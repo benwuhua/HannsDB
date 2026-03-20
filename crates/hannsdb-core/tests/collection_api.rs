@@ -1,0 +1,440 @@
+use std::fs;
+use std::path::PathBuf;
+use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use hannsdb_core::catalog::ManifestMetadata;
+use hannsdb_core::db::HannsDb;
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{}_{}", name, nanos))
+}
+
+#[test]
+fn collection_api_create_insert_search() {
+    let root = unique_temp_dir("hannsdb_collection_api_create");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let inserted = db
+        .insert("docs", &[42, 84], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    assert_eq!(inserted, 2);
+
+    let hits = db
+        .search("docs", &[0.0_f32, 0.0], 1)
+        .expect("search vectors");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 42);
+}
+
+#[test]
+fn collection_api_delete_masks_results() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[42, 84], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    let deleted = db.delete("docs", &[42]).expect("delete one id");
+    assert_eq!(deleted, 1);
+
+    let hits = db
+        .search("docs", &[0.0_f32, 0.0], 2)
+        .expect("search vectors");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 84);
+}
+
+#[test]
+fn collection_api_reopen_recovery() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen");
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
+        db.insert("docs", &[42, 84], &[0.0_f32, 0.0, 1.0, 1.0])
+            .expect("insert vectors");
+        db.delete("docs", &[42]).expect("delete one id");
+    }
+
+    let db = HannsDb::open(&root).expect("reopen db");
+    let hits = db
+        .search("docs", &[0.0_f32, 0.0], 2)
+        .expect("search vectors");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 84);
+}
+
+#[test]
+fn collection_api_create_collection_rejects_zero_dimension() {
+    let root = unique_temp_dir("hannsdb_collection_api_zero_dim");
+    let mut db = HannsDb::open(&root).expect("open db");
+
+    let result = db.create_collection("bad", 0, "l2");
+    assert!(result.is_err(), "dimension 0 must be rejected");
+}
+
+#[test]
+fn collection_api_insert_rejects_mismatched_id_vector_counts_without_panic() {
+    let root = unique_temp_dir("hannsdb_collection_api_mismatch");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.insert("docs", &[1, 2, 3], &[0.0_f32, 0.0, 1.0, 1.0])
+    }));
+
+    assert!(result.is_ok(), "insert should not panic");
+    assert!(
+        result.expect("insert call should return").is_err(),
+        "mismatched id/vector counts must return Err"
+    );
+}
+
+#[test]
+fn collection_api_insert_rejects_duplicate_external_ids() {
+    let root = unique_temp_dir("hannsdb_collection_api_duplicate_ids");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let result = db.insert("docs", &[7, 7], &[0.0_f32, 0.0, 1.0, 1.0]);
+    assert!(result.is_err(), "duplicate external ids must be rejected");
+}
+
+#[test]
+fn collection_api_drop_collection_removes_directory_and_manifest_entry() {
+    let root = unique_temp_dir("hannsdb_collection_api_drop");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    db.drop_collection("docs").expect("drop collection");
+
+    assert!(
+        !root.join("collections").join("docs").exists(),
+        "collection directory must be removed"
+    );
+    let manifest = ManifestMetadata::load_from_path(&root.join("manifest.json"))
+        .expect("load manifest metadata");
+    assert!(
+        !manifest.collections.iter().any(|name| name == "docs"),
+        "manifest entry must be removed"
+    );
+}
+
+#[test]
+fn collection_api_recreate_collection_after_drop_succeeds() {
+    let root = unique_temp_dir("hannsdb_collection_api_recreate");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.drop_collection("docs").expect("drop collection");
+
+    db.create_collection("docs", 2, "l2")
+        .expect("recreate collection");
+    let inserted = db
+        .insert("docs", &[101], &[0.5_f32, 0.5])
+        .expect("insert after recreate");
+    assert_eq!(inserted, 1);
+}
+
+#[test]
+fn collection_api_drop_missing_collection_returns_not_found() {
+    let root = unique_temp_dir("hannsdb_collection_api_drop_missing");
+    let mut db = HannsDb::open(&root).expect("open db");
+
+    let err = db
+        .drop_collection("missing")
+        .expect_err("dropping missing collection should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_search_honors_ip_metric() {
+    let root = unique_temp_dir("hannsdb_collection_api_metric_ip");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs_ip", 2, "ip")
+        .expect("create ip collection");
+    db.insert("docs_ip", &[1001, 1002], &[100.0_f32, 100.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    let hits = db
+        .search("docs_ip", &[1.0_f32, 1.0], 1)
+        .expect("search vectors");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 1001, "IP should favor larger dot product");
+}
+
+#[test]
+fn collection_api_search_honors_cosine_metric() {
+    let root = unique_temp_dir("hannsdb_collection_api_metric_cosine");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs_cos", 2, "cosine")
+        .expect("create cosine collection");
+    db.insert("docs_cos", &[2001, 2002], &[10.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    let hits = db
+        .search("docs_cos", &[1.0_f32, 0.0], 1)
+        .expect("search vectors");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2001, "cosine should favor aligned direction");
+}
+
+#[test]
+fn collection_api_get_collection_info_reports_stats() {
+    let root = unique_temp_dir("hannsdb_collection_api_info_stats");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.delete("docs", &[11]).expect("delete one id");
+
+    let info = db.get_collection_info("docs").expect("get collection info");
+    assert_eq!(info.name, "docs");
+    assert_eq!(info.dimension, 2);
+    assert_eq!(info.metric, "l2");
+    assert_eq!(info.record_count, 2);
+    assert_eq!(info.deleted_count, 1);
+    assert_eq!(info.live_count, 1);
+}
+
+#[test]
+fn collection_api_get_collection_info_missing_returns_not_found() {
+    let root = unique_temp_dir("hannsdb_collection_api_info_missing");
+    let db = HannsDb::open(&root).expect("open db");
+    let err = db
+        .get_collection_info("missing")
+        .expect_err("missing collection should return not found");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_flush_collection_succeeds_for_existing_collection() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_ok");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    db.flush_collection("docs")
+        .expect("flush should succeed for existing collection");
+}
+
+#[test]
+fn collection_api_flush_collection_missing_returns_not_found() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_missing");
+    let db = HannsDb::open(&root).expect("open db");
+
+    let err = db
+        .flush_collection("missing")
+        .expect_err("missing collection flush should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_optimize_warms_search_state_for_repeated_queries() {
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_cache");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 10.0, 10.0])
+        .expect("insert vectors");
+    db.optimize_collection("docs")
+        .expect("optimize should warm search state");
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let hits = db
+        .search("docs", &[0.1_f32, -0.1], 1)
+        .expect("cached search should still work");
+    assert_eq!(hits[0].id, 11);
+    assert!(
+        (hits[0].distance - 0.14142136).abs() < 1e-6,
+        "l2 distance should preserve brute-force semantics after optimize: got {}",
+        hits[0].distance
+    );
+}
+
+#[cfg(feature = "knowhere-backend")]
+#[test]
+fn collection_api_optimize_ann_maps_external_ids_and_normalizes_l2_distance() {
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_ann_mapping");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[-7, 42], &[1.0_f32, 1.0, 4.0, 5.0])
+        .expect("insert vectors");
+
+    let brute_hits = db
+        .search("docs", &[2.0_f32, 1.0], 2)
+        .expect("brute force search should work");
+    assert_eq!(brute_hits[0].id, -7);
+
+    db.optimize_collection("docs")
+        .expect("optimize should build ann state");
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let ann_hits = db
+        .search("docs", &[2.0_f32, 1.0], 2)
+        .expect("ann-backed search should work from optimized state");
+    assert_eq!(ann_hits[0].id, -7, "ann hit id must map to external id");
+
+    let expected = brute_hits[0].distance;
+    let actual = ann_hits[0].distance;
+    assert!(
+        (expected - actual).abs() < 1e-6,
+        "l2 distance must match brute-force semantics: expected {expected}, got {actual}"
+    );
+}
+
+#[cfg(feature = "knowhere-backend")]
+#[test]
+fn collection_api_optimize_ann_preserves_ip_distance_semantics() {
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_ann_ip_distance");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs_ip", 2, "ip")
+        .expect("create collection");
+    db.insert("docs_ip", &[1001, 1002], &[2.0_f32, 2.0, 1.0, 0.0])
+        .expect("insert vectors");
+
+    let brute_hits = db
+        .search("docs_ip", &[1.0_f32, 1.0], 1)
+        .expect("brute-force search should work");
+    assert_eq!(brute_hits[0].id, 1001);
+
+    db.optimize_collection("docs_ip")
+        .expect("optimize should build ann state");
+
+    let collection_dir = root.join("collections").join("docs_ip");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let ann_hits = db
+        .search("docs_ip", &[1.0_f32, 1.0], 1)
+        .expect("ann-backed ip search should work from optimized state");
+    assert_eq!(ann_hits[0].id, 1001);
+    assert!(
+        (ann_hits[0].distance - brute_hits[0].distance).abs() < 1e-6,
+        "ip distance must match brute-force semantics: expected {}, got {}",
+        brute_hits[0].distance,
+        ann_hits[0].distance
+    );
+}
+
+#[test]
+fn collection_api_optimize_benchmark_entry() {
+    fn read_env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
+    fn read_env_metric(name: &str, default: &str) -> String {
+        std::env::var(name)
+            .unwrap_or_else(|_| default.to_string())
+            .to_ascii_lowercase()
+    }
+
+    fn synthetic_value(i: usize, j: usize) -> f32 {
+        let x = (i as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add((j as u64).wrapping_mul(1442695040888963407))
+            .wrapping_add(1);
+        let y = ((x >> 16) as u32) as f32 / (u32::MAX as f32);
+        y * 2.0 - 1.0
+    }
+
+    fn build_synthetic_vectors(n: usize, dim: usize, metric: &str) -> Vec<f32> {
+        let mut vectors = vec![0.0_f32; n * dim];
+        for i in 0..n {
+            let mut norm_sq = 0.0_f32;
+            let row = &mut vectors[i * dim..(i + 1) * dim];
+            for (j, v) in row.iter_mut().enumerate() {
+                let val = synthetic_value(i, j);
+                *v = val;
+                norm_sq += val * val;
+            }
+            if metric == "cosine" {
+                let norm = norm_sq.sqrt();
+                if norm > 0.0 {
+                    for v in row.iter_mut() {
+                        *v /= norm;
+                    }
+                }
+            }
+        }
+        vectors
+    }
+
+    let n = read_env_usize("HANNSSDB_OPT_BENCH_N", 2000);
+    let dim = read_env_usize("HANNSSDB_OPT_BENCH_DIM", 256);
+    let top_k = read_env_usize("HANNSSDB_OPT_BENCH_TOPK", 10);
+    let metric = read_env_metric("HANNSSDB_OPT_BENCH_METRIC", "cosine");
+    assert!(
+        matches!(metric.as_str(), "l2" | "cosine" | "ip"),
+        "unsupported metric, expected one of l2/cosine/ip, got: {metric}"
+    );
+
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_bench");
+    let collection = "optimize_bench";
+    let ids = (0..n as i64).collect::<Vec<_>>();
+    let vectors = build_synthetic_vectors(n, dim, &metric);
+    let query = vectors[..dim].to_vec();
+
+    let bench_start = Instant::now();
+    let mut db = HannsDb::open(&root).expect("open db");
+
+    let create_start = Instant::now();
+    db.create_collection(collection, dim, &metric)
+        .expect("create collection");
+    let create_ms = create_start.elapsed().as_millis();
+
+    let insert_start = Instant::now();
+    let inserted = db
+        .insert(collection, &ids, &vectors)
+        .expect("insert synthetic vectors");
+    let insert_ms = insert_start.elapsed().as_millis();
+    assert_eq!(inserted, n);
+
+    let optimize_start = Instant::now();
+    db.optimize_collection(collection)
+        .expect("optimize collection");
+    let optimize_ms = optimize_start.elapsed().as_millis();
+
+    let search_start = Instant::now();
+    let hits = db
+        .search(collection, &query, top_k)
+        .expect("search optimized collection");
+    let search_ms = search_start.elapsed().as_millis();
+    let total_ms = bench_start.elapsed().as_millis();
+
+    assert!(
+        !hits.is_empty(),
+        "optimized search should return at least one hit"
+    );
+
+    println!(
+        "OPT_BENCH_CONFIG n={} dim={} metric={} top_k={}",
+        n, dim, metric, top_k
+    );
+    println!(
+        "OPT_BENCH_TIMING_MS create={} insert={} optimize={} search={} total={}",
+        create_ms, insert_ms, optimize_ms, search_ms, total_ms
+    );
+}

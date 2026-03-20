@@ -1,0 +1,13 @@
+[package]
+name = "hannsdb-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+knowhere-backend = ["dep:knowhere-rs"]
+
+[dependencies]
+knowhere-rs = { path = "../../../knowhere-rs", optional = true }

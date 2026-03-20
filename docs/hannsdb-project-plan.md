@@ -1,0 +1,216 @@
+# HannsDB Project Plan
+
+> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Turn HannsDB from a benchmarkable prototype into a coherent local agent database with a stable `knowhere-rs` ANN path and a repeatable `VectorDBBench` story.
+
+**Architecture:** Keep one shared Rust core as the data plane, expose Python and daemon surfaces on top, and use a staged benchmark strategy: isolated optimize benchmark first, then `VectorDBBench` smoke, then full standard-case validation.
+
+**Tech Stack:** Rust workspace, `knowhere-rs`, PyO3, axum, Python 3.11, VectorDBBench
+
+---
+
+## Current state snapshot
+
+### Completed
+
+- [x] Workspace bootstrap
+- [x] Catalog and manifest persistence
+- [x] Segment file storage and tombstones
+- [x] Core collection API
+- [x] Feature-gated `knowhere-rs` HNSW adapter
+- [x] Minimal Python binding
+- [x] Minimal daemon routes
+- [x] HannsDB client integration in `VectorDBBench`
+- [x] Tiny benchmark smoke path
+- [x] Standalone optimize benchmark entry
+- [x] Release-profile optimize benchmark proxy at real target scale (`50K / 1536 / cosine`)
+- [x] First evidence-backed `knowhere-rs` HNSW hotpath improvement on near-target cosine build
+- [x] Repository-local `.coord + scripts/coord` tmux collaboration control plane
+- [x] Canonical document model with typed scalar payloads
+- [x] Core `insert/upsert/fetch/query(filter)` path for agent-shaped data
+- [x] Python `Doc.fields/score` plus `upsert/fetch/delete/flush/stats`
+- [x] Thin daemon `upsert/fetch/filter-search` routes
+
+### In progress
+
+- [ ] Stabilize and measure `knowhere-rs` HNSW build behavior at target-scale cosine workloads
+- [ ] Close the standard `Performance1536D50K` benchmark path
+- [ ] Convert current prototype durability into a real storage story
+
+### Not started
+
+- [ ] WAL and crash recovery
+- [ ] Multi-segment management
+- [ ] Compaction/rebuild workflow
+- [ ] Richer agent-oriented data model beyond the current v1 single-primary-vector slice
+
+## Phase 1: Freeze the current source of truth
+
+**Purpose:** Make project status obvious and reduce confusion between “planned”, “implemented”, and “being benchmarked”.
+
+**Files:**
+- Create: `docs/hannsdb-project-design.md`
+- Create: `docs/hannsdb-project-plan.md`
+- Modify as needed: `docs/vector-db-bench-notes.md`
+
+- [x] Write a top-level design document that reflects the real current architecture.
+- [x] Write a top-level plan document that marks completed work separately from upcoming work.
+- [ ] Keep benchmark notes as the detailed evidence log, not the only place where current status exists.
+- [x] Keep benchmark notes as the detailed evidence log, not the only place where current status exists.
+
+**Exit criteria:**
+- A new reader can understand the project from `docs/hannsdb-project-design.md` and `docs/hannsdb-project-plan.md` alone.
+
+## Phase 2: Stabilize the ANN integration boundary
+
+**Purpose:** Make the `knowhere-rs` path trustworthy enough to build the rest of HannsDB on top of it.
+
+**Files:**
+- Modify: `crates/hannsdb-index/src/adapter.rs`
+- Modify: `crates/hannsdb-index/src/hnsw.rs`
+- Modify: `crates/hannsdb-core/src/db.rs`
+- Modify: `crates/hannsdb-index/tests/hnsw_adapter.rs`
+- Modify: `crates/hannsdb-core/tests/collection_api.rs`
+- External verify path: `/Users/ryan/Code/knowhere-rs/src/faiss/hnsw.rs`
+
+- [x] Lock down score semantics for `l2` and `ip`.
+- [x] Stabilize tiny-fixture HNSW behavior with deterministic seeding.
+- [x] Remove avoidable HannsDB-side copy/flatten overhead before `knowhere-rs`.
+- [x] Add focused tests for semantic compatibility.
+- [x] Measure current target-scale build time with the latest `knowhere-rs` cosine optimizations.
+- 2026-03-19 latest variance sample is recorded in `docs/vector-db-bench-notes.md` under "2026-03-19 latest knowhere-rs variance sample".
+- [x] Decide whether the next performance step belongs in HannsDB glue code or inside `knowhere-rs`. Next cut should prioritize the `knowhere-rs` HNSW build hotpath; HannsDB work should stay limited to adapter-boundary overhead trims and score-semantic preservation.
+
+**Exit criteria:**
+- Targeted feature-on tests pass consistently.
+- Benchmark notes clearly state what HannsDB must adapt at the adapter/core boundary.
+- Current `knowhere-rs` performance evidence is recorded for target-like workloads.
+
+## Phase 3: Close the optimize benchmark loop
+
+**Purpose:** Make performance work repeatable without needing the full benchmark harness on every change.
+
+**Files:**
+- Modify: `crates/hannsdb-core/tests/collection_api.rs`
+- Modify: `scripts/run_hannsdb_optimize_bench.sh`
+- Modify: `docs/vector-db-bench-notes.md`
+
+- [x] Add a synthetic optimize benchmark test entry.
+- [x] Add a shell entrypoint that can run repeated measurements and report medians.
+- [x] Record a verified small baseline (`N=2000`, `DIM=256`, `cosine`).
+- [x] Record the first larger-scale baseline that is meaningfully close to `50K / 1536 / cosine`.
+- [x] Use this entry as the default controller check before escalating to full `VectorDBBench`.
+
+**Exit criteria:**
+- One command produces stable benchmark fields for create/insert/optimize/search/total.
+- Current median baseline is documented.
+
+## Phase 4: Close the standard benchmark path
+
+**Purpose:** Get HannsDB to reliably run the meaningful `VectorDBBench` path, not just the tiny smoke.
+
+**Files:**
+- Modify: `scripts/run_vdbb_hannsdb_perf1536d50k.sh`
+- Modify: `docs/vector-db-bench-notes.md`
+- External repo: `/Users/ryan/Code/VectorDBBench`
+
+- [x] Wire HannsDB into `VectorDBBench` with a local-path embedded client.
+- [x] Pass tiny smoke and custom dataset flows.
+- [ ] Finish `Performance1536D50K` with current code and record a complete result.
+- [ ] Decide whether v1 benchmark success requires only “run completes” or also a minimum latency/throughput target.
+- [ ] Keep a reproducible command and result artifact path for the latest standard-case run.
+
+**Exit criteria:**
+- A full standard-case run completes end-to-end.
+- The latest command, logs, and result file are recorded in docs.
+
+## Phase 5: Finish the storage story
+
+**Purpose:** Move HannsDB from “benchmarkable prototype” to “credible local database”.
+
+**Files:**
+- Create: `crates/hannsdb-core/src/storage/mod.rs`
+- Create: `crates/hannsdb-core/src/storage/wal.rs`
+- Create: `crates/hannsdb-core/src/storage/recovery.rs`
+- Create: `crates/hannsdb-core/tests/recovery.rs`
+- Modify: `crates/hannsdb-core/src/db.rs`
+
+- [ ] Add WAL for inserts and deletes.
+- [ ] Add replay on open.
+- [ ] Define what `flush_collection()` actually guarantees.
+- [ ] Prove reopen/recovery behavior with crash-style tests.
+
+**Exit criteria:**
+- HannsDB can reopen safely after interrupted writes in the supported v1 paths.
+
+## Phase 6: Evolve from single-segment prototype to manageable local DB
+
+**Purpose:** Prepare for realistic collection growth and lifecycle management.
+
+**Files:**
+- Modify: `crates/hannsdb-core/src/segment/*`
+- Modify: `crates/hannsdb-core/src/db.rs`
+- Modify: `crates/hannsdb-daemon/src/routes.rs`
+- Add tests under `crates/hannsdb-core/tests/`
+
+- [ ] Introduce explicit segment rollover rules.
+- [ ] Add compaction/rebuild plan for tombstoned data.
+- [ ] Clarify when ANN state is rebuilt versus incrementally updated.
+- [ ] Expose minimal admin controls through the daemon if needed.
+
+**Exit criteria:**
+- The code no longer assumes “one collection, one forever-growing segment” as the only lifecycle model.
+
+## Phase 7: Expand from benchmark shape to agent-data shape
+
+**Purpose:** Make HannsDB more than a benchmark adapter.
+
+**Files:**
+- Modify: `crates/hannsdb-core/src/db.rs`
+- Modify: `crates/hannsdb-py/src/lib.rs`
+- Potentially add new model modules under `crates/hannsdb-core/src/`
+
+- [x] Define the v1 canonical record model for agent use.
+- [x] Decide how payload/text/session fields are stored relative to vectors.
+- [x] Add retrieval APIs that are useful beyond pure top-k vector search.
+- [x] Keep ANN index as derived acceleration state, not the only truth.
+- [x] Execute the detailed parity slice plan in `docs/superpowers/plans/2026-03-20-hannsdb-zvec-parity-v1.md`.
+- 2026-03-20 update: the first parity tranche is now implemented in core/Python/daemon for one-primary-vector collections with typed scalar payloads, `upsert`, `fetch`, correct filtered query, daemon `search.output_fields`, and an explicit daemon `/stats` alias.
+
+**Exit criteria:**
+- HannsDB has a clear agent-facing data model, not only benchmark-facing inserts and queries.
+
+## Phase 8: Harden the daemon only after the core deserves it
+
+**Purpose:** Avoid overbuilding the service surface before the storage and ANN layers stabilize.
+
+**Files:**
+- Modify: `crates/hannsdb-daemon/src/api.rs`
+- Modify: `crates/hannsdb-daemon/src/routes.rs`
+- Modify: `crates/hannsdb-daemon/tests/http_smoke.rs`
+
+- [x] Add the thin collection/search/admin baseline.
+- [x] Add only the missing routes that the now-stable core genuinely needs.
+- [ ] Avoid adding background task complexity before WAL/recovery and segment lifecycle are defined.
+
+**Exit criteria:**
+- Daemon stays thin, coherent, and downstream of core decisions.
+
+## Recommended near-term execution order
+
+1. Measure and record the latest `knowhere-rs` target-scale build behavior.
+2. Use the recorded HannsDB release proxy baseline and latest `knowhere-rs` evidence to decide whether the next cut belongs in `knowhere-rs` or HannsDB glue.
+3. Re-run the full `Performance1536D50K` path once the optimize path is materially better understood.
+4. Only after benchmark closure, resume WAL/recovery and segment lifecycle work.
+
+## What this project is doing right now
+
+If you only want the short answer:
+
+- HannsDB already has a working local core, Python binding, daemon, and benchmark smoke path.
+- The current main blocker is not “can it run at all”; it is “can the ANN optimize/build path finish fast enough at the standard `50K / 1536 / cosine` workload”.
+- The controller now uses the standalone release optimize benchmark as the default check before escalating to full `VectorDBBench`.
+- In parallel, the project is validating and improving `knowhere-rs` as a long-term ANN foundation for this workload.
+
+This file should be treated as the current top-level execution plan.

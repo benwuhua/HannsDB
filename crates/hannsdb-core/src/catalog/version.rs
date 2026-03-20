@@ -1,0 +1,1 @@
+pub const CATALOG_FORMAT_VERSION: u32 = 1;

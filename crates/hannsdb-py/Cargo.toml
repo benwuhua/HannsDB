@@ -1,0 +1,26 @@
+[package]
+name = "hannsdb-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+python-binding = ["dep:pyo3"]
+knowhere-backend = ["hannsdb-core/knowhere-backend"]
+
+[lib]
+name = "hannsdb"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hannsdb-core = { path = "../hannsdb-core" }
+pyo3 = { version = "0.23", features = ["abi3-py39", "auto-initialize"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.maturin]
+name = "hannsdb"

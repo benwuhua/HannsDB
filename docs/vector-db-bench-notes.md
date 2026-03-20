@@ -1,0 +1,662 @@
+# HannsDB VectorDBBench Notes (Current Evidence)
+
+## 1) Tiny-smoke workflow and verified result artifact
+
+- Workflow/command source: [`docs/vdbb-hannsdb-smoke.md`](/Users/ryan/Code/HannsDB/docs/vdbb-hannsdb-smoke.md) and [`scripts/run_vdbb_hannsdb_smoke.sh`](/Users/ryan/Code/HannsDB/scripts/run_vdbb_hannsdb_smoke.sh)
+- Tiny-smoke run command:
+  - `./scripts/run_vdbb_hannsdb_smoke.sh`
+- Verified result path:
+  - `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260319_hannsdb-smoke_hannsdb.json`
+
+## 2) Latest verified tiny-smoke metrics
+
+Source: [`result_20260319_hannsdb-smoke_hannsdb.json`](/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260319_hannsdb-smoke_hannsdb.json)
+
+- `run_id`: `2efd1d4340e343ed95269c03ab9ea1b6`
+- `insert_duration`: `0.5853s`
+- `optimize_duration`: `0.0001s`
+- `load_duration`: `0.5854s`
+- `serial_latency_p99`: `0.0002s`
+- `serial_latency_p95`: `0.0001s`
+- `recall`: `1.0`
+- `ndcg`: `1.0`
+- `qps`: `0.0` (tiny smoke is recall/latency correctness-oriented, not throughput-oriented)
+
+## 3) Standard benchmark command (Performance1536D50K)
+
+Command consistent with the logged TaskConfig (`db_label=hannsdb-1536d50k`, `path=/tmp/hannsdb-vdbb-1536d50k-db`, `M=16`, `ef_construction=64`, `ef_search=32`, `k=10`, `stages=drop_old/load/search_serial`):
+
+```bash
+PYTHONPATH=/Users/ryan/Code/VectorDBBench \
+/Users/ryan/Code/HannsDB/.venv-hannsdb/bin/python -m vectordb_bench.cli.vectordbbench hannsdb \
+  --path /tmp/hannsdb-vdbb-1536d50k-db \
+  --db-label hannsdb-1536d50k \
+  --task-label hannsdb-1536d50k \
+  --case-type Performance1536D50K \
+  --m 16 \
+  --ef-construction 64 \
+  --ef-search 32 \
+  --k 10 \
+  --skip-search-concurrent \
+  --num-concurrency 1 \
+  --concurrency-duration 1
+```
+
+## 4) Standard-case runtime observations from log (with timestamps)
+
+Source: [`logs/vectordb_bench.log`](/Users/ryan/Code/HannsDB/logs/vectordb_bench.log)
+
+- Initial `drop_old` warning:
+  - `2026-03-19 14:57:53,104` — `Failed to drop HannsDB collection vector_bench_test: no collection registered in manifest`
+- Dataset download start:
+  - `2026-03-19 14:57:54,837` — `Start to downloading files, total count: 4`
+- Dataset download completion:
+  - `2026-03-19 15:07:18,589` — `Succeed to download all files, downloaded file count = 4`
+- Load/insert duration:
+  - `2026-03-19 15:09:14,681` — `load_duration(insert + optimize) = 115.1317`
+- Serial search start:
+  - `2026-03-19 15:09:14,681` — `SpawnProcess-1 start serial search`
+  - `2026-03-19 15:09:15,144` — `start search the entire test_data to get recall and latency`
+
+## 5) Current standard-case status (latest observed evidence)
+
+- As of the latest observed standard-case log evidence above, serial search had started, but no final standard-case result write entry was observed yet for that run in the provided evidence set.
+
+## 6) Cache-fix repro evidence after hot-path change
+
+- A follow-up repro was run with:
+  - `db_label=hannsdb-1536d50k-cachefix`
+  - `task_label=hannsdb-1536d50k-cachefix`
+  - `path=/tmp/hannsdb-vdbb-1536d50k-cachefix-db`
+- Observed log milestones:
+  - `2026-03-19 15:49:22,772` — `optimize_duration=2.1071`, showing `Collection::optimize()` is no longer a pure no-op and now warms in-process search state.
+  - `2026-03-19 15:49:23,193` — serial search started for the `1000` queries in `test.parquet`.
+- Sampled runtime evidence during that repro showed the search worker spending CPU in:
+  - `hannsdb_core::query::search::search_by_metric`
+  - `distance_by_metric`
+  - `cosine_similarity`
+- The earlier `load_records` hot path was no longer present in the sampled search stack, which confirms the cache fix removed the repeated full-disk reload from repeated queries.
+- Remaining blocker:
+  - the benchmark path is still brute-force cosine search over `50K x 1536` vectors for `1000` queries, so the next meaningful performance milestone is wiring the HNSW/ANN path into benchmark-facing search rather than further tuning the disk cache path.
+
+## 7) Integration memory: knowhere-backed ANN distance semantics
+
+- Confirmed non-bug integration fact:
+  - the current feature-on blocker is **not** a `knowhere-rs` compile/build failure; it is a HannsDB-core integration mistake around constructing the ANN backend from `Result<..., AdapterError>`.
+- Confirmed integration caveat to remember:
+  - actual local verification for the active HNSW path is the authority; earlier assumptions about `L2` score shape were wrong and had to be corrected with direct tests against `knowhere-rs`.
+- Required HannsDB rule going forward:
+  - if benchmark-facing search is accelerated through the knowhere-backed ANN path, HannsDB core must preserve its public score semantics explicitly at the adapter/core boundary instead of assuming `knowhere-rs` output already matches HannsDB.
+
+## 8) knowhere-rs verification findings from HannsDB integration
+
+- This is a first-class project goal, not a side effect:
+  - HannsDB development must continuously verify that `knowhere-rs` stays reusable and semantically compatible for the active ANN path.
+- Verified local findings from the current integration slice:
+  - `KnowhereHnswIndex` local tiny-fixture behavior was flaky until the HannsDB wrapper pinned `config.params.random_seed = Some(42)`.
+  - After pinning `random_seed`, repeated local verification stabilized for both:
+    - `cargo test -p hannsdb-index --features knowhere-backend hnsw_adapter`
+    - `cargo test -p hannsdb-core collection_api --features knowhere-backend`
+  - `knowhere-rs` HNSW finalizes `L2` results to Euclidean distance already, so HannsDB core must not apply a second `sqrt`.
+  - `knowhere-rs` HNSW finalizes `IP` results to positive inner-product scores, while HannsDB core's current public search semantics use negative distance for `ip`; HannsDB core therefore has to map `IP` scores back at the adapter/core boundary.
+
+## 9) Standard benchmark update after enabling knowhere-backed optimize
+
+- Repro command:
+  - `DB_LABEL=hannsdb-1536d50k-knowhere-seeded TASK_LABEL=hannsdb-1536d50k-knowhere-seeded DB_PATH=/tmp/hannsdb-vdbb-1536d50k-knowhere-seeded-db ./scripts/run_vdbb_hannsdb_perf1536d50k.sh`
+- Observed state transition:
+  - the previous dominant bottleneck was brute-force search over `50K x 1536` vectors after a near-no-op optimize step
+  - after wiring the knowhere-backed ANN optimize path, the dominant bottleneck moved earlier into `optimize()`
+- Verified evidence:
+  - dataset load/insert still completed in about `112.14s`
+  - no `load_duration(insert + optimize)` line was emitted afterward within the bounded run window, which means optimize did not finish in that window
+  - repeated samples of the hot worker showed the process inside:
+    - `hannsdb_core::db::HannsDb::optimize_collection`
+    - `hannsdb_core::db::build_optimized_ann_state`
+    - `hannsdb_index::hnsw::KnowhereHnswIndex::insert`
+    - `knowhere_rs::faiss::hnsw::HnswIndex::add`
+    - `search_layer_idx_*` and `distance_to_idx_cosine_dispatch`
+- Current conclusion:
+  - the search-side brute-force bottleneck has been removed from the critical path for this case
+  - the new benchmark blocker is knowhere-backed HNSW build cost during optimize on the `50K / 1536 / cosine` dataset
+
+## 10) Standalone optimize benchmark entry (no external dataset download)
+
+Use this one-command entry to isolate `HannsDb::optimize_collection` timing from full VectorDBBench runs:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Configurable parameters (env):
+- `N` (default `2000`)
+- `DIM` (default `256`)
+- `METRIC` (`l2|cosine|ip`, default `cosine`)
+- `TOPK` (default `10`)
+- `REPEATS` (default `3`, script prints each run and medians)
+- `FEATURES` (default `knowhere-backend`)
+- `PROFILE` (`debug|release`, default `debug`)
+
+Example for a larger cosine case:
+
+```bash
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=5 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Recommended stable A/B command (same params, different code revision):
+
+```bash
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Recommended large-scale proxy command:
+
+```bash
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Stable output fields:
+- `OPT_BENCH_CONFIG n=<...> dim=<...> metric=<...> top_k=<...>`
+- `OPT_BENCH_TIMING_MS create=<...> insert=<...> optimize=<...> search=<...> total=<...>`
+- `RUN_RAW_TIMING run=<i> OPT_BENCH_TIMING_MS ...`
+- `RUN_PARSED_TIMING run=<i> create_ms=... insert_ms=... optimize_ms=... search_ms=... total_ms=...`
+- `BENCH_SUMMARY_MEDIAN_MS create=... insert=... optimize=... search=... total=...`
+
+## 11) Baseline record (2026-03-19, repeated run)
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Per-run raw timing:
+- Run 1: `OPT_BENCH_TIMING_MS create=0 insert=580 optimize=10080 search=4 total=10665`
+- Run 2: `OPT_BENCH_TIMING_MS create=0 insert=528 optimize=10325 search=4 total=10860`
+- Run 3: `OPT_BENCH_TIMING_MS create=0 insert=510 optimize=10308 search=4 total=10823`
+
+Median summary:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=528 optimize=10308 search=4 total=10823`
+
+## 12) Larger-scale baseline attempt and pinned result (2026-03-19)
+
+Target command first tried:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed behavior at larger scales:
+- `50K / 1536`: run entered long compute phase with sustained full CPU in `collection_api_optimize_benchmark_entry`, no timing line produced in the bounded window; terminated manually.
+- `20K / 1536`: same pattern (long-running optimize, no timing line in bounded window); terminated manually.
+
+Closest completed scale used as current pinned baseline:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=10000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Raw output summary:
+- `OPT_BENCH_CONFIG n=10000 dim=1536 metric=cosine top_k=10`
+- `OPT_BENCH_TIMING_MS create=0 insert=14812 optimize=267575 search=18 total=282407`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=14812 optimize=267575 search=18 total=282407`
+
+Pinned baseline fields for current version:
+- `optimize_ms=267575`
+- `total_ms=282407`
+
+## 13) Real-size release baseline (50K/1536/cosine, 2026-03-19)
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Profile used:
+- `release`
+
+Scale used:
+- `n=50000`, `dim=1536`, `metric=cosine`, `top_k=10`, `repeats=1`
+
+Raw output summary:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
+- `OPT_BENCH_TIMING_MS create=0 insert=93591 optimize=498659 search=9 total=592260`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=93591 optimize=498659 search=9 total=592260`
+
+Pinned baseline fields for current version:
+- `optimize_ms=498659`
+- `total_ms=592260`
+
+Proxy quality:
+- This is a better proxy for the real VectorDBBench hot path than the earlier `10K/1536` fallback because it matches the target `50K/1536/cosine` scale and keeps the optimize-stage bottleneck dominant.
+
+## 14) HannsDB-side prebuild overhead cut (no-tombstone fast path)
+
+Change summary:
+- In `build_optimized_ann_state`, added a no-tombstone fast path:
+  - `ann_external_ids = state.external_ids.clone()`
+  - direct backend feed from `state.records` via `insert_flat_identity(...)`
+- This avoids materializing an extra `flat_vectors` copy for the common no-delete case before knowhere build.
+- Tombstone-present path is unchanged semantically (still filters deleted rows and remaps ANN IDs).
+
+Verification commands:
+- `cargo test -p hannsdb-core collection_api --features knowhere-backend -- --nocapture`
+- `N=200 DIM=64 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=debug ./scripts/run_hannsdb_optimize_bench.sh`
+- `N=200 DIM=64 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh`
+- `N=20000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh`
+
+Observed 20K/1536 release delta (same command as above):
+- Before this cut:
+  - `OPT_BENCH_TIMING_MS create=0 insert=34819 optimize=84003 search=3 total=118827`
+- After this cut:
+  - `OPT_BENCH_TIMING_MS create=0 insert=34469 optimize=77257 search=3 total=111730`
+
+What moved:
+- `insert_ms`: slight drop (`34819 -> 34469`, about `-1.0%`)
+- `optimize_ms`: clear drop (`84003 -> 77257`, about `-8.0%`)
+- `total_ms`: drop (`118827 -> 111730`, about `-6.0%`)
+
+Interpretation:
+- This cut primarily reduced optimize prebuild overhead on the HannsDB side.
+- Remaining dominant cost is still inside knowhere build itself (expected hotspot in add/build path).
+
+## 14) knowhere-rs hotpath validation record (2026-03-19, initial sample)
+
+This is part of the HannsDB mainline, not side work: while optimizing HannsDB, we are also validating whether `knowhere-rs` is a viable long-term ANN foundation for the target workload.
+
+Baseline before the latest bounded `knowhere-rs` cut:
+
+- Command:
+  - `KNOWHERE_RS_HNSW_BENCH_N=10000 KNOWHERE_RS_HNSW_BENCH_DIM=1536 cargo test --release -p knowhere-rs --lib bench_hnsw_cosine_build_hotpath_smoke -- --ignored --nocapture`
+- Baseline result:
+  - `total_ms=47319.276`
+  - `per_vector_ms=4.731928`
+
+After the bounded hotpath change in `src/faiss/hnsw.rs`:
+
+- Main code effects:
+  - removed unconditional timing capture from the non-profile candidate-search path
+  - carried precomputed cosine query norm through the active insertion/build call chain
+  - cached cosine vector norms in-memory and rebuilt them on load
+- Focused correctness verification:
+  - `cargo test -p knowhere-rs --lib test_hnsw_cosine_metric -- --nocapture`
+  - `cargo test -p knowhere-rs --lib test_cosine_distance_with_query_norm_matches_dispatch_path -- --nocapture`
+- Near-target benchmark result:
+  - `total_ms=42270.941`
+  - `per_vector_ms=4.227094`
+
+Initial observed delta against the previous `10K / 1536` baseline:
+
+- `total_ms`: about `10.7%` lower
+- `per_vector_ms`: about `10.7%` lower
+
+Important caveat:
+
+- this section records the first good sample only
+- later repeated runs are recorded in sections `16` and `18`
+- do not treat this single-sample delta as a stable improvement claim by itself
+
+## 15) HannsDB-side no-tombstone fast path validation (2026-03-19)
+
+Accepted HannsDB-side cut:
+
+- `build_optimized_ann_state` now has a no-tombstone fast path
+- HannsDB avoids constructing an extra copied `flat_vectors` buffer before calling the backend when the collection has no deletes
+- a narrow `insert_flat_identity(...)` adapter path now supports this shape directly
+
+Controller re-checks:
+
+- Targeted correctness:
+  - `cargo test -p hannsdb-core collection_api --features knowhere-backend -- --nocapture`
+  - result: `19 passed`
+- Small release proxy:
+  - `N=200 DIM=64 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh`
+  - controller result: `OPT_BENCH_TIMING_MS create=0 insert=13 optimize=11 search=0 total=25`
+- Mid-scale release proxy reported by the worker:
+  - `N=20000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh`
+  - worker result: `OPT_BENCH_TIMING_MS create=0 insert=34469 optimize=77257 search=3 total=111730`
+  - previous recorded baseline at the same scale: `insert=34819 optimize=84003 total=118827`
+
+Current implication:
+
+- HannsDB-side prebuild overhead has moved in the right direction
+- the next important check is whether this carries through to the `50K / 1536 / cosine` release proxy and then to the full `Performance1536D50K` gate
+
+## 16) knowhere-rs current evidence status after the latest narrow cut
+
+Latest narrow code change under review:
+
+- `cosine_vector_norm_for_idx_hot(...)` / hot-path norm lookup tightening in `src/faiss/hnsw.rs`
+
+Important controller finding:
+
+- the worker-reported single run showed a small improvement (`41896.941 ms` at `10K / 1536`)
+- but a controller rerun on the same current tree produced:
+  - `total_ms=45405.598`
+  - `per_vector_ms=4.540560`
+
+Current implication:
+
+- the latest claimed `~0.88%` improvement is **not yet reproducible enough to treat as accepted performance truth**
+- keep the code/result as captured evidence, but do not rely on that improvement until repeated runs establish a stable median
+- the next step on the knowhere side is measurement stabilization, not another immediate performance claim
+
+## 17) T-20260319-006 gate validation result (2026-03-19)
+
+Release optimize proxy rerun (required):
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed timing line:
+- `OPT_BENCH_TIMING_MS create=0 insert=116802 optimize=617836 search=11 total=734651`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=116802 optimize=617836 search=11 total=734651`
+
+Comparison to pinned baseline (`insert=93591 optimize=498659 total=592260`):
+- `insert_ms`: `+23211` (about `+24.8%`)
+- `optimize_ms`: `+119177` (about `+23.9%`)
+- `total_ms`: `+142391` (about `+24.0%`)
+
+Standard `Performance1536D50K` gate rerun was attempted with fresh labels/path:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+DB_LABEL=hannsdb-1536d50k-rerun2 TASK_LABEL=hannsdb-1536d50k-rerun2 DB_PATH=/tmp/hannsdb-vdbb-1536d50k-rerun2-db ./scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Observed behavior:
+- benchmark entered case execution and completed load stage:
+  - `2026-03-19 19:32:58,785` — `Finish loading all dataset into VectorDB, dur=130.49832625011913`
+- no final result JSON was emitted for this rerun label
+- sampled worker process during the long stall showed Python threads waiting on locks/queues (not active compute frames), so this run was terminated and marked blocked-with-concerns
+
+Current conclusion for this task:
+- release proxy regressed versus pinned baseline
+- full standard gate rerun remains blocked in this environment after load stage
+
+## 18) T-20260319-009 evidence refresh (2026-03-19)
+
+Required 3-run release proxy command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh
+```
+
+Raw run timings:
+- Run 1: `OPT_BENCH_TIMING_MS create=0 insert=136174 optimize=649342 search=12 total=785531`
+- Run 2: `OPT_BENCH_TIMING_MS create=0 insert=139047 optimize=784235 search=18 total=923302`
+- Run 3: `OPT_BENCH_TIMING_MS create=0 insert=219994 optimize=721181 search=11 total=941188`
+
+3-run median from script:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=139047 optimize=721181 search=12 total=923302`
+
+This confirms the current `50K/1536/cosine` release proxy is still materially above the earlier pinned baseline (`insert=93591 optimize=498659 total=592260`).
+
+Required full-gate rerun command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+DB_LABEL=hannsdb-1536d50k-rerun3 TASK_LABEL=hannsdb-1536d50k-rerun3 DB_PATH=/tmp/hannsdb-vdbb-1536d50k-rerun3-db ./scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Observed runtime milestone:
+- `2026-03-19 20:58:49,036` — `(SpawnProcess-1:1) Finish loading all dataset into VectorDB, dur=149.12591604096815`
+
+Stall diagnosis snapshot artifacts:
+- controller Python process sample: `/tmp/hannsdb-vdbb-rerun3.sample.txt` (PID `63139`)
+- worker subprocess sample: `/tmp/hannsdb-vdbb-rerun3-worker.sample.txt` (PID `63141`)
+
+Snapshot finding summary:
+- parent process stack centered in `time_sleep` wait
+- worker subprocess main thread blocked on Python lock wait (`lock_PyThread_acquire_lock` / `pthread_cond_wait`)
+- no result JSON emitted for `hannsdb-1536d50k-rerun3` before manual termination
+
+## 18) T-20260319-007 repeated-run outcome (2026-03-19)
+
+Task intent:
+- no code changes, only measurement stabilization for the current `knowhere-rs` tree
+
+Focused correctness check:
+- `cargo test -p knowhere-rs --lib test_cosine_distance_with_query_norm_matches_dispatch_path -- --nocapture` passed
+
+Near-target benchmark (`N=10000`, `DIM=1536`) repeated 3 times:
+- run 1: `total_ms=42176.417`, `per_vector_ms=4.217642`
+- run 2: `total_ms=43867.780`, `per_vector_ms=4.386778`
+- run 3: `total_ms=43841.215`, `per_vector_ms=4.384121`
+
+Comparison points:
+- prior baseline from `T-20260319-003`: `total_ms=42270.941`, `per_vector_ms=4.227094`
+- controller spot-check in this session: `total_ms=45405.598`, `per_vector_ms=4.540560`
+
+Conclusion:
+- current narrow cut cannot be claimed as a stable deterministic speedup yet
+- observed behavior fits a noise-sensitive/variance-sensitive band on this machine
+- next knowhere step should be another bounded hotpath cut plus the same repeated-run check, not a claim based on a single run
+
+## 19) 2026-03-19 latest knowhere-rs variance sample
+
+Command:
+- `KN_BENCH_NS=5000,10000 KN_BENCH_REPEATS=2 KN_BENCH_DIM=1536 bash scripts/run_knowhere_hnsw_variance.sh`
+
+KN_SUMMARY:
+- `KN_SUMMARY n=5000 dim=1536 repeats=2 raw_total_ms=25360.235,25229.276 median_total_ms=25294.755 min=25229.276 max=25360.235 spread=130.959`
+- `KN_SUMMARY n=10000 dim=1536 repeats=2 raw_total_ms=63087.401,63032.786 median_total_ms=63060.094 min=63032.786 max=63087.401 spread=54.615`
+
+Note:
+- this is the latest target-scale variance check recorded on 2026-03-19 for the current `knowhere-rs` cosine hotpath path
+- the `N=10000` median is still materially above the smaller sample, so the run is evidence for variance tracking, not a final throughput claim
+
+## 20) Reusable knowhere-rs HNSW variance harness
+
+Script:
+- `/Users/ryan/Code/HannsDB/scripts/run_knowhere_hnsw_variance.sh`
+
+Purpose:
+- run repeated `knowhere-rs` `bench_hnsw_cosine_build_hotpath_smoke` builds for one or more `N` values
+- print per-run raw `total_ms` / `per_vector_ms`
+- print per-`N` summary with `raw_total_ms`, `median_total_ms`, `min`, `max`, `spread(max-min)`
+
+Defaults:
+- `KN_REPO=/Users/ryan/Code/knowhere-rs`
+- `KN_BENCH_NS=5000,10000,20000`
+- `KN_BENCH_DIM=1536`
+- `KN_BENCH_REPEATS=3`
+
+Env overrides:
+- `KN_REPO`
+- `KN_BENCH_NS` (comma-separated, e.g. `1000,5000`)
+- `KN_BENCH_DIM`
+- `KN_BENCH_REPEATS`
+
+Smoke example:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+KN_BENCH_NS=1000 KN_BENCH_DIM=256 KN_BENCH_REPEATS=1 ./scripts/run_knowhere_hnsw_variance.sh
+```
+
+Output fields:
+- `KN_VARIANCE_CONFIG ...`
+- `KN_RUN_BEGIN n=<N> iter=<i>`
+- `KN_RUN_RAW n=<N> iter=<i> total_ms=<...> per_vector_ms=<...>`
+- `KN_SUMMARY n=<N> dim=<...> repeats=<...> raw_total_ms=<csv> median_total_ms=<...> min=<...> max=<...> spread=<...>`
+
+## 21) Latest rerun: release proxy 50K/1536/cosine (2026-03-19)
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Captured output:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
+- `OPT_BENCH_TIMING_MS create=0 insert=158795 optimize=710488 search=11 total=869299`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=158795 optimize=710488 search=11 total=869299`
+
+Conclusion:
+- this latest release rerun completed successfully at the target `50K / 1536 / cosine` scale, and `optimize` remained the dominant cost in the run.
+
+## 22) 2026-03-20 latest variance rerun
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+KN_BENCH_NS=5000,10000 KN_BENCH_REPEATS=3 KN_BENCH_DIM=1536 bash scripts/run_knowhere_hnsw_variance.sh
+```
+
+KN_SUMMARY:
+- `KN_SUMMARY n=5000 dim=1536 repeats=3 raw_total_ms=16513.816,17095.546,17100.214 median_total_ms=17095.546 min=16513.816 max=17100.214 spread=586.398`
+- `KN_SUMMARY n=10000 dim=1536 repeats=3 raw_total_ms=43552.775,43586.094,43341.512 median_total_ms=43552.775 min=43341.512 max=43586.094 spread=244.582`
+
+Conclusion:
+- this rerun shows the `N=10000` median remains much higher than the `N=5000` median, and both sample sets stayed within a bounded spread across three repeats.
+
+## 23) 2026-03-20 gate stall classification refinement
+
+Source:
+- `/tmp/hannsdb-watchdog-20260320.ps.txt`
+- `/tmp/hannsdb-watchdog-20260320.sample.txt`
+- `/tmp/hannsdb-watchdog-20260320-worker.sample.txt`
+
+Observed process state:
+- VectorDBBench parent CLI process stayed low CPU and mostly waited/slept.
+- one spawn child process was observed near `99%` CPU during the post-load window.
+- the sampled `worker` file from that run was later confirmed to be `resource_tracker`, not the hot child.
+
+Interpretation:
+- this evidence is more consistent with a **compute-bound serial search stage** than a hard deadlock for that run.
+- watchdog diagnostic selection was tightened afterward to prefer high-CPU non-`resource_tracker` python children.
+
+## 24) 2026-03-20 stage-aware watchdog verification
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+STALL_TIMEOUT_SEC=60 POST_LOAD_TIMEOUT_SEC=300 DB_LABEL=hannsdb-watchdog-20260320-stagecheck TASK_LABEL=hannsdb-watchdog-20260320-stagecheck DB_PATH=/tmp/hannsdb-watchdog-20260320-stagecheck-db bash scripts/run_vdbb_hannsdb_perf1536d50k_watchdog.sh
+```
+
+Result classification:
+- `WATCHDOG_LOAD_COMPLETE` observed
+- no `WATCHDOG_SEARCH_STARTED` observed
+- `WATCHDOG_POST_LOAD_TIMEOUT` fired and exited with code `125`
+
+Worker sample evidence:
+- `/tmp/hannsdb-watchdog-20260320-stagecheck-worker.sample.txt` top frames stayed in:
+  - `hannsdb_core::db::HannsDb::optimize_collection`
+  - `hannsdb_core::db::build_optimized_ann_state`
+  - `knowhere_rs::faiss::hnsw::HnswIndex::add`
+
+Conclusion:
+- for this run, the gate blocker remained in optimize/build before search start.
+- stage-aware timeout split removed ambiguity between optimize-bound and search-bound stalls.
+
+## 25) 2026-03-20 knowhere-rs NEON inner-product micro-cut check (reverted)
+
+Experiment:
+- tried a bounded `ip_neon` pointer-step micro optimization in `/Users/ryan/Code/knowhere-rs/src/simd.rs`
+- validation command:
+  - `KN_BENCH_NS=5000 KN_BENCH_REPEATS=3 KN_BENCH_DIM=1536 bash scripts/run_knowhere_hnsw_variance.sh`
+
+Observed summary:
+- `KN_SUMMARY n=5000 dim=1536 repeats=3 raw_total_ms=17370.845,17099.663,17087.428 median_total_ms=17099.663 min=17087.428 max=17370.845 spread=283.417`
+
+Decision:
+- median was effectively flat versus the current 2026-03-20 baseline band.
+- no clear benefit was proven, so this micro-cut was reverted.
+
+## 26) 2026-03-20 post-parity-slice small optimize rerun
+
+Context:
+- core now includes the canonical document model, typed scalar payloads, `insert/upsert/fetch/query(filter)`
+- `hannsdb-py` now exposes `Doc.fields/score`, `upsert`, `fetch`, `flush`, and `stats`
+- the daemon now exposes thin `upsert`, `fetch`, and filtered search routes
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=debug bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Per-run raw timing:
+- Run 1: `OPT_BENCH_TIMING_MS create=0 insert=545 optimize=10420 search=4 total=10970`
+- Run 2: `OPT_BENCH_TIMING_MS create=0 insert=512 optimize=10438 search=4 total=10956`
+- Run 3: `OPT_BENCH_TIMING_MS create=0 insert=508 optimize=10528 search=4 total=11042`
+
+Median summary:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=512 optimize=10438 search=4 total=10970`
+
+Interpretation:
+- this rerun stayed in the same small-case band as the 2026-03-19 repeated baseline (`optimize ~= 10.3s` with `knowhere-backend` enabled)
+- the document/payload/filter tranche did not produce an obvious small-case no-filter optimize regression at this benchmark size
+- this command is not directly comparable to plain `cargo test --workspace` output because the benchmark script explicitly enables `FEATURES=knowhere-backend`
+
+## 27) 2026-03-20 parity follow-up benchmark gate recheck
+
+Context:
+- after adding Python `delete` and daemon `search.output_fields` / `/stats`, re-check the no-filter path before opening any new feature tranche
+
+Commands:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=debug bash scripts/run_hannsdb_optimize_bench.sh
+
+cd /Users/ryan/Code/VectorDBBench
+. /Users/ryan/Code/HannsDB/.venv-hannsdb/bin/activate
+python -m pytest tests/test_hannsdb_stage_logs.py tests/test_hannsdb_cli.py tests/test_hannsdb_client_config_shape.py -q
+
+cd /Users/ryan/Code/HannsDB
+bash scripts/run_vdbb_hannsdb_smoke.sh
+```
+
+Observed summary:
+- small optimize proxy:
+  - Run 1: `OPT_BENCH_TIMING_MS create=0 insert=514 optimize=10436 search=4 total=10955`
+  - Run 2: `OPT_BENCH_TIMING_MS create=0 insert=510 optimize=10446 search=4 total=10961`
+  - Run 3: `OPT_BENCH_TIMING_MS create=0 insert=502 optimize=10440 search=4 total=10948`
+  - Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=510 optimize=10440 search=4 total=10955`
+- VectorDBBench pytest: `6 passed, 2 warnings`
+- VectorDBBench smoke:
+  - result file materialized at `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260320_hannsdb-smoke_hannsdb.json`
+  - smoke metrics stayed healthy: `load_duration=0.4804`, `recall=1.0`, `ndcg=1.0`, `serial_latency_p99=0.0002`
+
+Interpretation:
+- relative to section 26 on 2026-03-20, the small no-filter optimize proxy remained flat (`optimize 10438 -> 10440 ms`, `total 10970 -> 10955 ms`)
+- the latest parity changes did not introduce an observable regression in the small-case no-filter path
+- current benchmark evidence still points to `knowhere-rs` HNSW build cost as the main target-scale blocker, not the latest HannsDB parity work
+
+## 28) 2026-03-20 target-scale release proxy recheck after parity follow-up
+
+Context:
+- after the small-case gate stayed flat, re-run the target `50K / 1536 / cosine` release proxy once to check whether the same conclusion still holds closer to the real benchmark scale
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- `OPT_BENCH_TIMING_MS create=0 insert=97672 optimize=499821 search=9 total=597503`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=97672 optimize=499821 search=9 total=597503`
+- `knowhere-rs` emitted the same non-blocking `unused_mut` warnings seen earlier, but the run completed normally
+
+Interpretation:
+- relative to the earlier 2026-03-20 release proxy sample (`insert=158795 optimize=710488 total=869299`), this rerun was materially faster
+- the runtime shape is unchanged: `optimize` still dominates and remains the main target-scale cost center
+- this recheck strengthens the current attribution that recent HannsDB parity work is not the blocker; the main remaining target-scale work still belongs in `knowhere-rs` HNSW build behavior

@@ -1,0 +1,15 @@
+[package]
+name = "hannsdb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+knowhere-backend = ["dep:hannsdb-index", "hannsdb-index/knowhere-backend"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hannsdb-index = { path = "../hannsdb-index", optional = true }

@@ -1,0 +1,12 @@
+/target
+**/__pycache__/
+.pytest_cache/
+/logs/
+/crates/hannsdb-py/tmp/
+.coord/events.log
+.coord/alerts.log
+.coord/monitor/
+.coord/results/
+.coord/tasks/
+.coord/watch/
+.coord/workers/
