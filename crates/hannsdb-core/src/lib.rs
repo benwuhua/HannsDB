@@ -3,6 +3,7 @@ pub mod db;
 pub mod document;
 pub mod query;
 pub mod segment;
+pub mod wal;
 
 pub fn core_bootstrap_marker() -> &'static str {
     "hannsdb-core-bootstrap"

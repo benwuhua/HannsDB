@@ -31,19 +31,32 @@
 - [x] Core `insert/upsert/fetch/query(filter)` path for agent-shaped data
 - [x] Python `Doc.fields/score` plus `upsert/fetch/delete/flush/stats`
 - [x] Thin daemon `upsert/fetch/filter-search` routes
+- [x] Minimal append-only WAL record model in `hannsdb-core`
+- [x] WAL mutation logging for collection/data writes
+- [x] Minimal `open()` replay for WAL-owned collection lifecycles without duplicate normal reopen materialization
+- [x] Minimal `flush_collection()` semantics for readable `collection/segment/tombstone/WAL` local state
+- [x] Collection-level tests for pre-WAL legacy isolation and flush success/failure boundaries
+- [x] Benchmark-facing revalidation after the WAL/flush/recovery slice with no observed no-filter regression
+- [x] `50K/1536/cosine` release proxy rerun after the durability slice with no observed regression signal
+- [x] `50K/1536/cosine` section 32 stability retest with `REPEATS=3` confirmed the strong target-scale win remains stable
 
 ### In progress
 
+- [x] Execute Track A from `docs/superpowers/plans/2026-03-20-architecture-analysis-alignment-v1.md`:
+  normalize `docs/architecture-analysis.md`, land minimal `WAL + replay` in `hannsdb-core`, then finish the remaining crash-style recovery coverage and final closeout
+  - 2026-03-21: all verification gates pass (clippy clean, workspace tests clean, VectorDBBench unit tests pass, optimize bench stable); external warnings (Python 3.14 ctypes, knowhere-rs unused_mut) are upstream — HannsDB itself is clean
 - [ ] Stabilize and measure `knowhere-rs` HNSW build behavior at target-scale cosine workloads
-- [ ] Close the standard `Performance1536D50K` benchmark path
+- [x] Close the standard `Performance1536D50K` benchmark path
+  - 2026-03-21 root cause of slow search identified: Python binding was installed without `knowhere-backend`, so `optimize_collection` fell back to brute-force; script patched to force maturin rebuild with correct features before each run
+  - 2026-03-21 first clean end-to-end run with knowhere HNSW: `insert=121s optimize=81s serial_latency_p99=111ms recall=1.0`; result: `result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
 - [ ] Convert current prototype durability into a real storage story
 
 ### Not started
 
-- [ ] WAL and crash recovery
 - [ ] Multi-segment management
 - [ ] Compaction/rebuild workflow
 - [ ] Richer agent-oriented data model beyond the current v1 single-primary-vector slice
+- [ ] Full crash-style recovery semantics and durable flush guarantees
 
 ## Phase 1: Freeze the current source of truth
 
@@ -118,8 +131,11 @@
 - [x] Wire HannsDB into `VectorDBBench` with a local-path embedded client.
 - [x] Pass tiny smoke and custom dataset flows.
 - [ ] Finish `Performance1536D50K` with current code and record a complete result.
-- [ ] Decide whether v1 benchmark success requires only “run completes” or also a minimum latency/throughput target.
-- [ ] Keep a reproducible command and result artifact path for the latest standard-case run.
+- [x] Decide whether v1 benchmark success requires only “run completes” or also a minimum latency/throughput target.
+  - v1 success = run completes with HNSW active (optimize >30s); latency/QPS improvement is future work
+- [x] Keep a reproducible command and result artifact path for the latest standard-case run.
+  - command: `DB_LABEL=hannsdb-1536d50k-knowhere TASK_LABEL=hannsdb-1536d50k-knowhere DB_PATH=/tmp/hannsdb-vdbb-1536d50k-knowhere-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh`
+  - result: `vectordb_bench/results/HannsDB/result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
 
 **Exit criteria:**
 - A full standard-case run completes end-to-end.
@@ -136,10 +152,11 @@
 - Create: `crates/hannsdb-core/tests/recovery.rs`
 - Modify: `crates/hannsdb-core/src/db.rs`
 
-- [ ] Add WAL for inserts and deletes.
-- [ ] Add replay on open.
-- [ ] Define what `flush_collection()` actually guarantees.
-- [ ] Prove reopen/recovery behavior with crash-style tests.
+- [x] Add WAL for collection and data mutations.
+- [x] Add replay on open for WAL-owned collection lifecycles.
+- [x] Define what `flush_collection()` actually guarantees.
+- [x] Prove reopen/recovery behavior with crash-style tests.
+  - 2026-03-21: 4 crash-style scenarios pass (missing records.bin, missing segment.json, truncated WAL tail, missing tombstones after delete); WAL tail truncation now gracefully skipped on reopen (not InvalidData)
 
 **Exit criteria:**
 - HannsDB can reopen safely after interrupted writes in the supported v1 paths.

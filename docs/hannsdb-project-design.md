@@ -103,6 +103,15 @@ Current DB API in [`db.rs`](/Users/ryan/Code/HannsDB/crates/hannsdb-core/src/db.
 - `flush_collection`
 - `optimize_collection`
 
+Current v1 `flush_collection()` guarantee is intentionally narrow:
+
+- collection metadata is readable
+- `segment.json` is readable
+- `tombstones.json` is readable
+- `wal.jsonl` is present and readable
+
+It is a visibility/consistency boundary for local files, not a claim of full crash-safe durability.
+
 ### 4.1.1 Canonical v1 record model
 
 HannsDB now has an explicit document model for the agent-data path.
@@ -160,6 +169,8 @@ Current exposed lifecycle:
 - `Collection.stats`
 - `Collection.optimize`
 - `Collection.destroy`
+
+`Collection.flush` inherits the same minimal v1 semantics from the Rust core; it does not currently imply stronger fsync-style durability.
 
 Current `Doc` shape includes:
 
@@ -229,7 +240,7 @@ Compatibility rule:
 - legacy benchmark-style raw vector inserts still work
 - when legacy raw inserts are used, HannsDB appends empty payload rows to keep later document fetch and upsert aligned
 
-At the moment, the implementation is still effectively single-segment per collection. WAL, crash recovery, compaction, and multi-segment orchestration are planned but not yet the current implementation baseline.
+At the moment, the implementation is still effectively single-segment per collection. Minimal WAL mutation logging and `open()` replay for WAL-owned collection lifecycles now exist, but full crash-style recovery guarantees, compaction, and multi-segment orchestration are still future work.
 
 ## 6. Query and optimize model
 
@@ -328,6 +339,9 @@ Current verified `knowhere-rs` findings already influenced HannsDB design:
 - embedded Python document APIs: `upsert`, `fetch`, `delete`, `query(filter)`, `flush`, `stats`
 - thin daemon document APIs: insert/upsert/fetch/filter-search
 - standalone optimize benchmark path
+- minimal append-only WAL at `<root>/wal.jsonl`
+- WAL mutation logging for collection/data writes
+- minimal `open()` replay for WAL-owned collection lifecycles without duplicate materialization on normal reopen
 
 ### Partially implemented
 
@@ -335,15 +349,16 @@ Current verified `knowhere-rs` findings already influenced HannsDB design:
 - daemon admin surface
 - benchmark tooling and notes
 - `knowhere-rs` performance verification
+- durability foundation (`flush_collection()` semantics and stronger recovery guarantees still pending)
 
 ### Not implemented yet
 
-- WAL and crash recovery
 - multi-segment lifecycle
 - compaction
 - richer schema/payload indexing
 - filter execution beyond current minimal shape
 - full production-grade daemon responsibilities
+- full crash-style recovery semantics and durable flush guarantees
 
 ## 10. Main risks
 
@@ -357,7 +372,7 @@ This was already happening. The repo had detailed dated docs and detailed benchm
 
 ### Risk 3: core durability is still incomplete
 
-Without WAL/recovery, the project is benchmarkable but not yet robust enough to call the storage layer finished.
+The project now has minimal WAL logging and replay, but durability is still not finished until `flush_collection()` has explicit guarantees and crash-style recovery cases are proven.
 
 ### Risk 4: benchmark success can mask product gaps
 

@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hannsdb_core::catalog::ManifestMetadata;
 use hannsdb_core::db::HannsDb;
+use hannsdb_core::document::CollectionSchema;
+use hannsdb_core::wal::{append_wal_record, WalRecord};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -231,6 +233,80 @@ fn collection_api_flush_collection_succeeds_for_existing_collection() {
 }
 
 #[test]
+fn collection_api_open_replay_does_not_touch_pre_wal_collection_under_partial_storage() {
+    let root = unique_temp_dir("hannsdb_collection_api_replay_pre_wal_guard");
+
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("legacy", 2, "l2")
+            .expect("create legacy collection");
+        db.insert("legacy", &[7], &[0.2_f32, 0.2])
+            .expect("insert into legacy");
+        db.flush_collection("legacy").expect("flush legacy");
+    }
+
+    fs::remove_file(root.join("wal.jsonl")).expect("remove historical wal");
+    let replay_schema = CollectionSchema::new("vector", 2, "l2", Vec::new());
+    append_wal_record(
+        &root.join("wal.jsonl"),
+        &WalRecord::CreateCollection {
+            collection: "replay_only".to_string(),
+            schema: replay_schema,
+        },
+    )
+    .expect("append replay create");
+    append_wal_record(
+        &root.join("wal.jsonl"),
+        &WalRecord::Insert {
+            collection: "replay_only".to_string(),
+            ids: vec![99],
+            vectors: vec![0.0_f32, 0.0],
+        },
+    )
+    .expect("append replay insert");
+
+    let db = HannsDb::open(&root).expect("reopen db and replay wal");
+    let legacy_hits = db
+        .search("legacy", &[0.2_f32, 0.2], 1)
+        .expect("legacy search should remain available");
+    assert_eq!(legacy_hits.len(), 1);
+    assert_eq!(legacy_hits[0].id, 7, "legacy collection must not be touched");
+
+    let replay_hits = db
+        .search("replay_only", &[0.0_f32, 0.0], 1)
+        .expect("replayed collection should be restored");
+    assert_eq!(replay_hits.len(), 1);
+    assert_eq!(replay_hits[0].id, 99);
+}
+
+#[test]
+fn collection_api_flush_collection_succeeds_after_create_and_insert() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_after_insert");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10, 20], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    db.flush_collection("docs")
+        .expect("flush should succeed after create+insert");
+}
+
+#[test]
+fn collection_api_flush_collection_succeeds_after_create_insert_and_delete() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_after_delete");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10, 20], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.delete("docs", &[10]).expect("delete one id");
+
+    db.flush_collection("docs")
+        .expect("flush should succeed after create+delete");
+}
+
+#[test]
 fn collection_api_flush_collection_missing_returns_not_found() {
     let root = unique_temp_dir("hannsdb_collection_api_flush_missing");
     let db = HannsDb::open(&root).expect("open db");
@@ -238,6 +314,50 @@ fn collection_api_flush_collection_missing_returns_not_found() {
     let err = db
         .flush_collection("missing")
         .expect_err("missing collection flush should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_flush_collection_fails_when_wal_is_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_missing_wal");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
+
+    let err = db
+        .flush_collection("docs")
+        .expect_err("flush should fail when wal is missing");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_flush_collection_fails_when_segment_is_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_missing_segment");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    fs::remove_file(root.join("collections").join("docs").join("segment.json"))
+        .expect("remove segment");
+
+    let err = db
+        .flush_collection("docs")
+        .expect_err("flush should fail when segment metadata is missing");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn collection_api_flush_collection_fails_when_tombstones_are_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_missing_tombstones");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    fs::remove_file(root.join("collections").join("docs").join("tombstones.json"))
+        .expect("remove tombstones");
+
+    let err = db
+        .flush_collection("docs")
+        .expect_err("flush should fail when tombstones metadata is missing");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 

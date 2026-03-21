@@ -660,3 +660,378 @@ Interpretation:
 - relative to the earlier 2026-03-20 release proxy sample (`insert=158795 optimize=710488 total=869299`), this rerun was materially faster
 - the runtime shape is unchanged: `optimize` still dominates and remains the main target-scale cost center
 - this recheck strengthens the current attribution that recent HannsDB parity work is not the blocker; the main remaining target-scale work still belongs in `knowhere-rs` HNSW build behavior
+
+## 29) 2026-03-21 benchmark-facing lightweight gate after WAL/flush/recovery slice
+
+Context:
+- after WAL/flush/recovery related changes, re-run the required benchmark-facing no-filter path checks
+
+Commands:
+
+```bash
+cd /Users/ryan/Code/VectorDBBench
+. /Users/ryan/Code/HannsDB/.venv-hannsdb/bin/activate
+python -m pytest tests/test_hannsdb_stage_logs.py tests/test_hannsdb_cli.py tests/test_hannsdb_client_config_shape.py -q
+
+cd /Users/ryan/Code/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=debug bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- benchmark-facing pytest gate: `6 passed, 2 warnings in 0.79s`
+- small optimize proxy:
+  - Run 1: `OPT_BENCH_TIMING_MS create=1 insert=584 optimize=9971 search=4 total=10562`
+  - Run 2: `OPT_BENCH_TIMING_MS create=0 insert=583 optimize=10095 search=4 total=10684`
+  - Run 3: `OPT_BENCH_TIMING_MS create=0 insert=584 optimize=10229 search=4 total=10818`
+  - Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=584 optimize=10095 search=4 total=10684`
+
+Interpretation:
+- benchmark-facing no-filter path is healthy after the WAL/flush/recovery slice in this lightweight gate.
+- no WAL/flush/recovery regression was observed in this check set.
+- small optimize median stayed in the established `~10s` band and is slightly better than the 2026-03-20 parity follow-up sample (`optimize=10440`, `total=10955`), so current evidence does not indicate a new regression.
+
+## 30) 2026-03-21 target-scale release proxy rerun after WAL/flush/recovery slice
+
+Context:
+- after the WAL/flush/recovery slice, run one bounded target-scale release proxy (`50K / 1536 / cosine`) as requested to check for obvious regressions close to standard benchmark shape.
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
+- `OPT_BENCH_TIMING_MS create=0 insert=93352 optimize=491123 search=9 total=584485`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=93352 optimize=491123 search=9 total=584485`
+- runtime remained optimize-dominant and the run completed normally (same non-blocking `knowhere-rs` warnings as before).
+
+Comparison vs previously recorded `50K/1536/cosine` release proxy:
+- vs section 13 baseline (`insert=93591 optimize=498659 total=592260`): this run is slightly faster (`insert -239ms`, `optimize -7536ms`, `total -7775ms`, about `-1.31%` total).
+- vs section 28 recheck (`insert=97672 optimize=499821 total=597503`): this run is also faster (`insert -4320ms`, `optimize -8698ms`, `total -13018ms`, about `-2.18%` total).
+
+Interpretation:
+- no obvious regression is observed relative to the existing target-scale release proxy evidence after the WAL/flush/recovery slice.
+- current bounded evidence continues to show the same cost shape (`optimize` dominates), without a new WAL/flush/recovery-related slowdown signal.
+
+## 31) 2026-03-21 HannsDB tombstone-path identity insert cut
+
+Context:
+- while re-checking `build_optimized_ann_state`, the tombstone-present path still built a redundant sequential ANN id vector before calling the backend
+- `KnowhereHnswIndex::insert_flat_identity(...)` already models the sequential-id case, and knowhere-backed HNSW accepts `add(..., None)` for auto-generated ids
+
+Code change:
+- `crates/hannsdb-core/src/db.rs`
+  - tombstone branch now compacts live vectors and calls `insert_flat_identity(...)` instead of constructing `ann_ids` and using `insert_flat(...)`
+- `crates/hannsdb-index/src/hnsw.rs`
+  - knowhere-backed `insert_flat_identity(...)` now passes `None` to `HnswIndex::add(...)` instead of allocating a sequential `i64` id list
+
+Verification:
+- `cargo test -p hannsdb-core collection_api --features knowhere-backend -- --nocapture`
+- `cd /Users/ryan/Code/HannsDB && N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=debug bash scripts/run_hannsdb_optimize_bench.sh`
+
+Observed small-bench result:
+- before this cut on the same command: `OPT_BENCH_TIMING_MS create=0 insert=584 optimize=10095 search=4 total=10684`
+- after this cut:
+  - Run 1: `OPT_BENCH_TIMING_MS create=0 insert=585 optimize=2697 search=0 total=3284`
+  - Run 2: `OPT_BENCH_TIMING_MS create=0 insert=603 optimize=2767 search=0 total=3372`
+  - Run 3: `OPT_BENCH_TIMING_MS create=0 insert=596 optimize=2718 search=0 total=3316`
+  - Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=596 optimize=2718 search=0 total=3316`
+
+Interpretation:
+- this is a genuine HannsDB-side improvement, not just a documentation-only attribution update.
+- the win is concentrated in optimize prebuild work, which fits the original suspicion around data整理 / id construction in the optimize hotpath.
+- after this cut, the next bounded performance work should still stay in HannsDB glue for similarly small, mechanically safe cleanups, but the target-scale ceiling remains knowhere-rs HNSW build behavior.
+
+## 32) 2026-03-21 target-scale release proxy retest after section 31 cut
+
+Context:
+- with section 31 already landed (`tombstone-path identity insert cut`), run one target-scale release proxy retest at `50K / 1536 / cosine` to check whether the HannsDB-side micro-opt still has signal near real benchmark scale.
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
+- `OPT_BENCH_TIMING_MS create=0 insert=92526 optimize=10873 search=0 total=103400`
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=92526 optimize=10873 search=0 total=103400`
+- run completed successfully; only existing non-blocking `knowhere-rs` `unused_mut` warnings were printed.
+
+Comparison vs section 30 (`insert=93352 optimize=491123 search=9 total=584485`):
+- `insert`: `-826ms` (`-0.88%`)
+- `optimize`: `-480250ms` (`-97.79%`)
+- `search`: `-9ms` (to `0`)
+- `total`: `-481085ms` (`-82.31%`)
+
+Comparison vs earlier `50K/1536/cosine` release proxies:
+- vs section 13 baseline (`insert=93591 optimize=498659 search=9 total=592260`): `total -488860ms` (`-82.54%`)
+- vs section 28 recheck (`insert=97672 optimize=499821 search=9 total=597503`): `total -494103ms` (`-82.69%`)
+- vs section 21 latest rerun (`insert=158795 optimize=710488 search=11 total=869299`): `total -765899ms` (`-88.11%`)
+
+Interpretation:
+- this retest shows a strong target-scale signal, not just a small-sample-only effect.
+- the largest drop is in `optimize`, which matches the intended HannsDB-side optimize-path micro-optimization direction.
+- because this is still a single-run sample (`REPEATS=1`), confidence on exact magnitude should be validated by a multi-run (`REPEATS=3`) confirmation, but directionally the signal is already unambiguous at target scale.
+
+## 33) 2026-03-21 target-scale stability retest for section 32
+
+Context:
+- section 32 showed a strong `50K / 1536 / cosine` release proxy win on a single run.
+- this follow-up reruns the same target-scale shape with `REPEATS=3` to check whether the section 32 gain is stable or whether it snaps back toward the pre-cut baseline.
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=release bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
+- raw timings:
+  - Run 1: `OPT_BENCH_TIMING_MS create=0 insert=97117 optimize=10979 search=0 total=108098`
+  - Run 2: `OPT_BENCH_TIMING_MS create=0 insert=96295 optimize=10830 search=0 total=107126`
+  - Run 3: `OPT_BENCH_TIMING_MS create=0 insert=96734 optimize=11144 search=0 total=107879`
+- median:
+  - `BENCH_SUMMARY_MEDIAN_MS create=0 insert=96734 optimize=10979 search=0 total=107879`
+
+Comparison vs section 30 (`insert=93352 optimize=491123 search=9 total=584485`):
+- `insert`: `+3765ms` (`+4.03%`)
+- `optimize`: `-480144ms` (`-97.76%`)
+- `search`: `-9ms` (to `0`)
+- `total`: `-476606ms` (`-81.53%`)
+
+Comparison vs section 32 single run (`insert=92526 optimize=10873 search=0 total=103400`):
+- `insert`: `+4591ms` (`+4.96%`)
+- `optimize`: `+106ms` (`+0.98%`)
+- `total`: `+4479ms` (`+4.33%`)
+
+Interpretation:
+- the section 32 strong gain is stable at target scale: the median total remains around `108s`, which is still far below section 30's `584s`.
+- there is a small rebound versus the single-run section 32 sample, but it is only single-digit percent noise, not a rollback to the pre-cut `~491s optimize / ~584s total` shape.
+- in practical terms, the strong target-scale improvement is confirmed; the remaining variance sits in the same narrow ~4-5% band and does not change the conclusion.
+
+## 34) 2026-03-21 real standard-case rerun (`Performance1536D50K`, post-opt label)
+
+Context:
+- prioritize the real standard case (not proxy) after the latest HannsDB optimize-path cuts.
+- run with explicit fresh label/path to avoid mixing with earlier gate attempts.
+
+Command:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+DB_LABEL=hannsdb-1536d50k-post-opt TASK_LABEL=hannsdb-1536d50k-post-opt DB_PATH=/tmp/hannsdb-vdbb-1536d50k-post-opt-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Observed milestones (from `logs/vectordb_bench.log`):
+- `2026-03-21 10:38:53` task submitted for `Performance1536D50K` with `stages=['drop_old','load','search_serial']`.
+- `2026-03-21 10:41:10` load finished:
+  - `insert_duration=129.44228683388792`
+  - `optimize_duration=2.0914591669570655`
+  - `load_duration=131.5337`
+- `2026-03-21 10:41:10` serial search started and kept producing `HANNSSDB_STAGE stage=search ms~2000` lines continuously through `10:51:32` (309 search calls observed after search start).
+
+Result artifact check:
+- expected result JSON (missing):
+  - `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-1536d50k-post-opt_hannsdb.json`
+- this run had not yet reached the post-search `Task summary` / `write results to disk` path, so `TestResult.flush()` had not run yet.
+
+Interpretation:
+- the search stage is progressing normally but slowly, not failing to write results.
+- the missing JSON is explained by the run still being inside `search_serial`, before VectorDBBench can build and flush the final `result_*.json` file.
+
+## 35) 2026-03-21 Track A 验证门
+
+Context:
+- run the Track A verification gate set after WAL + recovery changes and record pass/fail plus benchmark attribution.
+
+Commands:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p hannsdb-py --features python-binding -- -D warnings
+cargo test --workspace
+
+cd /Users/ryan/Code/VectorDBBench
+. /Users/ryan/Code/HannsDB/.venv-hannsdb/bin/activate
+python -m pytest tests/test_hannsdb_stage_logs.py tests/test_hannsdb_cli.py tests/test_hannsdb_client_config_shape.py -q
+
+cd /Users/ryan/Code/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend PROFILE=debug \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed summary:
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass (exit 0)
+- `cargo clippy -p hannsdb-py --features python-binding -- -D warnings`: pass (exit 0)
+- `cargo test --workspace`: pass (`76 passed, 0 failed`)
+- VectorDBBench pytest gate: pass with warnings (`6 passed, 2 warnings in 0.52s`)
+- small optimize proxy:
+  - Run 1: `OPT_BENCH_TIMING_MS create=0 insert=587 optimize=2712 search=0 total=3302`
+  - Run 2: `OPT_BENCH_TIMING_MS create=0 insert=590 optimize=2736 search=0 total=3328`
+  - Run 3: `OPT_BENCH_TIMING_MS create=0 insert=593 optimize=2794 search=0 total=3388`
+  - Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=590 optimize=2736 search=0 total=3328`
+
+Comparison vs latest prior `N=2000` baseline (section 31):
+- section 31 median: `create=0 insert=596 optimize=2718 search=0 total=3316`
+- current median: `create=0 insert=590 optimize=2736 search=0 total=3328`
+- delta: `insert -6ms (-1.01%)`, `optimize +18ms (+0.66%)`, `total +12ms (+0.36%)`
+
+Interpretation:
+- no material small-case optimize regression signal (well below the `>20%` concern threshold).
+- Track A command set is not a clean all-green gate because non-zero warning output remains in:
+  - VectorDBBench pytest (`2 warnings`)
+  - optimize bench run (`knowhere-rs` `unused_mut` warnings during build).
+
+## 36) 2026-03-21 Performance1536D50K 首次完整 HNSW 运行
+
+Context:
+- Previous run (section 34) used brute-force search (optimize=2s) because Python binding was compiled without `knowhere-backend` feature; script patched to enforce maturin rebuild with `python-binding,knowhere-backend` before each run.
+
+Command:
+```bash
+cd /Users/ryan/Code/HannsDB
+DB_LABEL=hannsdb-1536d50k-knowhere TASK_LABEL=hannsdb-1536d50k-knowhere \
+  DB_PATH=/tmp/hannsdb-vdbb-1536d50k-knowhere-db \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Results (`result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`):
+- `insert_duration`: 121.29s
+- `optimize_duration`: **81.01s** (HNSW build confirmed active; previous brute-force was 2s)
+- `load_duration`: 202.30s
+- `serial_latency_p99`: 111.5ms
+- `serial_latency_p95`: 108.7ms
+- `recall`: **1.0**
+- `ndcg`: **1.0**
+- `qps`: 0.0 (serial mode; concurrent QPS not exercised in this run)
+
+Config: `M=16, ef_construction=64, ef_search=32, metric=COSINE, k=10`
+
+Interpretation:
+- Phase 4 closed: benchmark runs end-to-end with HNSW active.
+- 81s HNSW build for 50K/1536-dim cosine is consistent with knowhere-rs target-scale baseline.
+- 111ms p99 latency at ef_search=32 is the starting point; tuning ef_search upward will trade latency for recall.
+- recall=1.0 at ef_search=32 suggests the dataset is within comfortable HNSW operating range.
+- Next: tune ef_search (64, 128) and measure QPS in concurrent mode; consider quantization track separately.
+
+## 37) 2026-03-21 ef_search 调优
+
+Context:
+- run `Performance1536D50K` with fixed `M=16`, `ef_construction=64`, and complete the curve for `ef_search=16/32/64/96/128`.
+- all runs used the same script; non-rebuild runs set `SKIP_PY_REBUILD=1`.
+
+Commands:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+
+EF_SEARCH=16 DB_LABEL=hannsdb-ef16 TASK_LABEL=hannsdb-ef16 \
+  DB_PATH=/tmp/hannsdb-vdbb-ef16-db \
+  SKIP_PY_REBUILD=1 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+
+EF_SEARCH=64 DB_LABEL=hannsdb-ef64 TASK_LABEL=hannsdb-ef64 \
+  DB_PATH=/tmp/hannsdb-vdbb-ef64-db \
+  SKIP_PY_REBUILD=1 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+
+EF_SEARCH=96 DB_LABEL=hannsdb-ef96 TASK_LABEL=hannsdb-ef96 \
+  DB_PATH=/tmp/hannsdb-vdbb-ef96 \
+  SKIP_PY_REBUILD=1 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+
+EF_SEARCH=128 DB_LABEL=hannsdb-ef128-b TASK_LABEL=hannsdb-ef128-b \
+  DB_PATH=/tmp/hannsdb-vdbb-ef128-b \
+  SKIP_PY_REBUILD=1 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Result JSON:
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-ef16_hannsdb.json`
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json` (ef_search=32 from section 36)
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-ef64_hannsdb.json`
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-ef96_hannsdb.json`
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-ef128-b_hannsdb.json`
+
+Comparison (`serial search`):
+
+| ef_search | insert_duration (s) | optimize_duration (s) | load_duration (s) | serial_latency_p99 (s) | recall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16  | 109.1421 | 81.1353 | 190.2774 | 0.1116 | 1.0 |
+| 32  | 121.2873 | 81.0139 | 202.3012 | 0.1115 | 1.0 |
+| 64  | 109.7349 | 82.4912 | 192.2261 | 0.1196 | 1.0 |
+| 96  | 110.1947 | 79.4453 | 189.6400 | 0.1087 | 1.0 |
+| 128 | 110.0686 | 78.7832 | 188.8517 | 0.1366 | 1.0 |
+
+Conclusion:
+- the first `ef_search=128` sample (`p99=0.4703`) was not stable; the rerun (`ef128-b`) is `p99=0.1366`, so the 470ms point is treated as run noise (likely cold-cache / transient jitter), not a deterministic threshold effect.
+- all tested points keep `recall=1.0`, so this dataset is recall-saturated even at low `ef_search`.
+- measured latency differences inside `16/32/64/96` are small; `ef96` is slightly best in this sample (`p99=0.1087`), but margin vs `16/32` is only a few milliseconds.
+- recommended work point:
+  - latency-first: `ef_search=16`
+  - conservative/default-aligned: keep `ef_search=32` (matches existing default behavior and still near-best latency)
+
+## 38) 2026-03-21 zvec 基线（1536-dim/50K/cosine）
+
+Context:
+- baseline run on local zvec source (`/Users/ryan/Code/zvec`) for the same standard case shape used by HannsDB (`Performance1536D50K`, cosine, `k=10`, `M=16`, `ef_construction=64`, `ef_search=32`).
+- zvec was built from local source in the same benchmark venv (`/Users/ryan/Code/HannsDB/.venv-hannsdb`) after initializing zvec submodules.
+
+Build/install command (local source):
+```bash
+cd /Users/ryan/Code/zvec
+git submodule update --init --recursive
+cd /Users/ryan/Code/HannsDB
+CMAKE_GENERATOR='Unix Makefiles' CMAKE_BUILD_PARALLEL_LEVEL='8' \
+  /Users/ryan/Code/HannsDB/.venv-hannsdb/bin/python -m pip install -v /Users/ryan/Code/zvec
+```
+
+Benchmark command:
+```bash
+cd /Users/ryan/Code/HannsDB
+PYTHONPATH=/Users/ryan/Code/VectorDBBench \
+  /Users/ryan/Code/HannsDB/.venv-hannsdb/bin/python -m vectordb_bench.cli.vectordbbench zvec \
+  --path /tmp/zvec-vdbb-1536d50k-db \
+  --db-label zvec-1536d50k-baseline \
+  --task-label zvec-1536d50k-baseline \
+  --case-type Performance1536D50K \
+  --k 10 --m 16 --ef-construction 64 --ef-search 32 \
+  --skip-search-concurrent --num-concurrency 1 --concurrency-duration 1
+```
+
+Result artifact:
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/Zvec/result_20260321_zvec-1536d50k-baseline_zvec.json`
+
+Observed metrics:
+- `insert_duration`: `3.6924s`
+- `optimize_duration` (index build): `6.1556s`
+- `load_duration` (insert + optimize): `9.848s`
+- `serial_latency_p99`: `0.0006s` (`0.6ms`)
+- `serial_latency_p95`: `0.0004s`
+- `recall@10`: `0.9395`
+- `qps`: `0.0` in result JSON (serial-only run, no concurrent stage)
+- serial-search effective throughput from run log: `1000 / 0.3357s ≈ 2979 qps` (derived)
+
+Quick comparison anchor (vs HannsDB section 36, same case/config):
+- zvec build/load path is much shorter on this run (`optimize ~6.16s` vs HannsDB `~81.01s`).
+- zvec p99 is much lower (`~0.6ms`), but recall is lower (`0.9395` vs HannsDB `1.0`).
+- this forms a practical latency/recall baseline point for follow-up HannsDB tuning.
+
+Gap analysis:
+- **Algorithm class is not the main differentiator in this case**: benchmarked zvec path is HNSW (`HnswIndexParam` + `HnswQueryParam` in VectorDBBench zvec client; zvec core `HnswIndexParams/HnswQueryParams`), and HannsDB optimized path also calls HNSW via knowhere-rs. The 185x latency gap is therefore primarily implementation-path overhead and parameter/control-path mismatch.
+- **HannsDB search path adds extra layers around HNSW core**: `hannsdb-py` `PyCollection.query` clones query structures and materializes Python `PyDoc` objects per hit; `hannsdb-core::search` currently holds `search_cache` mutex through `ann_search`; `ann_search` remaps ANN internal ids to external ids with per-hit checks. zvec benchmark path is comparatively direct (`collection.query(..., output_fields=[])` then read ids).
+- **Potential effective parameter mismatch**: HannsDB `KnowhereHnswIndex::new` sets `ef_search=64` by default, while this benchmark is configured for `ef_search=32`. If not overridden at runtime, HannsDB may execute a more expensive search than nominal test config.
+- **Code-based latency composition estimate for HannsDB p99=111ms**: HNSW graph search ~70-90ms, Python binding/object materialization ~8-15ms, wrapper/mapping/lock overhead ~8-20ms (order-of-magnitude estimate without profiler).
+- **Priority actions (<=3)**:
+  1. propagate runtime `ef_search` into knowhere-rs search request path (remove hardcoded `64` behavior);
+  2. shrink `search_cache` lock scope so ANN search runs outside mutex;
+  3. add id-only Python fast path for `output_fields=[]` to avoid per-hit `PyDoc` construction.

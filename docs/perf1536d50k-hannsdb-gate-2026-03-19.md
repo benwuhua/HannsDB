@@ -279,3 +279,29 @@ Fixcheck conclusion:
 - the diagnostic target fix **is effective**
 - `sample_worker` now points at the real worker subprocess (`spawn_main`), and the `cmd=` string does **not** contain `resource_tracker`
 - the run still ends in `stall_timeout_no_result`, so the gate remains unresolved, but the diagnostic sampling behavior is corrected
+
+## 2026-03-21 post-opt direct rerun on real standard case
+
+Command executed:
+
+```bash
+cd /Users/ryan/Code/HannsDB
+DB_LABEL=hannsdb-1536d50k-post-opt TASK_LABEL=hannsdb-1536d50k-post-opt DB_PATH=/tmp/hannsdb-vdbb-1536d50k-post-opt-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Observed stage evidence:
+- real `Performance1536D50K` task started successfully with standard stage chain (`drop_old/load/search_serial`).
+- load completed at `2026-03-21 10:41:10`:
+  - `insert_duration=129.44228683388792`
+  - `optimize_duration=2.0914591669570655`
+  - `load_duration=131.5337`
+- serial search started immediately and kept progressing with repeated `HANNSSDB_STAGE stage=search ms~2000` logs until the latest observed log line at `10:51:32` (309 search calls observed after search start).
+
+Result artifact status:
+- expected JSON was not generated:
+  - `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-1536d50k-post-opt_hannsdb.json`
+- no `Task summary` or `write results to disk` line appeared yet, so VectorDBBench had not reached `TestResult.flush()`.
+
+Gate conclusion update:
+- this run demonstrates the real standard-case path reaches and sustains search execution with the post-opt code.
+- the absence of final JSON is explained by the search stage still being in flight, not by a broken result-write chain.

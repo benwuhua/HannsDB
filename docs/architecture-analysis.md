@@ -19,6 +19,11 @@ ANN adapter, HTTP daemon, and Python bindings—sharing a single Rust workspace.
 | knowhere-rs feature-gated | Allows fallback to brute-force when ANN backend unavailable |
 | Dual surface (Python + HTTP) | One Rust core exposed through PyO3 bindings and Axum REST API |
 
+**Execution note:** This document is the target architecture baseline for the
+next implementation tranche. Where current code still differs, follow the
+design intent here only after the corresponding change is explicitly planned and
+verified.
+
 ---
 
 ## 2. System Architecture
@@ -93,7 +98,7 @@ ANN adapter, HTTP daemon, and Python bindings—sharing a single Rust workspace.
 **Storage layout per collection:**
 
 ```
-<db_root>/<collection_name>/
+<db_root>/collections/<collection_name>/
 ├── collection.json     # name, dimension, metric, schema
 ├── segment.json        # segment ID, record count, deleted count
 ├── records.bin         # f32 vectors, row-major, append-only
@@ -108,7 +113,8 @@ ANN adapter, HTTP daemon, and Python bindings—sharing a single Rust workspace.
 - **Delete:** O(1) tombstone flip (soft delete)
 - **Upsert:** tombstone old + append new
 - **Search (brute):** O(n) linear scan with distance calculation
-- **Search (ANN):** O(log n) via knowhere-rs HNSW after `optimize_collection()`
+- **Search (ANN):** Approximate nearest-neighbor search via knowhere-rs HNSW
+  after `optimize_collection()`
 
 **Supported metrics:** L2, Cosine (1 − similarity), IP (negated)
 
@@ -124,10 +130,10 @@ ANN adapter, HTTP daemon, and Python bindings—sharing a single Rust workspace.
 
 ```rust
 trait HnswBackend {
-    fn insert(&mut self, ids: &[i64], vectors: &[f32], dim: usize) -> Result<()>;
-    fn insert_flat(&mut self, vectors: &[f32], dim: usize) -> Result<()>;
+    fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<()>;
+    fn insert_flat(&mut self, ids: &[u64], vectors: &[f32], dim: usize) -> Result<()>;
     fn insert_flat_identity(&mut self, vectors: &[f32], dim: usize) -> Result<()>;
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>>;
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<HnswSearchHit>>;
 }
 ```
 
@@ -157,19 +163,20 @@ trait HnswBackend {
 | GET/POST | `/collections` | List / Create collection |
 | GET/DELETE | `/collections/:name` | Info / Drop collection |
 | GET | `/collections/:name/stats` | Collection statistics |
-| POST | `/collections/:name/admin/flush` | Flush to disk |
+| POST | `/collections/:name/admin/flush` | Validate minimal flush boundary (`collection.json`, `segment.json`, `tombstones.json`, `wal.jsonl` are readable) |
 | POST/DELETE | `/collections/:name/records` | Insert / Delete records |
 | POST | `/collections/:name/records/upsert` | Upsert records |
 | POST | `/collections/:name/records/fetch` | Fetch by ID |
-| POST | `/collections/:name/search` | Search (with optional filter) |
+| POST | `/collections/:name/search` | Search (with optional filter and optional `output_fields`) |
 
 ### 3.4 hannsdb-py
 
 **Purpose:** Python bindings via PyO3 (abi3-py39+).
 
 Exposes the same collection lifecycle, CRUD, and query operations as the core,
-wrapped in Python-friendly `Collection` class with `init()`, `open()`,
-`create_and_open()` module-level functions.
+including `insert`, `upsert`, `fetch`, `delete`, `query`, `flush`, `stats`,
+and `optimize`, wrapped in a Python-friendly `Collection` class with `init()`,
+`open()`, and `create_and_open()` module-level functions.
 
 ---
 
@@ -238,7 +245,8 @@ Client → insert(collection, ids, vectors, payloads)
   → Append IDs to ids.bin (binary i64)
   → Append payloads to payloads.jsonl (one JSON per line)
   → Update segment metadata (record count)
-  → Flush to disk
+  → Persist metadata/tombstone side files as needed
+  (Full durability semantics remain limited until WAL exists)
 ```
 
 ### 5.2 Search Path (Brute-Force)
@@ -250,8 +258,8 @@ Client → search(collection, query_vector, top_k, filter?)
   → For each non-deleted vector:
       → If filter: evaluate filter expression against payload
       → Compute distance (L2 / Cosine / IP)
-      → Maintain top-k min-heap
-  → Return sorted results
+      → Collect candidate hits
+  → Sort by distance and truncate to top-k
 ```
 
 ### 5.3 Search Path (ANN / Optimized)
@@ -272,7 +280,7 @@ Client → search(collection, query_vector, top_k)
 
 ```
 Client → delete(collection, ids)
-  → Look up row positions for IDs
+  → Linear-scan stored IDs to find matching live rows
   → Set tombstone bits
   → Persist tombstones.json
   → Increment deleted count in segment metadata

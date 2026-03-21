@@ -16,6 +16,9 @@ use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
     load_records, SegmentMetadata, TombstoneMask,
 };
+use crate::wal::{append_wal_record, load_wal_records, WalRecord};
+
+const DEFAULT_EF_SEARCH: usize = 32;
 
 pub struct HannsDb {
     root: PathBuf,
@@ -68,10 +71,12 @@ impl HannsDb {
             let _ = ManifestMetadata::load_from_path(&manifest_path)?;
         }
 
-        Ok(Self {
+        let mut db = Self {
             root: root.to_path_buf(),
             search_cache: Mutex::new(HashMap::new()),
-        })
+        };
+        db.replay_wal_if_needed()?;
+        Ok(db)
     }
 
     pub fn create_collection(
@@ -91,6 +96,15 @@ impl HannsDb {
         name: &str,
         schema: &CollectionSchema,
     ) -> io::Result<()> {
+        self.create_collection_with_schema_internal(name, schema, true)
+    }
+
+    fn create_collection_with_schema_internal(
+        &mut self,
+        name: &str,
+        schema: &CollectionSchema,
+        log_wal: bool,
+    ) -> io::Result<()> {
         if schema.dimension == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -104,6 +118,16 @@ impl HannsDb {
                 io::ErrorKind::AlreadyExists,
                 format!("collection already exists: {name}"),
             ));
+        }
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::CreateCollection {
+                    collection: name.to_string(),
+                    schema: schema.clone(),
+                },
+            )?;
         }
 
         fs::create_dir_all(&paths.dir)?;
@@ -128,12 +152,25 @@ impl HannsDb {
     }
 
     pub fn drop_collection(&mut self, name: &str) -> io::Result<()> {
+        self.drop_collection_internal(name, true)
+    }
+
+    fn drop_collection_internal(&mut self, name: &str, log_wal: bool) -> io::Result<()> {
         let paths = self.collection_paths(name);
         if !paths.dir.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("collection not found: {name}"),
             ));
+        }
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::DropCollection {
+                    collection: name.to_string(),
+                },
+            )?;
         }
 
         fs::remove_dir_all(&paths.dir)?;
@@ -153,6 +190,9 @@ impl HannsDb {
     pub fn flush_collection(&self, name: &str) -> io::Result<()> {
         let paths = self.collection_paths(name);
         let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
+        let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
+        let _ = load_wal_records(&wal_path(&self.root))?;
         Ok(())
     }
 
@@ -195,6 +235,16 @@ impl HannsDb {
         collection: &str,
         external_ids: &[i64],
         vectors: &[f32],
+    ) -> io::Result<usize> {
+        self.insert_internal(collection, external_ids, vectors, true)
+    }
+
+    fn insert_internal(
+        &mut self,
+        collection: &str,
+        external_ids: &[i64],
+        vectors: &[f32],
+        log_wal: bool,
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
@@ -243,6 +293,17 @@ impl HannsDb {
             }
         }
 
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::Insert {
+                    collection: collection.to_string(),
+                    ids: external_ids.to_vec(),
+                    vectors: vectors.to_vec(),
+                },
+            )?;
+        }
+
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
         let inserted = append_records(&paths.records, collection_meta.dimension, vectors)?;
         let _ = append_record_ids(&paths.external_ids, external_ids)?;
@@ -267,6 +328,15 @@ impl HannsDb {
         collection: &str,
         documents: &[Document],
     ) -> io::Result<usize> {
+        self.insert_documents_internal(collection, documents, true)
+    }
+
+    fn insert_documents_internal(
+        &mut self,
+        collection: &str,
+        documents: &[Document],
+        log_wal: bool,
+    ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
@@ -282,6 +352,16 @@ impl HannsDb {
                     format!("external id already exists: {}", document.id),
                 ));
             }
+        }
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::InsertDocuments {
+                    collection: collection.to_string(),
+                    documents: documents.to_vec(),
+                },
+            )?;
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
@@ -305,6 +385,15 @@ impl HannsDb {
         collection: &str,
         documents: &[Document],
     ) -> io::Result<usize> {
+        self.upsert_documents_internal(collection, documents, true)
+    }
+
+    fn upsert_documents_internal(
+        &mut self,
+        collection: &str,
+        documents: &[Document],
+        log_wal: bool,
+    ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
@@ -312,6 +401,16 @@ impl HannsDb {
         let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
 
         validate_documents(documents, collection_meta.dimension)?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::UpsertDocuments {
+                    collection: collection.to_string(),
+                    documents: documents.to_vec(),
+                },
+            )?;
+        }
 
         for document in documents {
             mark_live_id_deleted(
@@ -374,10 +473,29 @@ impl HannsDb {
     }
 
     pub fn delete(&mut self, collection: &str, external_ids: &[i64]) -> io::Result<usize> {
+        self.delete_internal(collection, external_ids, true)
+    }
+
+    fn delete_internal(
+        &mut self,
+        collection: &str,
+        external_ids: &[i64],
+        log_wal: bool,
+    ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
         let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
         let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::Delete {
+                    collection: collection.to_string(),
+                    ids: external_ids.to_vec(),
+                },
+            )?;
+        }
 
         let mut newly_deleted = 0usize;
         for (row_idx, stored_id) in stored_ids.iter().enumerate() {
@@ -402,6 +520,18 @@ impl HannsDb {
         query: &[f32],
         top_k: usize,
     ) -> io::Result<Vec<SearchHit>> {
+        self.search_with_ef(collection, query, top_k, DEFAULT_EF_SEARCH)
+    }
+
+    pub fn search_with_ef(
+        &self,
+        collection: &str,
+        query: &[f32],
+        top_k: usize,
+        _ef_search: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        #[cfg(feature = "knowhere-backend")]
+        let ef_search = _ef_search.max(1);
         let mut cache = self
             .search_cache
             .lock()
@@ -416,7 +546,7 @@ impl HannsDb {
             .expect("search cache must contain requested collection");
         #[cfg(feature = "knowhere-backend")]
         if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-            return ann_search(optimized_ann, query, top_k);
+            return ann_search(optimized_ann, query, top_k, ef_search);
         }
 
         search_by_metric(
@@ -545,10 +675,83 @@ impl HannsDb {
         }
         Ok(hits)
     }
+
+    fn replay_wal_if_needed(&mut self) -> io::Result<()> {
+        let records = load_wal_records_or_empty(&wal_path(&self.root))?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let plan = WalReplayPlan::build(&records);
+        if !plan.has_owned_collections() || !plan.requires_replay(self)? {
+            return Ok(());
+        }
+
+        let manifest_path = manifest_path(&self.root);
+        let mut manifest = ManifestMetadata::load_from_path(&manifest_path)?;
+        for collection in plan.owned_collections() {
+            let paths = self.collection_paths(collection);
+            if paths.dir.exists() {
+                fs::remove_dir_all(&paths.dir)?;
+            }
+            manifest.collections.retain(|entry| entry != collection);
+            self.invalidate_search_cache(collection);
+        }
+        manifest.save_to_path(&manifest_path)?;
+        fs::create_dir_all(self.root.join("collections"))?;
+
+        for record in &records {
+            if plan.owns(collection_name_for_wal_record(record)) {
+                self.apply_wal_record(record)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_wal_record(&mut self, record: &WalRecord) -> io::Result<()> {
+        match record {
+            WalRecord::CreateCollection { collection, schema } => {
+                self.create_collection_with_schema_internal(collection, schema, false)
+            }
+            WalRecord::DropCollection { collection } => {
+                let paths = self.collection_paths(collection);
+                if !paths.dir.exists() {
+                    return Ok(());
+                }
+                self.drop_collection_internal(collection, false)
+            }
+            WalRecord::Insert {
+                collection,
+                ids,
+                vectors,
+            } => self
+                .insert_internal(collection, ids, vectors, false)
+                .map(|_| ()),
+            WalRecord::InsertDocuments {
+                collection,
+                documents,
+            } => self
+                .insert_documents_internal(collection, documents, false)
+                .map(|_| ()),
+            WalRecord::UpsertDocuments {
+                collection,
+                documents,
+            } => self
+                .upsert_documents_internal(collection, documents, false)
+                .map(|_| ()),
+            WalRecord::Delete { collection, ids } => {
+                self.delete_internal(collection, ids, false).map(|_| ())
+            }
+        }
+    }
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("manifest.json")
+}
+
+fn wal_path(root: &Path) -> PathBuf {
+    root.join("wal.jsonl")
 }
 
 struct CollectionPaths {
@@ -561,8 +764,136 @@ struct CollectionPaths {
     tombstones: PathBuf,
 }
 
+#[derive(Debug, Default)]
+struct WalCollectionPlan {
+    requires_data_files: bool,
+}
+
+#[derive(Debug, Default)]
+struct WalReplayPlan {
+    collections: HashMap<String, WalCollectionPlan>,
+    dropped_collections: HashSet<String>,
+}
+
+impl WalReplayPlan {
+    fn build(records: &[WalRecord]) -> Self {
+        let mut collections = HashMap::new();
+        let mut dropped_collections = HashSet::new();
+        for record in records {
+            match record {
+                WalRecord::CreateCollection { collection, .. } => {
+                    collections.insert(collection.clone(), WalCollectionPlan::default());
+                    dropped_collections.remove(collection);
+                }
+                WalRecord::DropCollection { collection } => {
+                    if collections.remove(collection).is_some() {
+                        dropped_collections.insert(collection.clone());
+                    }
+                }
+                WalRecord::Insert {
+                    collection, ids, ..
+                } if !ids.is_empty() => {
+                    if let Some(plan) = collections.get_mut(collection) {
+                        plan.requires_data_files = true;
+                    }
+                }
+                WalRecord::InsertDocuments {
+                    collection,
+                    documents,
+                } if !documents.is_empty() => {
+                    if let Some(plan) = collections.get_mut(collection) {
+                        plan.requires_data_files = true;
+                    }
+                }
+                WalRecord::UpsertDocuments {
+                    collection,
+                    documents,
+                } if !documents.is_empty() => {
+                    if let Some(plan) = collections.get_mut(collection) {
+                        plan.requires_data_files = true;
+                    }
+                }
+                WalRecord::Delete { collection, ids } if !ids.is_empty() => {
+                    if let Some(plan) = collections.get_mut(collection) {
+                        plan.requires_data_files = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            collections,
+            dropped_collections,
+        }
+    }
+
+    fn requires_replay(&self, db: &HannsDb) -> io::Result<bool> {
+        let manifest = ManifestMetadata::load_from_path(&manifest_path(&db.root))?;
+        for (collection, plan) in &self.collections {
+            let paths = db.collection_paths(collection);
+            if !manifest.collections.iter().any(|entry| entry == collection) {
+                return Ok(true);
+            }
+            if !paths.collection_meta.exists()
+                || !paths.segment_meta.exists()
+                || !paths.tombstones.exists()
+            {
+                return Ok(true);
+            }
+            if plan.requires_data_files
+                && (!paths.records.exists()
+                    || !paths.external_ids.exists()
+                    || !paths.payloads.exists())
+            {
+                return Ok(true);
+            }
+        }
+        for collection in &self.dropped_collections {
+            let paths = db.collection_paths(collection);
+            if manifest.collections.iter().any(|entry| entry == collection) || paths.dir.exists() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn owned_collections(&self) -> impl Iterator<Item = &str> {
+        self.collections
+            .keys()
+            .chain(self.dropped_collections.iter())
+            .map(String::as_str)
+    }
+
+    fn has_owned_collections(&self) -> bool {
+        !(self.collections.is_empty() && self.dropped_collections.is_empty())
+    }
+
+    fn owns(&self, collection: &str) -> bool {
+        self.collections.contains_key(collection) || self.dropped_collections.contains(collection)
+    }
+}
+
+fn collection_name_for_wal_record(record: &WalRecord) -> &str {
+    match record {
+        WalRecord::CreateCollection { collection, .. }
+        | WalRecord::DropCollection { collection }
+        | WalRecord::Insert { collection, .. }
+        | WalRecord::InsertDocuments { collection, .. }
+        | WalRecord::UpsertDocuments { collection, .. }
+        | WalRecord::Delete { collection, .. } => collection,
+    }
+}
+
 fn load_records_or_empty(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {
     match load_records(path, dimension) {
+        Ok(records) => Ok(records),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_wal_records_or_empty(path: &Path) -> io::Result<Vec<WalRecord>> {
+    match load_wal_records(path) {
         Ok(records) => Ok(records),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err),
@@ -729,21 +1060,18 @@ fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedA
             .len()
             .saturating_sub(state.tombstone.deleted_count());
         ann_external_ids = Vec::with_capacity(live_count);
-        let mut ann_ids = Vec::with_capacity(live_count);
         let mut flat_vectors = Vec::with_capacity(live_count.saturating_mul(state.dimension));
         for (row_idx, vector) in state.records.chunks_exact(state.dimension).enumerate() {
             if state.tombstone.is_deleted(row_idx) {
                 continue;
             }
-            let ann_id = ann_external_ids.len() as u64;
-            ann_ids.push(ann_id);
             flat_vectors.extend_from_slice(vector);
             ann_external_ids.push(state.external_ids[row_idx]);
         }
 
-        if !ann_ids.is_empty() {
+        if !flat_vectors.is_empty() {
             backend
-                .insert_flat(&ann_ids, &flat_vectors, state.dimension)
+                .insert_flat_identity(&flat_vectors, state.dimension)
                 .map_err(adapter_error_to_io)?;
         }
     }
@@ -776,10 +1104,11 @@ fn ann_search(
     optimized_ann: &OptimizedAnnState,
     query: &[f32],
     top_k: usize,
+    ef_search: usize,
 ) -> io::Result<Vec<SearchHit>> {
     let hits = optimized_ann
         .backend
-        .search(query, top_k)
+        .search(query, top_k, ef_search)
         .map_err(adapter_error_to_io)?;
     let mut mapped = Vec::with_capacity(hits.len());
     for hit in hits {

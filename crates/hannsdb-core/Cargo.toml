@@ -13,3 +13,6 @@ knowhere-backend = ["dep:hannsdb-index", "hannsdb-index/knowhere-backend"]
 serde.workspace = true
 serde_json.workspace = true
 hannsdb-index = { path = "../hannsdb-index", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
