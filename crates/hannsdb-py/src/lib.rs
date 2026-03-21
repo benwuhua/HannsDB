@@ -302,6 +302,32 @@ pub fn open(
 }
 
 impl Collection {
+    #[cfg(feature = "python-binding")]
+    fn query_ids_scores(
+        &self,
+        topk: usize,
+        vectors: &VectorQuery,
+    ) -> std::io::Result<Vec<(String, f32)>> {
+        if vectors.field_name != self.primary_vector_name {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "query field '{}' does not match primary vector '{}'",
+                    vectors.field_name, self.primary_vector_name
+                ),
+            ));
+        }
+
+        let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
+        let hits = self
+            .db
+            .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| (hit.id.to_string(), hit.distance))
+            .collect())
+    }
+
     pub fn insert(&mut self, docs: &[Doc]) -> std::io::Result<usize> {
         let documents = docs
             .iter()
@@ -387,9 +413,10 @@ impl Collection {
                 });
         }
 
+        let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
         let hits = self
             .db
-            .search(&self.collection_name, &vectors.vector, topk)?;
+            .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
         let should_fetch_fields = output_fields
             .as_ref()
             .map_or(true, |fields| !fields.is_empty());
@@ -1018,14 +1045,38 @@ impl PyCollection {
         topk: usize,
         filter: Option<String>,
     ) -> PyResult<Vec<Py<PyDoc>>> {
+        let vectors = vectors.borrow(py).inner.clone();
+        let empty_output_fields = output_fields.as_ref().is_some_and(|fields| fields.is_empty());
+        let has_filter = filter
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if empty_output_fields && !has_filter {
+            let hits = self
+                .inner_ref()?
+                .query_ids_scores(topk, &vectors)
+                .map_err(io_to_py_err)?;
+            return hits
+                .into_iter()
+                .map(|(id, score)| {
+                    Py::new(
+                        py,
+                        PyDoc {
+                            inner: Doc {
+                                id,
+                                score: Some(score),
+                                fields: BTreeMap::new(),
+                                vectors: BTreeMap::new(),
+                            },
+                        },
+                    )
+                })
+                .collect();
+        }
+
         let docs = self
             .inner_ref()?
-            .query(
-                output_fields,
-                topk,
-                filter.as_deref(),
-                vectors.borrow(py).inner.clone(),
-            )
+            .query(output_fields, topk, filter.as_deref(), vectors)
             .map_err(io_to_py_err)?;
         docs.into_iter()
             .map(|doc| Py::new(py, PyDoc { inner: doc }))
