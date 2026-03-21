@@ -1,6 +1,7 @@
 mod metadata;
 mod payloads;
 mod records;
+pub mod segment_set;
 mod tombstone;
 
 pub use metadata::SegmentMetadata;
