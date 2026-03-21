@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(feature = "knowhere-backend")]
+use std::sync::Arc;
 
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::adapter::{AdapterError, HnswBackend};
@@ -54,8 +56,8 @@ struct CachedSearchState {
 
 #[cfg(feature = "knowhere-backend")]
 struct OptimizedAnnState {
-    backend: Box<dyn HnswBackend + Send + Sync>,
-    ann_external_ids: Vec<i64>,
+    backend: Arc<dyn HnswBackend + Send + Sync>,
+    ann_external_ids: Arc<Vec<i64>>,
     metric: String,
 }
 
@@ -532,6 +534,12 @@ impl HannsDb {
     ) -> io::Result<Vec<SearchHit>> {
         #[cfg(feature = "knowhere-backend")]
         let ef_search = _ef_search.max(1);
+        #[cfg(feature = "knowhere-backend")]
+        let mut optimized_snapshot: Option<(
+            Arc<dyn HnswBackend + Send + Sync>,
+            Arc<Vec<i64>>,
+            String,
+        )> = None;
         let mut cache = self
             .search_cache
             .lock()
@@ -546,17 +554,43 @@ impl HannsDb {
             .expect("search cache must contain requested collection");
         #[cfg(feature = "knowhere-backend")]
         if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-            return ann_search(optimized_ann, query, top_k, ef_search);
+            optimized_snapshot = Some((
+                Arc::clone(&optimized_ann.backend),
+                Arc::clone(&optimized_ann.ann_external_ids),
+                optimized_ann.metric.clone(),
+            ));
+        }
+        let brute_force_snapshot = (
+            state.records.clone(),
+            state.external_ids.clone(),
+            state.tombstone.clone(),
+            state.dimension,
+            state.metric.clone(),
+        );
+        drop(cache);
+
+        #[cfg(feature = "knowhere-backend")]
+        if let Some((backend, ann_external_ids, metric)) = optimized_snapshot {
+            return ann_search(
+                backend.as_ref(),
+                ann_external_ids.as_slice(),
+                &metric,
+                query,
+                top_k,
+                ef_search,
+            );
         }
 
+        let (records, external_ids, tombstone, dimension, metric) = brute_force_snapshot;
+
         search_by_metric(
-            &state.records,
-            &state.external_ids,
-            state.dimension,
-            &state.tombstone,
+            &records,
+            &external_ids,
+            dimension,
+            &tombstone,
             query,
             top_k,
-            &state.metric,
+            &metric,
         )
     }
 
@@ -1077,8 +1111,8 @@ fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedA
     }
 
     Ok(OptimizedAnnState {
-        backend,
-        ann_external_ids,
+        backend: Arc::from(backend),
+        ann_external_ids: Arc::new(ann_external_ids),
         metric,
     })
 }
@@ -1101,15 +1135,14 @@ fn make_ann_backend(
 
 #[cfg(feature = "knowhere-backend")]
 fn ann_search(
-    optimized_ann: &OptimizedAnnState,
+    backend: &(dyn HnswBackend + Send + Sync),
+    ann_external_ids: &[i64],
+    metric: &str,
     query: &[f32],
     top_k: usize,
     ef_search: usize,
 ) -> io::Result<Vec<SearchHit>> {
-    let hits = optimized_ann
-        .backend
-        .search(query, top_k, ef_search)
-        .map_err(adapter_error_to_io)?;
+    let hits = backend.search(query, top_k, ef_search).map_err(adapter_error_to_io)?;
     let mut mapped = Vec::with_capacity(hits.len());
     for hit in hits {
         let ann_idx = usize::try_from(hit.id).map_err(|_| {
@@ -1118,17 +1151,13 @@ fn ann_search(
                 "optimized ANN hit id cannot be converted to usize",
             )
         })?;
-        let external_id = optimized_ann
-            .ann_external_ids
-            .get(ann_idx)
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("optimized ANN hit id out of range: {}", hit.id),
-                )
-            })?;
-        let distance = match optimized_ann.metric.as_str() {
+        let external_id = ann_external_ids.get(ann_idx).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("optimized ANN hit id out of range: {}", hit.id),
+            )
+        })?;
+        let distance = match metric {
             "ip" => -hit.distance,
             _ => hit.distance,
         };

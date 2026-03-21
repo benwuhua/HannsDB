@@ -1035,3 +1035,78 @@ Gap analysis:
   1. propagate runtime `ef_search` into knowhere-rs search request path (remove hardcoded `64` behavior);
   2. shrink `search_cache` lock scope so ANN search runs outside mutex;
   3. add id-only Python fast path for `output_fields=[]` to avoid per-hit `PyDoc` construction.
+- **Knowhere-rs deep dive (T-20260321-014)**:
+  - current HannsDB path calls pure Rust `knowhere-rs/src/faiss/hnsw.rs` (`HnswIndex::search`), not faiss C++ HNSW via FFI (`faiss-cxx` is optional and not enabled in HannsDB dependency path).
+  - concrete search-path overheads in knowhere-rs:
+    1. per-query allocation of `all_ids/all_dists` in `HnswIndex::search` (`hnsw.rs:3731-3732`) plus final rewrite loop (`3748+`);
+    2. cosine/unfiltered path creates fresh `SearchScratch::new()` per query in `search_single` (`5349`), while TLS scratch reuse is only used by L2 fast path (`5470-5474`);
+    3. result conversion/copy chain (`idx->id` in `5411+` then write into `all_ids/all_dists` in `3741+`).
+  - comparison anchor: faiss HNSW accepts reusable `VisitedTable&` in `HNSW::search` (`faiss/impl/HNSW.h:210-215`) and runs `search_from_candidates` with `MinimaxHeap` (`faiss/impl/HNSW.cpp:1230+`, `616+`); knowhere-rs algorithm shape is similar but cosine fast-path reuse is weaker.
+  - next best knowhere-rs optimizations (priority): cosine-path scratch reuse (TLS), single-query no-realloc path, cosine layer0 fast kernel path.
+
+## 39) 2026-03-21 ef_search 修复后 baseline
+
+Context:
+- goal: verify P0 fix that threads request-time `ef_search` down to knowhere-rs search path (instead of effectively using hardcoded `ef_search=64`).
+- same workload shape as section 36 (`Performance1536D50K`, cosine, `k=10`, `M=16`, `ef_construction=64`, `ef_search=32`).
+
+Run command:
+```bash
+cd /Users/ryan/Code/HannsDB
+rm -rf /tmp/hannsdb-vdbb-ef32-fixed &&
+EF_SEARCH=32 DB_LABEL=hannsdb-ef32-fixed TASK_LABEL=hannsdb-ef32-fixed \
+  DB_PATH=/tmp/hannsdb-vdbb-ef32-fixed SKIP_PY_REBUILD=0 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Result artifact:
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-ef32-fixed_hannsdb.json`
+
+Observed metrics:
+- `insert_duration`: `109.1479s`
+- `optimize_duration`: `79.5650s`
+- `load_duration`: `188.7129s`
+- `serial_latency_p99`: `0.1098s` (`109.8ms`)
+- `serial_latency_p95`: `0.1077s`
+- `recall@10`: `1.0`
+
+Comparison vs pre-fix baseline (section 36, `p99=111.5ms`):
+- post-fix `p99=109.8ms`, absolute delta `-1.7ms`, relative delta `-1.5%`.
+- conclusion: this fix successfully removed the hardcoded path and now honors request-time `ef_search`, but on this specific case (`ef_search=32`) measured latency improvement is small; remaining latency bottleneck is still dominated by other search-path overheads identified in section 38 gap analysis.
+
+## 40) 2026-03-21 P1 锁优化后 baseline
+
+Context:
+- P1 objective: shrink `hannsdb_core::db::search_with_ef` mutex scope so ANN search runs outside `search_cache` lock.
+- implementation changed `optimized_ann` backend/id mapping to snapshot-friendly `Arc` handles; `search_with_ef` now copies a read-only snapshot under lock and executes ANN/brute-force search after releasing the mutex.
+
+Verification:
+```bash
+cd /Users/ryan/Code/HannsDB
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+rm -rf /tmp/hannsdb-vdbb-p1-fixed &&
+EF_SEARCH=32 DB_LABEL=hannsdb-p1-fixed TASK_LABEL=hannsdb-p1-fixed \
+  DB_PATH=/tmp/hannsdb-vdbb-p1-fixed SKIP_PY_REBUILD=0 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Result artifact:
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-p1-fixed_hannsdb.json`
+
+Observed metrics:
+- `insert_duration`: `110.6421s`
+- `optimize_duration`: `79.5287s`
+- `load_duration`: `190.1708s`
+- `serial_latency_p99`: `0.1171s` (`117.1ms`)
+- `serial_latency_p95`: `0.1136s`
+- `recall@10`: `1.0`
+
+Comparison vs section 39 baseline (`p99=109.8ms`):
+- new `p99=117.1ms`, absolute delta `+7.3ms`, relative delta `+6.65%`.
+
+Interpretation:
+- code-level objective is met: ANN search is no longer executed while holding `search_cache` mutex.
+- in this serial benchmark shape, the lock-scope shrink does not improve p99 and this sample is slightly slower; likely because this path now clones more state per query (`records/ids/tombstone`) for non-optimized fallback snapshots.
+- follow-up should narrow snapshot cost (e.g., clone only optimized ANN path payload, avoid full brute-force snapshot copy when optimized index exists).

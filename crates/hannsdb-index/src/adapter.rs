@@ -61,7 +61,12 @@ pub trait HnswBackend {
         let ids = (0..count as u64).collect::<Vec<_>>();
         self.insert_flat(&ids, vectors, dim)
     }
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<HnswSearchHit>, AdapterError>;
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError>;
 }
 
 pub struct HnswAdapter<B> {
@@ -84,6 +89,15 @@ where
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<HnswSearchHit>, AdapterError> {
-        self.backend.search(query, k)
+        self.search_with_ef(query, k, 32)
+    }
+
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError> {
+        self.backend.search(query, k, ef_search)
     }
 }

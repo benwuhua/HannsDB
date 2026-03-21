@@ -60,7 +60,12 @@ impl HnswBackend for InMemoryHnswIndex {
         Ok(())
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<HnswSearchHit>, AdapterError> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        _ef_search: usize,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
                 expected: self.dim,
@@ -123,7 +128,8 @@ impl KnowhereHnswIndex {
             MetricKind::Ip => knowhere_rs::MetricType::Ip,
         };
         let mut cfg = knowhere_rs::IndexConfig::new(knowhere_rs::IndexType::Hnsw, metric_type, dim);
-        cfg.params.ef_search = Some(64);
+        // Keep index-level ef floor minimal; query-time ef_search is provided per request.
+        cfg.params.ef_search = Some(1);
         cfg.params.ef_construction = Some(128);
         cfg.params.m = Some(16);
         cfg.params.random_seed = Some(42);
@@ -211,19 +217,21 @@ impl HnswBackend for KnowhereHnswIndex {
                 got: vectors.len() % self.dim,
             });
         }
-        let count = vectors.len() / self.dim;
-        let ids = (0..count as i64).collect::<Vec<_>>();
-
         self.inner
             .train(vectors)
             .map_err(|e| AdapterError::Backend(format!("knowhere train failed: {e}")))?;
         self.inner
-            .add(vectors, Some(&ids))
+            .add(vectors, None)
             .map_err(|e| AdapterError::Backend(format!("knowhere add failed: {e}")))?;
         Ok(())
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<HnswSearchHit>, AdapterError> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
                 expected: self.dim,
@@ -232,7 +240,7 @@ impl HnswBackend for KnowhereHnswIndex {
         }
         let req = knowhere_rs::SearchRequest {
             top_k: k,
-            nprobe: 0,
+            nprobe: ef_search,
             filter: None,
             params: None,
             radius: None,
@@ -245,7 +253,7 @@ impl HnswBackend for KnowhereHnswIndex {
         Ok(result
             .ids
             .into_iter()
-            .zip(result.distances.into_iter())
+            .zip(result.distances)
             .filter_map(|(id, distance)| {
                 if id < 0 {
                     None
