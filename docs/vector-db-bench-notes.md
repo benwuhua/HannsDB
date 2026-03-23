@@ -1255,12 +1255,15 @@ After syncing commits `98e80b7` + `c04bb60` (HNSW persistence + configurable M/e
 
 Config: Performance1536D50K, M=16, ef_construction=64, ef_search=32, cosine
 
-| Platform | p99   | Recall | Notes |
-|----------|-------|--------|-------|
-| Mac M1   | 2.4ms | 0.9826 | HNSW active |
-| x86      | **2.8ms** | **0.9768** | HNSW active (`hnsw_index.bin` persisted) |
-| zvec target | 0.6ms | — | zvec on Mac, ef=300, M=50 |
+| Platform | DB      | p99       | Recall | Notes |
+|----------|---------|-----------|--------|-------|
+| Mac M1   | HannsDB | 2.4ms     | 0.9826 | HNSW active |
+| Mac M1   | zvec    | 0.6ms     | 0.9395 | baseline from section 38 |
+| x86      | HannsDB | **2.8ms** | **0.9768** | HNSW active (`hnsw_index.bin` persisted) |
+| x86      | zvec    | —         | —      | not yet measured |
+
+All runs use same params: M=16, ef_construction=64, ef_search=32, cosine, Performance1536D50K.
 
 First x86 attempt (p99=189ms, recall=1.0) used pre-persistence code (rsync happened before commit `98e80b7`), resulting in brute-force fallback. Re-sync fixed it.
 
-Gap to zvec: HannsDB x86 p99=2.8ms vs zvec p99=0.6ms — ~4.7× slower. Both are at M=16/ef=32 vs M=50/ef=300, so the parameter difference accounts for meaningful recall/latency tradeoff. Direct apples-to-apples comparison requires zvec run at M=16/ef=32.
+Mac M1 gap: HannsDB p99=2.4ms vs zvec p99=0.6ms — **4× slower** at identical params. x86 zvec not yet run; needed for a fair apples-to-apples x86 comparison.
