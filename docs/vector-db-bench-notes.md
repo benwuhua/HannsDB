@@ -1273,3 +1273,34 @@ First x86 HannsDB attempt (p99=189ms, recall=1.0) used pre-persistence code (rsy
 zvec x86 (0.9ms) is slower than zvec Mac M1 (0.6ms) — x86 SIMD doesn't outperform M1 for cosine HNSW at this scale.
 
 Note: zvec was installed via `pip install zvec` (official Linux x86_64 wheel on PyPI). No source build required.
+
+## 43) tombstone Arc化 + brute_force_snapshot 条件构建（2026-03-23）
+
+### 修改内容（commit a08abcd）
+
+两处 `search_with_ef` hot path 修复：
+
+1. `CachedSearchState.tombstone: TombstoneMask` → `Arc<TombstoneMask>`：clone 从 O(N) Vec<bool> copy（50K 向量 = 50KB heap alloc）变为 O(1) 原子引用计数。
+
+2. HNSW early return：当 `optimized_ann` 存在时，在 mutex 内克隆 3 个 Arc 后立即 `drop(cache)` 并 early return `ann_search`，完全跳过 brute-force snapshot 构建。
+
+### x86 验证结果
+
+| 版本 | x86 p99 | recall |
+|------|---------|--------|
+| 修复前 | 2.8ms | 0.9768 |
+| 修复后 | **2.7ms** | 0.9768 |
+| zvec x86 | 0.9ms | 0.941 |
+
+改善 0.1ms（3.6%）。tombstone clone 不是主要瓶颈，2.7ms vs 0.9ms 的 3× 差距主要来自其他开销（待分析）。
+
+### 下一步分析方向
+
+当前 x86 HannsDB p99=2.7ms，纯 Rust benchmark 显示 `search_with_ef` 本身 p99=128μs（Arc fix 后）。
+Python binding 层开销约 2.5ms，远大于 zvec（pybind11 C++ 路径）的 binding 开销。
+
+候选开销：
+1. Python list → `Vec<f32>` 转换（1536 个 float 对象，每次 query）
+2. `vectors.borrow(py).inner.clone()`：每次 query 克隆整个 VectorQuery（含 1536-float Vec）
+3. knowhere-rs cosine 路径每 query 创建 `SearchScratch::new()`（无 TLS 缓存）
+4. 10× `Py::new(py, PyDoc {...})`：Python heap allocation per result
