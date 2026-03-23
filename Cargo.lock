@@ -440,6 +440,7 @@ name = "hannsdb-core"
 version = "0.1.0"
 dependencies = [
  "hannsdb-index",
+ "log",
  "serde",
  "serde_json",
  "tempfile",

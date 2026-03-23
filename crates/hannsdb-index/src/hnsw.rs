@@ -121,7 +121,12 @@ pub struct KnowhereHnswIndex {
 
 #[cfg(feature = "knowhere-backend")]
 impl KnowhereHnswIndex {
-    pub fn new(dim: usize, metric: &str) -> Result<Self, AdapterError> {
+    pub fn new(
+        dim: usize,
+        metric: &str,
+        m: usize,
+        ef_construction: usize,
+    ) -> Result<Self, AdapterError> {
         let metric_type = match MetricKind::parse(metric)? {
             MetricKind::L2 => knowhere_rs::MetricType::L2,
             MetricKind::Cosine => knowhere_rs::MetricType::Cosine,
@@ -130,8 +135,8 @@ impl KnowhereHnswIndex {
         let mut cfg = knowhere_rs::IndexConfig::new(knowhere_rs::IndexType::Hnsw, metric_type, dim);
         // Keep index-level ef floor minimal; query-time ef_search is provided per request.
         cfg.params.ef_search = Some(1);
-        cfg.params.ef_construction = Some(128);
-        cfg.params.m = Some(16);
+        cfg.params.ef_construction = Some(ef_construction);
+        cfg.params.m = Some(m);
         cfg.params.random_seed = Some(42);
 
         let inner = knowhere_rs::HnswIndex::new(&cfg)

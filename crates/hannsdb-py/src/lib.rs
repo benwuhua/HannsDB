@@ -188,13 +188,21 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             MetricType::Ip => "ip",
         })
         .unwrap_or("l2");
+    let hnsw_m = vector.index_param.as_ref().map(|params| params.m).unwrap_or(16);
+    let hnsw_ef_construction = vector
+        .index_param
+        .as_ref()
+        .map(|params| params.ef_construction)
+        .unwrap_or(128);
 
-    Ok(CoreCollectionSchema::new(
-        vector.name.clone(),
-        vector.dimension,
-        metric,
+    Ok(CoreCollectionSchema {
+        primary_vector: vector.name.clone(),
+        dimension: vector.dimension,
+        metric: metric.to_string(),
         fields,
-    ))
+        hnsw_m,
+        hnsw_ef_construction,
+    })
 }
 
 fn parse_doc_id(id: &str) -> std::io::Result<i64> {

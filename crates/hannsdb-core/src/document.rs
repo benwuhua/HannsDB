@@ -39,6 +39,10 @@ pub struct CollectionSchema {
     pub dimension: usize,
     pub metric: String,
     pub fields: Vec<ScalarFieldSchema>,
+    #[serde(default = "default_hnsw_m")]
+    pub hnsw_m: usize,
+    #[serde(default = "default_hnsw_ef_construction")]
+    pub hnsw_ef_construction: usize,
 }
 
 impl CollectionSchema {
@@ -53,8 +57,18 @@ impl CollectionSchema {
             dimension,
             metric: metric.into(),
             fields,
+            hnsw_m: default_hnsw_m(),
+            hnsw_ef_construction: default_hnsw_ef_construction(),
         }
     }
+}
+
+fn default_hnsw_m() -> usize {
+    16
+}
+
+fn default_hnsw_ef_construction() -> usize {
+    128
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

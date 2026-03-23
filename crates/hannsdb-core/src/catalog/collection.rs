@@ -18,6 +18,10 @@ pub struct CollectionMetadata {
     pub primary_vector: String,
     #[serde(default)]
     pub fields: Vec<ScalarFieldSchema>,
+    #[serde(default = "default_hnsw_m")]
+    pub hnsw_m: usize,
+    #[serde(default = "default_hnsw_ef_construction")]
+    pub hnsw_ef_construction: usize,
 }
 
 impl CollectionMetadata {
@@ -29,6 +33,8 @@ impl CollectionMetadata {
             metric: metric.into(),
             primary_vector: default_primary_vector_name(),
             fields: Vec::new(),
+            hnsw_m: default_hnsw_m(),
+            hnsw_ef_construction: default_hnsw_ef_construction(),
         }
     }
 
@@ -40,6 +46,8 @@ impl CollectionMetadata {
             metric: schema.metric,
             primary_vector: schema.primary_vector,
             fields: schema.fields,
+            hnsw_m: schema.hnsw_m,
+            hnsw_ef_construction: schema.hnsw_ef_construction,
         }
     }
 
@@ -49,6 +57,8 @@ impl CollectionMetadata {
             dimension: self.dimension,
             metric: self.metric.clone(),
             fields: self.fields.clone(),
+            hnsw_m: self.hnsw_m,
+            hnsw_ef_construction: self.hnsw_ef_construction,
         }
     }
 
@@ -79,4 +89,12 @@ fn json_to_io_error(err: serde_json::Error) -> io::Error {
 
 fn default_primary_vector_name() -> String {
     "vector".to_string()
+}
+
+fn default_hnsw_m() -> usize {
+    16
+}
+
+fn default_hnsw_ef_construction() -> usize {
+    128
 }

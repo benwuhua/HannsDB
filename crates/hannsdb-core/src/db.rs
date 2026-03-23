@@ -58,6 +58,8 @@ struct CachedSearchState {
     tombstone: TombstoneMask,
     dimension: usize,
     metric: String,
+    hnsw_m: usize,
+    hnsw_ef_construction: usize,
     #[cfg(feature = "knowhere-backend")]
     optimized_ann: Option<OptimizedAnnState>,
 }
@@ -217,9 +219,9 @@ impl HannsDb {
             if let Some(bytes) = hnsw_bytes {
                 let paths = self.collection_paths(name);
                 if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
-                    eprintln!("Failed to persist HNSW index: {e}");
+                    log::warn!("Failed to persist HNSW index: {e}");
                 } else {
-                    eprintln!(
+                    log::info!(
                         "Persisted HNSW index ({} bytes) for collection '{name}'",
                         bytes.len()
                     );
@@ -880,7 +882,7 @@ impl HannsDb {
                         metric: metric.to_ascii_lowercase(),
                     }),
                     Err(e) => {
-                        eprintln!("Failed to load persisted HNSW index: {e}");
+                        log::warn!("Failed to load persisted HNSW index: {e}");
                         None
                     }
                 }
@@ -895,6 +897,8 @@ impl HannsDb {
             tombstone: TombstoneMask::new(0),
             dimension: collection_meta.dimension,
             metric,
+            hnsw_m: collection_meta.hnsw_m,
+            hnsw_ef_construction: collection_meta.hnsw_ef_construction,
             #[cfg(feature = "knowhere-backend")]
             optimized_ann,
         })
@@ -1482,7 +1486,13 @@ fn build_optimized_ann_state(
     };
 
     if metric == "l2" || metric == "cosine" || metric == "ip" {
-        let mut backend = KnowhereHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
+        let mut backend = KnowhereHnswIndex::new(
+            state.dimension,
+            &metric,
+            state.hnsw_m,
+            state.hnsw_ef_construction,
+        )
+        .map_err(adapter_error_to_io)?;
         if !flat_vectors.is_empty() {
             backend
                 .insert_flat_identity(&flat_vectors, state.dimension)
