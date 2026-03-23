@@ -4,7 +4,7 @@ set -euo pipefail
 
 REMOTE_HOST=root@189.1.218.159
 REMOTE_DIR=/data/work/HannsDB
-KNOWHERE_SRC=~/.openclaw/workspace-builder/knowhere-rs
+KNOWHERE_SRC=/Users/ryan/Code/vectorDB/knowhere-rs
 KNOWHERE_REMOTE_DIR=/data/work/knowhere-rs
 
 SSH_KEY=~/.ssh/agent/hannsdb-x86
