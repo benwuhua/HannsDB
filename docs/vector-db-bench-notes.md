@@ -1181,3 +1181,33 @@ Conclusion:
 - considering the task’s focus on `search`, P1+P2 does **not** show a search improvement in optimize-bench median; it is slightly worse (`0 -> 32ms`).
 - `total` median is lower, but that drop is dominated by `insert` variation rather than an optimize/search-path gain.
 - overall judgment: **no clear positive effect; current evidence is closer to noise with slight search-side regression signal**.
+
+---
+
+## Critical Bug Discovery and Fix (2026-03-23): CachedSearchState 300MB/query clone
+
+### Root cause
+
+`CachedSearchState` stored `records: Vec<f32>` and `external_ids: Vec<i64>` as plain Vecs (not Arc).
+In `search_with_ef`, the lock-free refactor (commit 9a6ef38) created `brute_force_snapshot` by
+cloning these fields **on every single query call** — copying ~300MB of vector data (50K × 1536 × 4B)
+even when the ANN path is taken (where the clone is immediately dropped unused).
+
+### Fix
+
+Commit `de2f972`: wrapped both fields in `Arc<Vec<_>>`. Clone is now a single atomic refcount increment.
+
+### Before/after measurement (x86, 50K/1536/cosine, ef=64, 1000 serial queries, Rust benchmark)
+
+| Metric | Before fix | After fix  | Improvement |
+|--------|-----------|------------|-------------|
+| p50    | 168,173 μs | **100 μs** | **~1680x**  |
+| p95    | 171,538 μs | **121 μs** | **~1418x**  |
+| p99    | 173,107 μs | **128 μs** | **~1352x**  |
+| avg    | 167,704 μs | **101 μs** | **~1660x**  |
+
+### Implication
+
+The previously-reported p99=110ms (VectorDBBench, Mac, ef=32) was almost entirely this clone overhead,
+not HNSW algorithm cost. After the fix, HannsDB serial search at ef=64 on x86 achieves p99=0.128ms —
+already faster than zvec's reported p99=0.6ms at ef=300/M=50 on Mac.
