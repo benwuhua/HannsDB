@@ -6,6 +6,8 @@ use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
 use pyo3::types::{PyBool, PyDict};
+#[cfg(feature = "python-binding")]
+use numpy::PyReadonlyArray1;
 
 use hannsdb_core::catalog::CollectionMetadata;
 use hannsdb_core::document::{
@@ -1098,7 +1100,7 @@ impl PyCollection {
     fn search_ids_raw(
         &self,
         field_name: String,
-        vector: Vec<f32>,
+        vector: PyReadonlyArray1<f32>,
         topk: usize,
         ef: usize,
     ) -> PyResult<Vec<i64>> {
@@ -1109,9 +1111,12 @@ impl PyCollection {
                 field_name, inner.primary_vector_name
             )));
         }
+        let slice = vector.as_slice().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("array slice error: {e}"))
+        })?;
         let hits = inner
             .db
-            .search_with_ef(&inner.collection_name, &vector, topk, ef.max(1))
+            .search_with_ef(&inner.collection_name, slice, topk, ef.max(1))
             .map_err(io_to_py_err)?;
         Ok(hits.into_iter().map(|hit| hit.id).collect())
     }
