@@ -1249,4 +1249,18 @@ Config: Performance1536D50K, M=16, ef_construction=64, ef_search=32, cosine
 
 Note: avg_latency=27ms is misleading — it reflects OS page-fault cost on first 10-20 HNSW accesses as the 322MB file is cold-loaded into page cache. After warm-up the HNSW queries run at p99=2.4ms.
 
-The x86 comparison vs zvec remains pending (needs sync + run on remote server).
+### x86 benchmark result (2026-03-23)
+
+After syncing commits `98e80b7` + `c04bb60` (HNSW persistence + configurable M/ef_construction) and rebuilding on x86, full VectorDBBench run confirmed HNSW is active:
+
+Config: Performance1536D50K, M=16, ef_construction=64, ef_search=32, cosine
+
+| Platform | p99   | Recall | Notes |
+|----------|-------|--------|-------|
+| Mac M1   | 2.4ms | 0.9826 | HNSW active |
+| x86      | **2.8ms** | **0.9768** | HNSW active (`hnsw_index.bin` persisted) |
+| zvec target | 0.6ms | — | zvec on Mac, ef=300, M=50 |
+
+First x86 attempt (p99=189ms, recall=1.0) used pre-persistence code (rsync happened before commit `98e80b7`), resulting in brute-force fallback. Re-sync fixed it.
+
+Gap to zvec: HannsDB x86 p99=2.8ms vs zvec p99=0.6ms — ~4.7× slower. Both are at M=16/ef=32 vs M=50/ef=300, so the parameter difference accounts for meaningful recall/latency tradeoff. Direct apples-to-apples comparison requires zvec run at M=16/ef=32.
