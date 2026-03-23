@@ -1260,10 +1260,16 @@ Config: Performance1536D50K, M=16, ef_construction=64, ef_search=32, cosine
 | Mac M1   | HannsDB | 2.4ms     | 0.9826 | HNSW active |
 | Mac M1   | zvec    | 0.6ms     | 0.9395 | baseline from section 38 |
 | x86      | HannsDB | **2.8ms** | **0.9768** | HNSW active (`hnsw_index.bin` persisted) |
-| x86      | zvec    | —         | —      | not yet measured |
+| x86      | zvec    | **0.9ms** | **0.941** | `pip install zvec` (official PyPI wheel) |
 
 All runs use same params: M=16, ef_construction=64, ef_search=32, cosine, Performance1536D50K.
 
-First x86 attempt (p99=189ms, recall=1.0) used pre-persistence code (rsync happened before commit `98e80b7`), resulting in brute-force fallback. Re-sync fixed it.
+First x86 HannsDB attempt (p99=189ms, recall=1.0) used pre-persistence code (rsync before commit `98e80b7`), falling back to brute-force. Re-sync fixed it.
 
-Mac M1 gap: HannsDB p99=2.4ms vs zvec p99=0.6ms — **4× slower** at identical params. x86 zvec not yet run; needed for a fair apples-to-apples x86 comparison.
+**Gap summary (same params, apples-to-apples):**
+- Mac M1: HannsDB 2.4ms vs zvec 0.6ms → **4× gap**
+- x86: HannsDB 2.8ms vs zvec 0.9ms → **3.1× gap**
+
+zvec x86 (0.9ms) is slower than zvec Mac M1 (0.6ms) — x86 SIMD doesn't outperform M1 for cosine HNSW at this scale.
+
+Note: zvec was installed via `pip install zvec` (official Linux x86_64 wheel on PyPI). No source build required.
