@@ -1211,3 +1211,42 @@ Commit `de2f972`: wrapped both fields in `Arc<Vec<_>>`. Clone is now a single at
 The previously-reported p99=110ms (VectorDBBench, Mac, ef=32) was almost entirely this clone overhead,
 not HNSW algorithm cost. After the fix, HannsDB serial search at ef=64 on x86 achieves p99=0.128ms —
 already faster than zvec's reported p99=0.6ms at ef=300/M=50 on Mac.
+
+---
+
+## VectorDBBench Integration Fixes and First Full Run (2026-03-23)
+
+### Python client fixes (VectorDBBench adapter)
+
+Three API mismatches fixed in `vectordb_bench/backend/clients/hannsdb/hannsdb.py`:
+
+1. **Pickle failure**: `CollectionSchema`, `CollectionOption`, `HnswQueryParam` are PyO3 types that can't be pickled. VectorDBBench spawns subprocesses for insert/optimize/search via `ProcessPoolExecutor(mp_context=spawn)`, requiring the `HannsDB` instance to be picklable. Fix: store option state as primitives (`_read_only`, `_enable_mmap`), reconstruct PyO3 types inside `init()` context.
+
+2. **Doc API**: `Doc(vectors={"dense": emb})` → `Doc(vector=emb, field_name="dense")`
+
+3. **optimize API**: `Collection.optimize(option=OptimizeOption())` → `Collection.optimize()`
+
+### HNSW index persistence (core fix)
+
+Root cause of brute-force search (p99=105ms, recall=1.0 post-optimize): VectorDBBench runs `optimize` in one subprocess and `search` in another. The in-memory HNSW cache in `OptimizedAnnState` is lost when the optimize subprocess exits.
+
+Fix (commits `98e80b7`, `de2f972`):
+- `KnowhereHnswIndex::serialize_to_bytes()` / `from_bytes()` added to `hannsdb-index`
+- `optimize_collection()` writes `hnsw_index.bin` (322MB for 50K/1536) to collection dir after build
+- `load_search_state()` checks for `hnsw_index.bin` and populates `optimized_ann` on open
+
+### First full VectorDBBench run result (Mac M1, 2026-03-23)
+
+Config: Performance1536D50K, M=16, ef_construction=64, ef_search=32, cosine
+
+| Metric           | Brute-force (no HNSW) | HNSW (after fix) |
+|------------------|-----------------------|------------------|
+| p99              | 105ms                 | **2.4ms**        |
+| p95              | 104ms                 | **2.2ms**        |
+| recall           | 1.0                   | 0.9826           |
+| insert_duration  | ~98s                  | ~100s            |
+| optimize_duration| —                     | ~285s            |
+
+Note: avg_latency=27ms is misleading — it reflects OS page-fault cost on first 10-20 HNSW accesses as the 322MB file is cold-loaded into page cache. After warm-up the HNSW queries run at p99=2.4ms.
+
+The x86 comparison vs zvec remains pending (needs sync + run on remote server).
