@@ -33,6 +33,10 @@ pub enum WalRecord {
         collection: String,
         ids: Vec<i64>,
     },
+    CompactCollection {
+        collection_name: String,
+        compacted_segment_id: String,
+    },
 }
 
 pub fn append_wal_record(path: &Path, record: &WalRecord) -> io::Result<()> {

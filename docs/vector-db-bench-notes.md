@@ -1110,3 +1110,74 @@ Interpretation:
 - code-level objective is met: ANN search is no longer executed while holding `search_cache` mutex.
 - in this serial benchmark shape, the lock-scope shrink does not improve p99 and this sample is slightly slower; likely because this path now clones more state per query (`records/ids/tombstone`) for non-optimized fallback snapshots.
 - follow-up should narrow snapshot cost (e.g., clone only optimized ANN path payload, avoid full brute-force snapshot copy when optimized index exists).
+
+## 41) 2026-03-21 P2 Python binding 快速路径
+
+Context:
+- P2 objective: add a Python-binding query fast path for `output_fields=[]` so benchmark search does not go through document-field materialization logic.
+- implementation in `crates/hannsdb-py/src/lib.rs`:
+  - add `Collection::query_ids_scores(...)` helper (id + score only);
+  - in `PyCollection::query`, when `output_fields=[]` and no filter, call this helper and directly build minimal `PyDoc` (`fields={}`, `vectors={}`), skipping full `Collection::query` path.
+
+Verification:
+```bash
+cd /Users/ryan/Code/HannsDB
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+rm -rf /tmp/hannsdb-vdbb-p2-fixed &&
+EF_SEARCH=32 DB_LABEL=hannsdb-p2-fixed TASK_LABEL=hannsdb-p2-fixed \
+  DB_PATH=/tmp/hannsdb-vdbb-p2-fixed SKIP_PY_REBUILD=0 \
+  bash scripts/run_vdbb_hannsdb_perf1536d50k.sh
+```
+
+Result artifact:
+- `/Users/ryan/Code/VectorDBBench/vectordb_bench/results/HannsDB/result_20260321_hannsdb-p2-fixed_hannsdb.json`
+
+Observed metrics:
+- `insert_duration`: `107.8061s`
+- `optimize_duration`: `79.8369s`
+- `load_duration`: `187.6430s`
+- `serial_latency_p99`: `0.1247s` (`124.7ms`)
+- `serial_latency_p95`: `0.1178s`
+- `recall@10`: `1.0`
+
+Comparison vs section 40 (`p99=117.1ms`):
+- new `p99=124.7ms`, absolute delta `+7.6ms`, relative delta `+6.49%`.
+
+Interpretation:
+- code-level fast path is active for `output_fields=[]`, but this single-run benchmark sample is slower rather than faster.
+- likely explanation is run-to-run variance and/or remaining dominant overhead outside this Python-layer change; the optimization effect is not visible in this sample.
+
+## 42) 2026-03-21 P1+P2 中位数验证
+
+Context:
+- run `run_hannsdb_optimize_bench.sh` with `REPEATS=3` on current state (P1+P2 applied) and compare with pre-change target-scale median from section 33.
+
+Command:
+```bash
+cd /Users/ryan/Code/HannsDB
+N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=3 \
+  FEATURES=knowhere-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Current run (P1+P2) raw timings:
+- Run 1: `OPT_BENCH_TIMING_MS create=0 insert=94900 optimize=10564 search=26 total=105492`
+- Run 2: `OPT_BENCH_TIMING_MS create=0 insert=90064 optimize=11317 search=73 total=101456`
+- Run 3: `OPT_BENCH_TIMING_MS create=0 insert=92474 optimize=11144 search=32 total=103652`
+- Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=92474 optimize=11144 search=32 total=103652`
+
+Reference baseline (section 33, pre P1+P2):
+- Median: `BENCH_SUMMARY_MEDIAN_MS create=0 insert=96734 optimize=10979 search=0 total=107879`
+
+Comparison (current vs section 33):
+- `insert`: `-4260ms` (`-4.40%`)
+- `optimize`: `+165ms` (`+1.50%`)
+- `search`: `+32ms` (from `0ms` to `32ms`)
+- `total`: `-4227ms` (`-3.92%`)
+
+Conclusion:
+- considering the task’s focus on `search`, P1+P2 does **not** show a search improvement in optimize-bench median; it is slightly worse (`0 -> 32ms`).
+- `total` median is lower, but that drop is dominated by `insert` variation rather than an optimize/search-path gain.
+- overall judgment: **no clear positive effect; current evidence is closer to noise with slight search-side regression signal**.

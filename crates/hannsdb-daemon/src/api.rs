@@ -114,6 +114,24 @@ pub struct FlushCollectionResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompactCollectionResponse {
+    pub compacted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegmentInfoResponse {
+    pub id: String,
+    pub live: usize,
+    pub dead: usize,
+    pub ann_ready: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegmentsResponse {
+    pub segments: Vec<SegmentInfoResponse>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CollectionInfoResponse {
     pub name: String,
     pub dimension: usize,

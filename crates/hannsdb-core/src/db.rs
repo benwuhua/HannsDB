@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 #[cfg(feature = "knowhere-backend")]
 use std::sync::Arc;
+use std::sync::Mutex;
 
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::adapter::{AdapterError, HnswBackend};
@@ -16,7 +17,7 @@ use crate::document::{CollectionSchema, Document, FieldValue};
 use crate::query::{distance_by_metric, parse_filter, search_by_metric, SearchHit};
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
-    load_records, SegmentMetadata, TombstoneMask,
+    load_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
@@ -35,6 +36,14 @@ pub struct CollectionInfo {
     pub record_count: usize,
     pub deleted_count: usize,
     pub live_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionSegmentInfo {
+    pub id: String,
+    pub live_count: usize,
+    pub dead_count: usize,
+    pub ann_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +223,123 @@ impl HannsDb {
         Ok(())
     }
 
+    pub fn compact_collection(&mut self, name: &str) -> io::Result<()> {
+        self.compact_collection_internal(name, true)
+    }
+
+    fn compact_collection_internal(&mut self, name: &str, log_wal: bool) -> io::Result<()> {
+        let paths = self.collection_paths(name);
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        if !paths.segment_set.exists() {
+            return Ok(());
+        }
+
+        let mut segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
+        if segment_set.immutable_segment_ids.is_empty() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&paths.segments_dir)?;
+        let immutable_segment_ids = segment_set.immutable_segment_ids.clone();
+        let compacted_segment_id = next_compacted_segment_id(
+            immutable_segment_ids
+                .iter()
+                .chain(std::iter::once(&segment_set.active_segment_id)),
+        );
+        let compacted_dir = paths.segments_dir.join(&compacted_segment_id);
+        fs::create_dir_all(&compacted_dir)?;
+        let compacted_paths = SegmentPaths::from_segment_dir(compacted_dir.clone());
+
+        let mut compacted_ids = Vec::new();
+        let mut compacted_records = Vec::new();
+        let mut compacted_payloads = Vec::new();
+
+        for segment_id in &immutable_segment_ids {
+            let segment_dir = paths.segments_dir.join(segment_id);
+            let segment_meta = SegmentMetadata::load_from_path(&segment_dir.join("segment.json"))?;
+            if segment_meta.dimension != collection_meta.dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "segment dimension mismatch: expected {}, got {}",
+                        collection_meta.dimension, segment_meta.dimension
+                    ),
+                ));
+            }
+
+            let segment_paths = SegmentPaths::from_segment_dir(segment_dir);
+            let segment_records = load_records(&segment_paths.records, collection_meta.dimension)?;
+            let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
+            let segment_payloads =
+                load_payloads_or_empty(&segment_paths.payloads, segment_external_ids.len())?;
+            let segment_tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
+
+            if segment_external_ids
+                .len()
+                .saturating_mul(collection_meta.dimension)
+                != segment_records.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for (row_idx, vector) in segment_records
+                .chunks_exact(collection_meta.dimension)
+                .enumerate()
+            {
+                if segment_tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                compacted_records.extend_from_slice(vector);
+                compacted_ids.push(segment_external_ids[row_idx]);
+                compacted_payloads.push(segment_payloads[row_idx].clone());
+            }
+        }
+
+        let inserted = append_records(
+            &compacted_paths.records,
+            collection_meta.dimension,
+            &compacted_records,
+        )?;
+        if inserted != compacted_ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compacted records and ids are not aligned",
+            ));
+        }
+        let _ = append_record_ids(&compacted_paths.external_ids, &compacted_ids)?;
+        let _ = append_payloads(&compacted_paths.payloads, &compacted_payloads)?;
+        TombstoneMask::new(compacted_ids.len()).save_to_path(&compacted_paths.tombstones)?;
+        SegmentMetadata::new(
+            compacted_segment_id.clone(),
+            collection_meta.dimension,
+            compacted_ids.len(),
+            0,
+        )
+        .save_to_path(&compacted_dir.join("segment.json"))?;
+
+        segment_set.immutable_segment_ids = vec![compacted_segment_id.clone()];
+        segment_set.save_to_path(&paths.segment_set)?;
+        for segment_id in &immutable_segment_ids {
+            fs::remove_dir_all(paths.segments_dir.join(segment_id))?;
+        }
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::CompactCollection {
+                    collection_name: name.to_string(),
+                    compacted_segment_id,
+                },
+            )?;
+        }
+
+        self.invalidate_search_cache(name);
+        Ok(())
+    }
+
     pub fn get_collection_info(&self, name: &str) -> io::Result<CollectionInfo> {
         let paths = self.collection_paths(name);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
@@ -230,6 +356,42 @@ impl HannsDb {
             deleted_count: segment_meta.deleted_count,
             live_count,
         })
+    }
+
+    pub fn list_collection_segments(&self, name: &str) -> io::Result<Vec<CollectionSegmentInfo>> {
+        let paths = self.collection_paths(name);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        if !paths.segment_set.exists() {
+            let segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
+            return Ok(vec![CollectionSegmentInfo {
+                id: segment_meta.segment_id,
+                live_count: segment_meta
+                    .record_count
+                    .saturating_sub(segment_meta.deleted_count),
+                dead_count: segment_meta.deleted_count,
+                ann_ready: false,
+            }]);
+        }
+
+        let segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
+        let mut segment_ids = Vec::with_capacity(1 + segment_set.immutable_segment_ids.len());
+        segment_ids.push(segment_set.active_segment_id);
+        segment_ids.extend(segment_set.immutable_segment_ids);
+
+        segment_ids
+            .into_iter()
+            .map(|segment_id| {
+                let segment_dir = paths.segments_dir.join(&segment_id);
+                let metadata = SegmentMetadata::load_from_path(&segment_dir.join("segment.json"))?;
+                Ok(CollectionSegmentInfo {
+                    id: segment_id,
+                    live_count: metadata.record_count.saturating_sub(metadata.deleted_count),
+                    dead_count: metadata.deleted_count,
+                    ann_ready: segment_dir.join("ann").exists(),
+                })
+            })
+            .collect()
     }
 
     pub fn insert(
@@ -321,6 +483,7 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        self.maybe_trigger_segment_rollover(&paths, &segment_meta)?;
         self.invalidate_search_cache(collection);
         Ok(inserted)
     }
@@ -627,6 +790,8 @@ impl HannsDb {
         CollectionPaths {
             dir: dir.clone(),
             collection_meta: dir.join("collection.json"),
+            segment_set: dir.join("segment_set.json"),
+            segments_dir: dir.join("segments"),
             segment_meta: dir.join("segment.json"),
             records: dir.join("records.bin"),
             external_ids: dir.join("ids.bin"),
@@ -635,17 +800,64 @@ impl HannsDb {
         }
     }
 
+    fn search_segment_paths(&self, collection: &str) -> io::Result<Vec<SegmentPaths>> {
+        let paths = self.collection_paths(collection);
+        if !paths.segment_set.exists() {
+            return Ok(vec![SegmentPaths::from_collection(&paths)]);
+        }
+
+        let segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
+        let mut segment_ids = Vec::with_capacity(1 + segment_set.immutable_segment_ids.len());
+        segment_ids.push(segment_set.active_segment_id);
+        segment_ids.extend(segment_set.immutable_segment_ids);
+
+        Ok(segment_ids
+            .into_iter()
+            .map(|segment_id| SegmentPaths::from_segment_dir(paths.segments_dir.join(segment_id)))
+            .collect())
+    }
+
     fn load_search_state(&self, collection: &str) -> io::Result<CachedSearchState> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let records = load_records_or_empty(&paths.records, collection_meta.dimension)?;
-        let external_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        let tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
+        let segment_paths = self.search_segment_paths(collection)?;
+
+        let mut records = Vec::new();
+        let mut external_ids = Vec::new();
+
+        for segment in segment_paths {
+            let segment_records =
+                load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            if segment_external_ids
+                .len()
+                .saturating_mul(collection_meta.dimension)
+                != segment_records.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for (row_idx, vector) in segment_records
+                .chunks_exact(collection_meta.dimension)
+                .enumerate()
+            {
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                records.extend_from_slice(vector);
+                external_ids.push(segment_external_ids[row_idx]);
+            }
+        }
 
         Ok(CachedSearchState {
             records,
             external_ids,
-            tombstone,
+            tombstone: TombstoneMask::new(0),
             dimension: collection_meta.dimension,
             metric: collection_meta.metric,
             #[cfg(feature = "knowhere-backend")]
@@ -661,6 +873,37 @@ impl HannsDb {
         cache.remove(collection);
     }
 
+    fn maybe_trigger_segment_rollover(
+        &self,
+        paths: &CollectionPaths,
+        segment_meta: &SegmentMetadata,
+    ) -> io::Result<()> {
+        if !SegmentSet::should_rollover(
+            segment_meta.record_count as u64,
+            segment_meta.deleted_count as u64,
+        ) {
+            return Ok(());
+        }
+
+        // Backward compatibility: existing collections keep flat-file read/write.
+        // This trigger materializes segment-set metadata and directories once.
+        if paths.segment_set.exists() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&paths.segments_dir)?;
+        let mut set = SegmentSet::new_single("seg-000001");
+        set.rollover();
+        for segment_id in set
+            .immutable_segment_ids
+            .iter()
+            .chain(std::iter::once(&set.active_segment_id))
+        {
+            fs::create_dir_all(paths.segments_dir.join(segment_id))?;
+        }
+        set.save_to_path(&paths.segment_set)
+    }
+
     fn query_documents_with_filter(
         &self,
         collection: &str,
@@ -668,45 +911,64 @@ impl HannsDb {
         top_k: usize,
         filter: &str,
     ) -> io::Result<Vec<DocumentHit>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
         let filter_expr = parse_filter(filter)?;
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let records = load_records_or_empty(&paths.records, collection_meta.dimension)?;
-        let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        let payloads = load_payloads_or_empty(&paths.payloads, stored_ids.len())?;
-        let tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
+        let segment_paths = self.search_segment_paths(collection)?;
 
-        if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "records and ids are not aligned",
-            ));
+        let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
+        for segment in segment_paths {
+            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for (row_idx, vector) in records.chunks_exact(collection_meta.dimension).enumerate() {
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                let fields = &payloads[row_idx];
+                if !filter_expr.matches(fields) {
+                    continue;
+                }
+                let candidate = RankedDocumentHit {
+                    hit: DocumentHit {
+                        id: stored_ids[row_idx],
+                        distance: distance_by_metric(query, vector, &collection_meta.metric)?,
+                        fields: fields.clone(),
+                    },
+                };
+
+                if heap.len() < top_k {
+                    heap.push(candidate);
+                    continue;
+                }
+
+                if let Some(worst) = heap.peek() {
+                    if candidate.cmp(worst) == Ordering::Less {
+                        let _ = heap.pop();
+                        heap.push(candidate);
+                    }
+                }
+            }
         }
 
-        let mut hits = Vec::new();
-        for (row_idx, vector) in records.chunks_exact(collection_meta.dimension).enumerate() {
-            if tombstone.is_deleted(row_idx) {
-                continue;
-            }
-            let fields = &payloads[row_idx];
-            if !filter_expr.matches(fields) {
-                continue;
-            }
-            hits.push(DocumentHit {
-                id: stored_ids[row_idx],
-                distance: distance_by_metric(query, vector, &collection_meta.metric)?,
-                fields: fields.clone(),
-            });
-        }
-
+        let mut hits = heap.into_iter().map(|entry| entry.hit).collect::<Vec<_>>();
         hits.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        if hits.len() > top_k {
-            hits.truncate(top_k);
-        }
         Ok(hits)
     }
 
@@ -776,6 +1038,9 @@ impl HannsDb {
             WalRecord::Delete { collection, ids } => {
                 self.delete_internal(collection, ids, false).map(|_| ())
             }
+            WalRecord::CompactCollection {
+                collection_name, ..
+            } => self.compact_collection_internal(collection_name, false),
         }
     }
 }
@@ -791,11 +1056,69 @@ fn wal_path(root: &Path) -> PathBuf {
 struct CollectionPaths {
     dir: PathBuf,
     collection_meta: PathBuf,
+    segment_set: PathBuf,
+    segments_dir: PathBuf,
     segment_meta: PathBuf,
     records: PathBuf,
     external_ids: PathBuf,
     payloads: PathBuf,
     tombstones: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentPaths {
+    records: PathBuf,
+    external_ids: PathBuf,
+    payloads: PathBuf,
+    tombstones: PathBuf,
+}
+
+impl SegmentPaths {
+    fn from_collection(paths: &CollectionPaths) -> Self {
+        Self {
+            records: paths.records.clone(),
+            external_ids: paths.external_ids.clone(),
+            payloads: paths.payloads.clone(),
+            tombstones: paths.tombstones.clone(),
+        }
+    }
+
+    fn from_segment_dir(segment_dir: PathBuf) -> Self {
+        Self {
+            records: segment_dir.join("records.bin"),
+            external_ids: segment_dir.join("ids.bin"),
+            payloads: segment_dir.join("payloads.jsonl"),
+            tombstones: segment_dir.join("tombstones.json"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RankedDocumentHit {
+    hit: DocumentHit,
+}
+
+impl PartialEq for RankedDocumentHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.hit.id == other.hit.id && self.hit.distance.to_bits() == other.hit.distance.to_bits()
+    }
+}
+
+impl Eq for RankedDocumentHit {}
+
+impl PartialOrd for RankedDocumentHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedDocumentHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hit
+            .distance
+            .total_cmp(&other.hit.distance)
+            .then_with(|| self.hit.id.cmp(&other.hit.id))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -849,6 +1172,13 @@ impl WalReplayPlan {
                 }
                 WalRecord::Delete { collection, ids } if !ids.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
+                        plan.requires_data_files = true;
+                    }
+                }
+                WalRecord::CompactCollection {
+                    collection_name, ..
+                } => {
+                    if let Some(plan) = collections.get_mut(collection_name) {
                         plan.requires_data_files = true;
                     }
                 }
@@ -915,7 +1245,22 @@ fn collection_name_for_wal_record(record: &WalRecord) -> &str {
         | WalRecord::InsertDocuments { collection, .. }
         | WalRecord::UpsertDocuments { collection, .. }
         | WalRecord::Delete { collection, .. } => collection,
+        WalRecord::CompactCollection {
+            collection_name, ..
+        } => collection_name,
     }
+}
+
+fn next_compacted_segment_id<'a>(segment_ids: impl Iterator<Item = &'a String>) -> String {
+    let max_id = segment_ids
+        .filter_map(|segment_id| {
+            segment_id
+                .strip_prefix("seg-")
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    format!("seg-{:06}", max_id.saturating_add(1))
 }
 
 fn load_records_or_empty(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {
@@ -1142,7 +1487,9 @@ fn ann_search(
     top_k: usize,
     ef_search: usize,
 ) -> io::Result<Vec<SearchHit>> {
-    let hits = backend.search(query, top_k, ef_search).map_err(adapter_error_to_io)?;
+    let hits = backend
+        .search(query, top_k, ef_search)
+        .map_err(adapter_error_to_io)?;
     let mut mapped = Vec::with_capacity(hits.len());
     for hit in hits {
         let ann_idx = usize::try_from(hit.id).map_err(|_| {

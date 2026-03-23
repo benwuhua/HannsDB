@@ -319,9 +319,9 @@ impl Collection {
         }
 
         let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
-        let hits = self
-            .db
-            .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
+        let hits =
+            self.db
+                .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
         Ok(hits
             .into_iter()
             .map(|hit| (hit.id.to_string(), hit.distance))
@@ -414,9 +414,9 @@ impl Collection {
         }
 
         let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
-        let hits = self
-            .db
-            .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
+        let hits =
+            self.db
+                .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
         let should_fetch_fields = output_fields
             .as_ref()
             .map_or(true, |fields| !fields.is_empty());
@@ -1046,7 +1046,9 @@ impl PyCollection {
         filter: Option<String>,
     ) -> PyResult<Vec<Py<PyDoc>>> {
         let vectors = vectors.borrow(py).inner.clone();
-        let empty_output_fields = output_fields.as_ref().is_some_and(|fields| fields.is_empty());
+        let empty_output_fields = output_fields
+            .as_ref()
+            .is_some_and(|fields| fields.is_empty());
         let has_filter = filter
             .as_deref()
             .map(str::trim)

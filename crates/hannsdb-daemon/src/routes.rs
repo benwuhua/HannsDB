@@ -12,11 +12,12 @@ use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{Document, FieldValue};
 
 use crate::api::{
-    CollectionInfoResponse, CreateCollectionRequest, CreateCollectionResponse,
-    DeleteRecordsRequest, DeleteRecordsResponse, DropCollectionResponse, ErrorResponse,
-    FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse,
-    HealthResponse, InsertRecordsRequest, InsertRecordsResponse, ListCollectionsResponse,
-    SearchHitResponse, SearchRequest, SearchResponse, UpsertRecordsResponse,
+    CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
+    CreateCollectionResponse, DeleteRecordsRequest, DeleteRecordsResponse, DropCollectionResponse,
+    ErrorResponse, FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse,
+    FlushCollectionResponse, HealthResponse, InsertRecordsRequest, InsertRecordsResponse,
+    ListCollectionsResponse, SearchHitResponse, SearchRequest, SearchResponse, SegmentsResponse,
+    UpsertRecordsResponse,
 };
 
 #[derive(Clone)]
@@ -44,6 +45,14 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
         .route(
             "/collections/:collection/admin/flush",
             post(flush_collection),
+        )
+        .route(
+            "/collections/:collection/admin/compact",
+            post(compact_collection),
+        )
+        .route(
+            "/collections/:collection/admin/segments",
+            get(get_collection_segments),
         )
         .route(
             "/collections/:collection/records",
@@ -228,6 +237,86 @@ async fn flush_collection(
             StatusCode::OK,
             Json(FlushCollectionResponse {
                 flushed: collection,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn compact_collection(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Response {
+    let mut db = state.db.lock().expect("daemon state mutex poisoned");
+    let result = db.compact_collection(&collection);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(CompactCollectionResponse { compacted: true }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_collection_segments(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .list_collection_segments(&collection);
+
+    match result {
+        Ok(segments) => (
+            StatusCode::OK,
+            Json(SegmentsResponse {
+                segments: segments
+                    .into_iter()
+                    .map(|segment| crate::api::SegmentInfoResponse {
+                        id: segment.id,
+                        live: segment.live_count,
+                        dead: segment.dead_count,
+                        ann_ready: segment.ann_ready,
+                    })
+                    .collect(),
             }),
         )
             .into_response(),

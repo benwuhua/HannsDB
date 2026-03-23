@@ -273,10 +273,7 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
         Some(&FieldValue::String("s2".to_string()))
     );
     assert_eq!(live[0].fields.get("turn"), Some(&FieldValue::Int64(7)));
-    assert_eq!(
-        live[0].fields.get("active"),
-        Some(&FieldValue::Bool(false))
-    );
+    assert_eq!(live[0].fields.get("active"), Some(&FieldValue::Bool(false)));
     drop(db);
 
     let collection_dir = collection_dir(temp.path(), "docs");
@@ -374,7 +371,10 @@ fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view()
         Some(&FieldValue::String("s3".to_string()))
     );
     assert_eq!(replayed[0].fields.get("turn"), Some(&FieldValue::Int64(9)));
-    assert_eq!(replayed[0].fields.get("active"), Some(&FieldValue::Bool(true)));
+    assert_eq!(
+        replayed[0].fields.get("active"),
+        Some(&FieldValue::Bool(true))
+    );
     assert!(
         !collection_dir.join("stale.tmp").exists(),
         "stale files should be removed when the collection is replayed"
@@ -422,11 +422,10 @@ fn wal_recovery_open_replays_wal_only_upsert_and_delete_into_latest_live_view() 
     assert_eq!(info.record_count, 1);
     assert_eq!(info.deleted_count, 1);
     assert_eq!(info.live_count, 0);
-    assert!(
-        db.fetch_documents("docs", &[11])
-            .expect("fetch replayed document")
-            .is_empty()
-    );
+    assert!(db
+        .fetch_documents("docs", &[11])
+        .expect("fetch replayed document")
+        .is_empty());
 }
 
 #[test]
@@ -448,12 +447,10 @@ fn wal_recovery_open_replays_drop_collection_without_leaving_manifest_or_dir() {
     .expect("append drop");
 
     let reopened = HannsDb::open(temp.path()).expect("reopen should replay drop");
-    assert!(
-        reopened
-            .list_collections()
-            .expect("list collections after reopen")
-            .is_empty()
-    );
+    assert!(reopened
+        .list_collections()
+        .expect("list collections after reopen")
+        .is_empty());
     assert!(
         !collection_dir(temp.path(), "docs").exists(),
         "collection dir should be removed after replay"

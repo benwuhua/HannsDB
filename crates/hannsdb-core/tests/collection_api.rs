@@ -5,7 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hannsdb_core::catalog::ManifestMetadata;
 use hannsdb_core::db::HannsDb;
-use hannsdb_core::document::CollectionSchema;
+use hannsdb_core::document::{
+    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
+};
+use hannsdb_core::segment::{
+    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+};
 use hannsdb_core::wal::{append_wal_record, WalRecord};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -14,6 +19,72 @@ fn unique_temp_dir(name: &str) -> PathBuf {
         .expect("system time before unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("{}_{}", name, nanos))
+}
+
+fn rewrite_collection_to_two_segment_layout(
+    root: &std::path::Path,
+    collection: &str,
+    dimension: usize,
+    second_segment_documents: &[Document],
+    deleted_second_segment_rows: &[usize],
+) {
+    let collection_dir = root.join("collections").join(collection);
+    let segments_dir = collection_dir.join("segments");
+    let seg1_dir = segments_dir.join("seg-0001");
+    let seg2_dir = segments_dir.join("seg-0002");
+    fs::create_dir_all(&seg1_dir).expect("create seg-0001 dir");
+    fs::create_dir_all(&seg2_dir).expect("create seg-0002 dir");
+
+    for file in [
+        "segment.json",
+        "records.bin",
+        "ids.bin",
+        "payloads.jsonl",
+        "tombstones.json",
+    ] {
+        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+    }
+
+    let mut second_ids = Vec::with_capacity(second_segment_documents.len());
+    let mut second_vectors = Vec::with_capacity(second_segment_documents.len() * dimension);
+    let mut second_payloads = Vec::with_capacity(second_segment_documents.len());
+    for document in second_segment_documents {
+        second_ids.push(document.id);
+        second_vectors.extend_from_slice(&document.vector);
+        second_payloads.push(document.fields.clone());
+    }
+
+    let inserted = append_records(&seg2_dir.join("records.bin"), dimension, &second_vectors)
+        .expect("append seg-0002 records");
+    assert_eq!(inserted, second_segment_documents.len());
+    let _ = append_record_ids(&seg2_dir.join("ids.bin"), &second_ids).expect("append seg-0002 ids");
+    let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &second_payloads)
+        .expect("append seg-0002 payloads");
+
+    let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    for row_idx in deleted_second_segment_rows {
+        let marked = seg2_tombstone.mark_deleted(*row_idx);
+        assert!(marked, "row index must be valid in seg-0002 tombstone");
+    }
+    seg2_tombstone
+        .save_to_path(&seg2_dir.join("tombstones.json"))
+        .expect("save seg-0002 tombstones");
+
+    SegmentMetadata::new(
+        "seg-0002",
+        dimension,
+        second_segment_documents.len(),
+        seg2_tombstone.deleted_count(),
+    )
+    .save_to_path(&seg2_dir.join("segment.json"))
+    .expect("save seg-0002 metadata");
+
+    SegmentSet {
+        active_segment_id: "seg-0002".to_string(),
+        immutable_segment_ids: vec!["seg-0001".to_string()],
+    }
+    .save_to_path(&collection_dir.join("segment_set.json"))
+    .expect("save segment_set metadata");
 }
 
 #[test]
@@ -33,6 +104,108 @@ fn collection_api_create_insert_search() {
         .expect("search vectors");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 42);
+}
+
+#[test]
+fn collection_api_search_merges_topk_across_two_segments() {
+    let root = unique_temp_dir("hannsdb_collection_api_two_segment_search");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let mut ids = Vec::with_capacity(100);
+    let mut vectors = Vec::with_capacity(200);
+    for i in 0_i64..100_i64 {
+        ids.push(i);
+        if i == 0 {
+            vectors.extend_from_slice(&[0.0_f32, 0.0]);
+        } else {
+            vectors.extend_from_slice(&[100.0_f32 + i as f32, 100.0 + i as f32]);
+        }
+    }
+    db.insert("docs", &ids, &vectors)
+        .expect("insert seg-0001 rows");
+
+    let mut second_docs = Vec::with_capacity(100);
+    for i in 0_i64..100_i64 {
+        let id = 100_i64 + i;
+        let vector = if i < 5 {
+            vec![(i as f32 + 1.0) * 0.1, 0.0]
+        } else {
+            vec![200.0 + i as f32, 200.0 + i as f32]
+        };
+        second_docs.push(Document::new(
+            id,
+            Vec::<(String, FieldValue)>::new(),
+            vector,
+        ));
+    }
+
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[]);
+
+    let hits = db
+        .search("docs", &[0.0_f32, 0.0], 5)
+        .expect("cross-segment search");
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![0, 100, 101, 102, 103]);
+}
+
+#[test]
+fn collection_api_filter_query_respects_cross_segment_tombstones() {
+    let root = unique_temp_dir("hannsdb_collection_api_two_segment_filter_tombstone");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let mut first_docs = Vec::with_capacity(100);
+    for i in 0_i64..100_i64 {
+        let group = if i == 10 || i == 20 { 1 } else { 2 };
+        let vector = if i == 10 {
+            vec![0.0_f32, 0.0]
+        } else if i == 20 {
+            vec![0.2_f32, 0.0]
+        } else {
+            vec![100.0 + i as f32, 100.0 + i as f32]
+        };
+        first_docs.push(Document::new(
+            i,
+            vec![("group".to_string(), FieldValue::Int64(group))],
+            vector,
+        ));
+    }
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let mut second_docs = Vec::with_capacity(100);
+    for i in 0_i64..100_i64 {
+        let id = 100_i64 + i;
+        let (group, vector) = if i == 10 {
+            (1_i64, vec![0.1_f32, 0.0])
+        } else if i == 20 {
+            (1_i64, vec![0.3_f32, 0.0])
+        } else {
+            (2_i64, vec![200.0 + i as f32, 200.0 + i as f32])
+        };
+        second_docs.push(Document::new(
+            id,
+            vec![("group".to_string(), FieldValue::Int64(group))],
+            vector,
+        ));
+    }
+
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[10]);
+
+    let hits = db
+        .query_documents("docs", &[0.0_f32, 0.0], 10, Some("group == 1"))
+        .expect("cross-segment filtered query");
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![10, 20, 120]);
 }
 
 #[test]
@@ -270,7 +443,10 @@ fn collection_api_open_replay_does_not_touch_pre_wal_collection_under_partial_st
         .search("legacy", &[0.2_f32, 0.2], 1)
         .expect("legacy search should remain available");
     assert_eq!(legacy_hits.len(), 1);
-    assert_eq!(legacy_hits[0].id, 7, "legacy collection must not be touched");
+    assert_eq!(
+        legacy_hits[0].id, 7,
+        "legacy collection must not be touched"
+    );
 
     let replay_hits = db
         .search("replay_only", &[0.0_f32, 0.0], 1)
@@ -352,8 +528,12 @@ fn collection_api_flush_collection_fails_when_tombstones_are_missing() {
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
         .expect("create collection");
-    fs::remove_file(root.join("collections").join("docs").join("tombstones.json"))
-        .expect("remove tombstones");
+    fs::remove_file(
+        root.join("collections")
+            .join("docs")
+            .join("tombstones.json"),
+    )
+    .expect("remove tombstones");
 
     let err = db
         .flush_collection("docs")

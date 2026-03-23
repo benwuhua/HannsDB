@@ -656,3 +656,116 @@ async fn records_upsert_fetch_and_filtered_search_work() {
         serde_json::json!([0.0, 0.0])
     );
 }
+
+#[tokio::test]
+async fn admin_segments_route_returns_segment_stats_for_single_segment() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete request");
+    assert_eq!(delete.status(), StatusCode::OK);
+
+    let segments = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/admin/segments")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send segments request");
+    assert_eq!(segments.status(), StatusCode::OK);
+
+    let body = to_bytes(segments.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse segments json");
+    assert_eq!(
+        json["segments"].as_array().expect("segments array").len(),
+        1
+    );
+    assert_eq!(json["segments"][0]["id"], "seg-0001");
+    assert_eq!(json["segments"][0]["live"], 1);
+    assert_eq!(json["segments"][0]["dead"], 1);
+    assert_eq!(json["segments"][0]["ann_ready"], false);
+}
+
+#[tokio::test]
+async fn admin_compact_route_dispatches_to_core() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let compact = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/admin/compact")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send compact request");
+    assert_eq!(compact.status(), StatusCode::OK);
+
+    let body = to_bytes(compact.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse compact json");
+    assert_eq!(json["compacted"], true);
+}
