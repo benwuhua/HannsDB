@@ -20,6 +20,7 @@ use crate::segment::{
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
+const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 
 pub struct HannsDb {
     root: PathBuf,
@@ -211,7 +212,19 @@ impl HannsDb {
         let mut state = state;
         #[cfg(feature = "knowhere-backend")]
         {
-            state.optimized_ann = Some(build_optimized_ann_state(&state)?);
+            let mut hnsw_bytes = None;
+            state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
+            if let Some(bytes) = hnsw_bytes {
+                let paths = self.collection_paths(name);
+                if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
+                    eprintln!("Failed to persist HNSW index: {e}");
+                } else {
+                    eprintln!(
+                        "Persisted HNSW index ({} bytes) for collection '{name}'",
+                        bytes.len()
+                    );
+                }
+            }
         }
         let mut cache = self
             .search_cache
@@ -818,6 +831,7 @@ impl HannsDb {
     fn load_search_state(&self, collection: &str) -> io::Result<CachedSearchState> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let metric = collection_meta.metric.clone();
         let segment_paths = self.search_segment_paths(collection)?;
 
         let mut records = Vec::new();
@@ -852,14 +866,37 @@ impl HannsDb {
             }
         }
 
+        #[cfg(feature = "knowhere-backend")]
+        let optimized_ann = {
+            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+            if hnsw_path.exists() {
+                match fs::read(&hnsw_path).and_then(|bytes| {
+                    KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
+                        .map_err(|e| io::Error::other(format!("{e:?}")))
+                }) {
+                    Ok(backend) => Some(OptimizedAnnState {
+                        backend: Arc::new(backend),
+                        ann_external_ids: Arc::new(external_ids.clone()),
+                        metric: metric.to_ascii_lowercase(),
+                    }),
+                    Err(e) => {
+                        eprintln!("Failed to load persisted HNSW index: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
         Ok(CachedSearchState {
             records: Arc::new(records),
             external_ids: Arc::new(external_ids),
             tombstone: TombstoneMask::new(0),
             dimension: collection_meta.dimension,
-            metric: collection_meta.metric,
+            metric,
             #[cfg(feature = "knowhere-backend")]
-            optimized_ann: None,
+            optimized_ann,
         })
     }
 
@@ -1420,17 +1457,13 @@ fn mark_live_id_deleted(
 }
 
 #[cfg(feature = "knowhere-backend")]
-fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedAnnState> {
+fn build_optimized_ann_state(
+    state: &CachedSearchState,
+    index_bytes_out: &mut Option<Vec<u8>>,
+) -> io::Result<OptimizedAnnState> {
     let metric = state.metric.to_ascii_lowercase();
-    let mut backend = make_ann_backend(state.dimension, &metric)?;
-    let ann_external_ids: Arc<Vec<i64>>;
-    if state.tombstone.deleted_count() == 0 {
-        ann_external_ids = Arc::clone(&state.external_ids);
-        if !state.records.is_empty() {
-            backend
-                .insert_flat_identity(&state.records, state.dimension)
-                .map_err(adapter_error_to_io)?;
-        }
+    let (ann_external_ids, flat_vectors) = if state.tombstone.deleted_count() == 0 {
+        (Arc::clone(&state.external_ids), state.records.as_ref().clone())
     } else {
         let live_count = state
             .external_ids
@@ -1445,36 +1478,37 @@ fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedA
             flat_vectors.extend_from_slice(vector);
             live_external_ids.push(state.external_ids[row_idx]);
         }
+        (Arc::new(live_external_ids), flat_vectors)
+    };
 
+    if metric == "l2" || metric == "cosine" || metric == "ip" {
+        let mut backend = KnowhereHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
         if !flat_vectors.is_empty() {
             backend
                 .insert_flat_identity(&flat_vectors, state.dimension)
                 .map_err(adapter_error_to_io)?;
         }
-        ann_external_ids = Arc::new(live_external_ids);
+        *index_bytes_out = backend.serialize_to_bytes().ok();
+        return Ok(OptimizedAnnState {
+            backend: Arc::new(backend),
+            ann_external_ids,
+            metric,
+        });
     }
 
+    let mut backend = InMemoryHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
+    if !flat_vectors.is_empty() {
+        backend
+            .insert_flat_identity(&flat_vectors, state.dimension)
+            .map_err(adapter_error_to_io)?;
+    }
+    *index_bytes_out = None;
+
     Ok(OptimizedAnnState {
-        backend: Arc::from(backend),
+        backend: Arc::new(backend),
         ann_external_ids,
         metric,
     })
-}
-
-#[cfg(feature = "knowhere-backend")]
-fn make_ann_backend(
-    dimension: usize,
-    metric: &str,
-) -> io::Result<Box<dyn HnswBackend + Send + Sync>> {
-    if metric == "l2" || metric == "cosine" || metric == "ip" {
-        return KnowhereHnswIndex::new(dimension, metric)
-            .map(|index| Box::new(index) as Box<dyn HnswBackend + Send + Sync>)
-            .map_err(adapter_error_to_io);
-    }
-
-    InMemoryHnswIndex::new(dimension, metric)
-        .map(|index| Box::new(index) as Box<dyn HnswBackend + Send + Sync>)
-        .map_err(adapter_error_to_io)
 }
 
 #[cfg(feature = "knowhere-backend")]

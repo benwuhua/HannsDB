@@ -139,6 +139,18 @@ impl KnowhereHnswIndex {
 
         Ok(Self { dim, inner })
     }
+
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, AdapterError> {
+        self.inner
+            .serialize_to_bytes()
+            .map_err(|e| AdapterError::Backend(format!("hnsw serialize failed: {e}")))
+    }
+
+    pub fn from_bytes(dim: usize, bytes: &[u8]) -> Result<Self, AdapterError> {
+        let inner = knowhere_rs::HnswIndex::deserialize_from_bytes(bytes)
+            .map_err(|e| AdapterError::Backend(format!("hnsw deserialize failed: {e}")))?;
+        Ok(Self { dim, inner })
+    }
 }
 
 #[cfg(feature = "knowhere-backend")]
