@@ -1053,7 +1053,7 @@ impl PyCollection {
         topk: usize,
         filter: Option<String>,
     ) -> PyResult<Vec<Py<PyDoc>>> {
-        let vectors = vectors.borrow(py).inner.clone();
+        let borrowed = vectors.borrow(py);
         let empty_output_fields = output_fields
             .as_ref()
             .is_some_and(|fields| fields.is_empty());
@@ -1064,7 +1064,7 @@ impl PyCollection {
         if empty_output_fields && !has_filter {
             let hits = self
                 .inner_ref()?
-                .query_ids_scores(topk, &vectors)
+                .query_ids_scores(topk, &borrowed.inner)
                 .map_err(io_to_py_err)?;
             return hits
                 .into_iter()
@@ -1084,6 +1084,7 @@ impl PyCollection {
                 .collect();
         }
 
+        let vectors = borrowed.inner.clone();
         let docs = self
             .inner_ref()?
             .query(output_fields, topk, filter.as_deref(), vectors)
@@ -1091,6 +1092,28 @@ impl PyCollection {
         docs.into_iter()
             .map(|doc| Py::new(py, PyDoc { inner: doc }))
             .collect()
+    }
+
+    #[pyo3(signature = (field_name, vector, topk, ef=32))]
+    fn search_ids_raw(
+        &self,
+        field_name: String,
+        vector: Vec<f32>,
+        topk: usize,
+        ef: usize,
+    ) -> PyResult<Vec<i64>> {
+        let inner = self.inner_ref()?;
+        if field_name != inner.primary_vector_name {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "query field '{}' does not match primary vector '{}'",
+                field_name, inner.primary_vector_name
+            )));
+        }
+        let hits = inner
+            .db
+            .search_with_ef(&inner.collection_name, &vector, topk, ef.max(1))
+            .map_err(io_to_py_err)?;
+        Ok(hits.into_iter().map(|hit| hit.id).collect())
     }
 
     #[pyo3(signature = (_option=None))]
