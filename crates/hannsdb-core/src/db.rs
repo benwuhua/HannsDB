@@ -55,7 +55,7 @@ pub struct DocumentHit {
 struct CachedSearchState {
     records: Arc<Vec<f32>>,
     external_ids: Arc<Vec<i64>>,
-    tombstone: TombstoneMask,
+    tombstone: Arc<TombstoneMask>,
     dimension: usize,
     metric: String,
     hnsw_m: usize,
@@ -710,12 +710,6 @@ impl HannsDb {
     ) -> io::Result<Vec<SearchHit>> {
         #[cfg(feature = "knowhere-backend")]
         let ef_search = _ef_search.max(1);
-        #[cfg(feature = "knowhere-backend")]
-        let mut optimized_snapshot: Option<(
-            Arc<dyn HnswBackend + Send + Sync>,
-            Arc<Vec<i64>>,
-            String,
-        )> = None;
         let mut cache = self
             .search_cache
             .lock()
@@ -730,32 +724,29 @@ impl HannsDb {
             .expect("search cache must contain requested collection");
         #[cfg(feature = "knowhere-backend")]
         if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-            optimized_snapshot = Some((
+            let optimized_snapshot = (
                 Arc::clone(&optimized_ann.backend),
                 Arc::clone(&optimized_ann.ann_external_ids),
                 optimized_ann.metric.clone(),
-            ));
-        }
-        let brute_force_snapshot = (
-            Arc::clone(&state.records),
-            Arc::clone(&state.external_ids),
-            state.tombstone.clone(),
-            state.dimension,
-            state.metric.clone(),
-        );
-        drop(cache);
-
-        #[cfg(feature = "knowhere-backend")]
-        if let Some((backend, ann_external_ids, metric)) = optimized_snapshot {
+            );
+            drop(cache);
             return ann_search(
-                backend.as_ref(),
-                ann_external_ids.as_slice(),
-                &metric,
+                optimized_snapshot.0.as_ref(),
+                optimized_snapshot.1.as_slice(),
+                &optimized_snapshot.2,
                 query,
                 top_k,
                 ef_search,
             );
         }
+        let brute_force_snapshot = (
+            Arc::clone(&state.records),
+            Arc::clone(&state.external_ids),
+            Arc::clone(&state.tombstone),
+            state.dimension,
+            state.metric.clone(),
+        );
+        drop(cache);
 
         let (records, external_ids, tombstone, dimension, metric) = brute_force_snapshot;
 
@@ -763,7 +754,7 @@ impl HannsDb {
             &records,
             &external_ids,
             dimension,
-            &tombstone,
+            tombstone.as_ref(),
             query,
             top_k,
             &metric,
@@ -894,7 +885,7 @@ impl HannsDb {
         Ok(CachedSearchState {
             records: Arc::new(records),
             external_ids: Arc::new(external_ids),
-            tombstone: TombstoneMask::new(0),
+            tombstone: Arc::new(TombstoneMask::new(0)),
             dimension: collection_meta.dimension,
             metric,
             hnsw_m: collection_meta.hnsw_m,
