@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "knowhere-backend")]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::adapter::{AdapterError, HnswBackend};
@@ -54,8 +52,8 @@ pub struct DocumentHit {
 }
 
 struct CachedSearchState {
-    records: Vec<f32>,
-    external_ids: Vec<i64>,
+    records: Arc<Vec<f32>>,
+    external_ids: Arc<Vec<i64>>,
     tombstone: TombstoneMask,
     dimension: usize,
     metric: String,
@@ -724,8 +722,8 @@ impl HannsDb {
             ));
         }
         let brute_force_snapshot = (
-            state.records.clone(),
-            state.external_ids.clone(),
+            Arc::clone(&state.records),
+            Arc::clone(&state.external_ids),
             state.tombstone.clone(),
             state.dimension,
             state.metric.clone(),
@@ -855,8 +853,8 @@ impl HannsDb {
         }
 
         Ok(CachedSearchState {
-            records,
-            external_ids,
+            records: Arc::new(records),
+            external_ids: Arc::new(external_ids),
             tombstone: TombstoneMask::new(0),
             dimension: collection_meta.dimension,
             metric: collection_meta.metric,
@@ -1425,9 +1423,9 @@ fn mark_live_id_deleted(
 fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedAnnState> {
     let metric = state.metric.to_ascii_lowercase();
     let mut backend = make_ann_backend(state.dimension, &metric)?;
-    let mut ann_external_ids;
+    let ann_external_ids: Arc<Vec<i64>>;
     if state.tombstone.deleted_count() == 0 {
-        ann_external_ids = state.external_ids.clone();
+        ann_external_ids = Arc::clone(&state.external_ids);
         if !state.records.is_empty() {
             backend
                 .insert_flat_identity(&state.records, state.dimension)
@@ -1438,14 +1436,14 @@ fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedA
             .external_ids
             .len()
             .saturating_sub(state.tombstone.deleted_count());
-        ann_external_ids = Vec::with_capacity(live_count);
+        let mut live_external_ids = Vec::with_capacity(live_count);
         let mut flat_vectors = Vec::with_capacity(live_count.saturating_mul(state.dimension));
         for (row_idx, vector) in state.records.chunks_exact(state.dimension).enumerate() {
             if state.tombstone.is_deleted(row_idx) {
                 continue;
             }
             flat_vectors.extend_from_slice(vector);
-            ann_external_ids.push(state.external_ids[row_idx]);
+            live_external_ids.push(state.external_ids[row_idx]);
         }
 
         if !flat_vectors.is_empty() {
@@ -1453,11 +1451,12 @@ fn build_optimized_ann_state(state: &CachedSearchState) -> io::Result<OptimizedA
                 .insert_flat_identity(&flat_vectors, state.dimension)
                 .map_err(adapter_error_to_io)?;
         }
+        ann_external_ids = Arc::new(live_external_ids);
     }
 
     Ok(OptimizedAnnState {
         backend: Arc::from(backend),
-        ann_external_ids: Arc::new(ann_external_ids),
+        ann_external_ids,
         metric,
     })
 }
