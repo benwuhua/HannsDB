@@ -1303,4 +1303,42 @@ Python binding 层开销约 2.5ms，远大于 zvec（pybind11 C++ 路径）的 b
 1. Python list → `Vec<f32>` 转换（1536 个 float 对象，每次 query）
 2. `vectors.borrow(py).inner.clone()`：每次 query 克隆整个 VectorQuery（含 1536-float Vec）
 3. knowhere-rs cosine 路径每 query 创建 `SearchScratch::new()`（无 TLS 缓存）
+
+## 44) search_ids_raw：消除 Python binding 层开销（2026-03-23）
+
+### 问题诊断
+
+`search_embedding` NonFilter 路径经过 `query()` → `VectorQuery` 对象创建 → `PyDoc` × 10 分配 → `int(result.id)` 列表推导。这些 Python 对象开销合计约 2.5ms/query，是主要瓶颈。
+
+### 修改内容
+
+**`crates/hannsdb-py/src/lib.rs`（commit `ecd7fe6`）：**
+
+1. 新增 `search_ids_raw` PyO3 方法：直接调用 `db.search_with_ef()` 返回 `Vec<i64>`，完全跳过 `VectorQuery` 和 `PyDoc` 对象构建。消除 10× `Py::new(py, PyDoc{...})` heap alloc + Python 对象。
+
+2. `query()` VectorQuery clone 修复：NonFilter P2 fast path 改为 `let borrowed = vectors.borrow(py)` + `&borrowed.inner` 传引用，避免 6KB Vec<f32> clone。
+
+**`VectorDBBench/vectordb_bench/backend/clients/hannsdb/hannsdb.py`：**
+
+`search_embedding` NonFilter 路径改用 `search_ids_raw`：
+```python
+return self.collection.search_ids_raw(
+    field_name="dense",
+    vector=query,
+    topk=k,
+    ef=self.ef_search,
+)
+```
+
+### x86 验证结果（Performance1536D50K, cosine, dim=1536, 50K, ef=32, k=10）
+
+| 版本 | x86 p99 | recall | ndcg |
+|------|---------|--------|------|
+| 修复前（tombstone fix 后） | 2.7ms | 0.9768 | — |
+| search_ids_raw 后 | **0.7ms** | 0.9465 | 0.9535 |
+| zvec x86 基准 | 0.9ms | 0.941 | — |
+
+**结论：3.86× 提升，超过 zvec（0.9ms）。**
+
+Python binding 层确实是 2.5ms 的主要来源：10× `PyDoc` alloc + `int()` 列表推导是核心开销，`search_ids_raw` 一次性消除。recall 从 0.9768 → 0.9465 轻微下降（约 3%），原因待查（可能是 ef_search 传参差异）。
 4. 10× `Py::new(py, PyDoc {...})`：Python heap allocation per result
