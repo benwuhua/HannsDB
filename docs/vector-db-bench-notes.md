@@ -1368,13 +1368,53 @@ Python binding 层确实是 2.5ms 的主要来源：10× `PyDoc` alloc + `int()`
 - zvec: 83533 queries / 30.01s
 - 并发 QPS 比值: zvec / HannsDB = **1.40×**
 
-### 已知限制（本次测量）
+### 已知限制（本次测量的后续更新）
 
-- HannsDB 在 VectorDBBench 并发 worker 里每次都会调用 `optimize()` 重建 HNSW，导致约 207s 启动开销。
-- 根因是 `from_bytes` 加载路径存在 bug（修复中），worker 未能复用已持久化的 HNSW index。
+- 2026-03-24 后续诊断确认：from_bytes 路径在最新代码下工作正常（x86 重编译后验证）。
+- Section 45 的 1991.6 QPS 测量本身是有效的（p99=0.71ms 证明 HNSW 当时已生效）。
+- 当时 HannsDB worker 重建开销的描述有误；详见 Section 46 的修正。
 
 ### 结论
 
 - 在当前实现下，zvec 在并发 QPS 上快 **1.40×**。
 - HannsDB 的 serial p99 更低（0.71ms vs 0.90ms），并且 recall 更高（0.9465 vs 0.9410）。
 - `from_bytes` 路径修复后需重新测量并发 QPS，再做最终结论。
+
+## 46) HannsDB HNSW 加载诊断与修正 QPS 测量（x86, 2026-03-24）
+
+### 背景
+
+Section 45 记录了 1991.6 QPS，并标注"from_bytes 路径存在 bug 待修"。后续诊断发现：
+
+- x86 上 `from_bytes` 失败的根本原因是**旧编译产物未更新**（stale binary）。
+- 重编译最新代码后，`from_bytes` 正常工作，无任何 `[HANNS-DIAG]` 错误输出。
+- 诊断脚本确认: `search_ms=0.8ms, hits=10`（HNSW 正确运行）。
+- HNSW 加载（`from_bytes`，322MB index file）耗时约 7s（`open_ms≈7088ms`），在 VectorDBBench init 阶段支付，不影响 QPS 测量窗口。
+
+### 修正后 QPS 测量（x86, 2026-03-24）
+
+- 数据集: Performance1536D50K, cosine, dim=1536, 50K vectors
+- 参数: M=16, ef_construction=64, ef_search=32, k=10
+- 并发度: concurrency=1, duration=30s
+
+| DB      | serial_p99 | 并发 QPS | recall |
+|---------|------------|----------|--------|
+| HannsDB | 0.7ms      | **1536.5 QPS** | 0.9465 |
+| zvec    | 0.9ms      | 2781.0 QPS | 0.9410 |
+
+- 并发 QPS 比值: zvec / HannsDB = **1.81×**（zvec 更快）
+- HannsDB 优势: recall +0.55%（0.9465 vs 0.9410），p99 更低（0.7ms vs 0.9ms）
+
+### QPS 差距分析
+
+HannsDB mean latency ≈ 0.65ms，zvec mean ≈ 0.36ms。尽管 HannsDB p99 更低，但 mean latency 更高，导致单线程吞吐低。
+
+差距来源（假设）：
+1. HNSW 搜索算法实现效率：knowhere-rs HNSW vs zvec hnswlib，SIMD 利用率差异
+2. Python 层开销差异（PyO3 vs 原生 C++ binding）
+
+### 下一步优化方向
+
+1. INT8/FP16 量化（knowhere-rs SQ8）：降低 HNSW search 时间，可能提升 QPS
+2. 批量搜索：减少 Python-Rust FFI per-call 开销
+3. profile 确认 mean latency 分布（0.65ms 具体花在哪里）
