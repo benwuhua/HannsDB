@@ -148,12 +148,23 @@ impl KnowhereHnswIndex {
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, AdapterError> {
         self.inner
             .serialize_to_bytes()
-            .map_err(|e| AdapterError::Backend(format!("hnsw serialize failed: {e}")))
+            .map_err(|e| AdapterError::Backend(format!("hnsw serialize failed (dim={}): {e}", self.dim)))
     }
 
     pub fn from_bytes(dim: usize, bytes: &[u8]) -> Result<Self, AdapterError> {
-        let inner = knowhere_rs::HnswIndex::deserialize_from_bytes(bytes)
-            .map_err(|e| AdapterError::Backend(format!("hnsw deserialize failed: {e}")))?;
+        let inner = std::panic::catch_unwind(|| knowhere_rs::HnswIndex::deserialize_from_bytes(bytes))
+            .map_err(|_| {
+                AdapterError::Backend(format!(
+                    "hnsw deserialize panicked (dim={dim}, bytes={})",
+                    bytes.len()
+                ))
+            })?
+            .map_err(|e| {
+                AdapterError::Backend(format!(
+                    "hnsw deserialize failed (dim={dim}, bytes={}): {e}",
+                    bytes.len()
+                ))
+            })?;
         Ok(Self { dim, inner })
     }
 }

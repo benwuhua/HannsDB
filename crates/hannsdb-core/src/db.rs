@@ -873,8 +873,64 @@ impl HannsDb {
                         metric: metric.to_ascii_lowercase(),
                     }),
                     Err(e) => {
-                        log::warn!("Failed to load persisted HNSW index: {e}");
-                        None
+                        log::warn!(
+                            "Failed to load persisted HNSW index from '{}': {e}",
+                            hnsw_path.display()
+                        );
+                        let metric_lc = metric.to_ascii_lowercase();
+                        match KnowhereHnswIndex::new(
+                            collection_meta.dimension,
+                            &metric_lc,
+                            collection_meta.hnsw_m,
+                            collection_meta.hnsw_ef_construction,
+                        ) {
+                            Ok(mut backend) => {
+                                match backend.insert_flat_identity(&records, collection_meta.dimension) {
+                                    Ok(()) => {
+                                        match backend.serialize_to_bytes() {
+                                            Ok(rebuilt) => {
+                                                if let Err(write_err) = fs::write(&hnsw_path, &rebuilt) {
+                                                    log::warn!(
+                                                        "Failed to rewrite rebuilt HNSW index to '{}': {write_err}",
+                                                        hnsw_path.display()
+                                                    );
+                                                } else {
+                                                    log::info!(
+                                                        "Rebuilt and rewrote HNSW index for '{}' ({} bytes)",
+                                                        collection, rebuilt.len()
+                                                    );
+                                                }
+                                            }
+                                            Err(ser_err) => {
+                                                log::warn!(
+                                                    "Failed to serialize rebuilt HNSW index: {:?}",
+                                                    ser_err
+                                                );
+                                            }
+                                        }
+                                        Some(OptimizedAnnState {
+                                            backend: Arc::new(backend),
+                                            ann_external_ids: Arc::new(external_ids.clone()),
+                                            metric: metric_lc,
+                                        })
+                                    }
+                                    Err(rebuild_err) => {
+                                        log::warn!(
+                                            "Failed to rebuild HNSW index in-memory for '{}': {:?}",
+                                            collection, rebuild_err
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(create_err) => {
+                                log::warn!(
+                                    "Failed to create HNSW backend for rebuild on '{}': {:?}",
+                                    collection, create_err
+                                );
+                                None
+                            }
+                        }
                     }
                 }
             } else {

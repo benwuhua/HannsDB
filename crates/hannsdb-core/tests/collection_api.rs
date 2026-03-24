@@ -636,6 +636,36 @@ fn collection_api_optimize_ann_preserves_ip_distance_semantics() {
     );
 }
 
+#[cfg(feature = "knowhere-backend")]
+#[test]
+fn collection_api_reopen_loads_persisted_hnsw_index() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_loads_persisted_hnsw");
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
+        db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 10.0, 10.0])
+            .expect("insert vectors");
+        db.optimize_collection("docs")
+            .expect("optimize should persist hnsw index");
+    }
+
+    let collection_dir = root.join("collections").join("docs");
+    assert!(
+        collection_dir.join("hnsw_index.bin").exists(),
+        "persisted hnsw index should exist after optimize"
+    );
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let db = HannsDb::open(&root).expect("reopen db");
+    let hits = db
+        .search_with_ef("docs", &[0.1_f32, -0.1], 1, 32)
+        .expect("reopen search should use persisted hnsw index");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 11);
+}
+
 #[test]
 fn collection_api_optimize_benchmark_entry() {
     fn read_env_usize(name: &str, default: usize) -> usize {

@@ -82,7 +82,8 @@ fn hnsw_adapter_rejects_dimension_mismatch() {
 #[cfg(feature = "knowhere-backend")]
 #[test]
 fn knowhere_hnsw_adapter_roundtrip_insert_and_search() {
-    let backend = KnowhereHnswIndex::new(2, "l2").expect("knowhere backend should construct");
+    let backend =
+        KnowhereHnswIndex::new(2, "l2", 16, 64).expect("knowhere backend should construct");
     let mut adapter = HnswAdapter::new(backend);
 
     adapter
@@ -102,7 +103,8 @@ fn knowhere_hnsw_adapter_roundtrip_insert_and_search() {
 #[cfg(feature = "knowhere-backend")]
 #[test]
 fn knowhere_hnsw_adapter_near_origin_l2_search_prefers_closest_point() {
-    let backend = KnowhereHnswIndex::new(2, "l2").expect("knowhere backend should construct");
+    let backend =
+        KnowhereHnswIndex::new(2, "l2", 16, 64).expect("knowhere backend should construct");
     let mut adapter = HnswAdapter::new(backend);
 
     adapter
@@ -122,7 +124,8 @@ fn knowhere_hnsw_adapter_near_origin_l2_search_prefers_closest_point() {
 #[cfg(feature = "knowhere-backend")]
 #[test]
 fn knowhere_hnsw_adapter_l2_search_matches_expected_neighbor_for_small_fixture() {
-    let backend = KnowhereHnswIndex::new(2, "l2").expect("knowhere backend should construct");
+    let backend =
+        KnowhereHnswIndex::new(2, "l2", 16, 64).expect("knowhere backend should construct");
     let mut adapter = HnswAdapter::new(backend);
 
     adapter
