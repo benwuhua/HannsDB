@@ -302,6 +302,12 @@ pub fn open(
         )
     })?;
     let metadata = collection_metadata_from_root(root, &collection_name)?;
+    // Warm search cache on open so persisted HNSW deserialize cost is paid before
+    // benchmark search windows start. Ignore errors for empty collections.
+    if metadata.dimension > 0 {
+        let warm_query = vec![0.0_f32; metadata.dimension];
+        let _ = db.search_with_ef(&collection_name, &warm_query, 1, 1);
+    }
     Ok(Collection {
         path,
         collection_name,

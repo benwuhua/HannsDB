@@ -715,6 +715,13 @@ impl HannsDb {
             .lock()
             .expect("search cache mutex poisoned");
         if !cache.contains_key(collection) {
+            #[cfg(feature = "knowhere-backend")]
+            let state = if let Some(ann_state) = self.try_load_persisted_ann_state(collection)? {
+                ann_state
+            } else {
+                self.load_search_state(collection)?
+            };
+            #[cfg(not(feature = "knowhere-backend"))]
             let state = self.load_search_state(collection)?;
             cache.insert(collection.to_string(), state);
         }
@@ -759,6 +766,68 @@ impl HannsDb {
             top_k,
             &metric,
         )
+    }
+
+    #[cfg(feature = "knowhere-backend")]
+    fn try_load_persisted_ann_state(&self, collection: &str) -> io::Result<Option<CachedSearchState>> {
+        let paths = self.collection_paths(collection);
+        let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+        if !hnsw_path.exists() {
+            return Ok(None);
+        }
+
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let metric = collection_meta.metric.clone();
+        let metric_lc = metric.to_ascii_lowercase();
+        let segment_paths = self.search_segment_paths(collection)?;
+
+        // Fast path: only reconstruct live external IDs for ANN id mapping.
+        let mut live_external_ids = Vec::new();
+        for segment in segment_paths {
+            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+            for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
+                if !tombstone.is_deleted(row_idx) {
+                    live_external_ids.push(external_id);
+                }
+            }
+        }
+
+        match fs::read(&hnsw_path).and_then(|bytes| {
+            KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }) {
+            Ok(backend) => {
+                log::info!(
+                    "Loaded persisted HNSW index for '{}' from '{}'",
+                    collection,
+                    hnsw_path.display()
+                );
+                let ann_external_ids = Arc::new(live_external_ids);
+                Ok(Some(CachedSearchState {
+                    records: Arc::new(Vec::new()),
+                    external_ids: Arc::clone(&ann_external_ids),
+                    tombstone: Arc::new(TombstoneMask::new(0)),
+                    dimension: collection_meta.dimension,
+                    metric,
+                    hnsw_m: collection_meta.hnsw_m,
+                    hnsw_ef_construction: collection_meta.hnsw_ef_construction,
+                    optimized_ann: Some(OptimizedAnnState {
+                        backend: Arc::new(backend),
+                        ann_external_ids,
+                        metric: metric_lc,
+                    }),
+                }))
+            }
+            Err(e) => {
+                log::warn!(
+                    "Fast persisted HNSW load failed for '{}' from '{}': {e}",
+                    collection,
+                    hnsw_path.display()
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub fn query_documents(
