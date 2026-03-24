@@ -1342,3 +1342,39 @@ return self.collection.search_ids_raw(
 
 Python binding 层确实是 2.5ms 的主要来源：10× `PyDoc` alloc + `int()` 列表推导是核心开销，`search_ids_raw` 一次性消除。recall 从 0.9768 → 0.9465 轻微下降（约 3%），原因待查（可能是 ef_search 传参差异）。
 4. 10× `Py::new(py, PyDoc {...})`：Python heap allocation per result
+
+## 45) HannsDB vs zvec 并发 QPS 对比（x86, 2026-03-24）
+
+### 测试条件
+
+- 数据集: Performance1536D50K
+- 指标: cosine
+- 参数: M=16, ef_construction=64, ef_search=32, k=10
+- 测试窗口: concurrent search 30s
+- 并发度: concurrency=1
+- 结果来源:
+  - HannsDB: `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260324_hannsdb-qps-20260324_hannsdb.json`
+  - zvec: `/data/work/VectorDBBench/vectordb_bench/results/Zvec/result_20260324_zvec-qps-20260324_zvec.json`
+
+### 对比结果
+
+| DB      | serial_p99 | serial_p95 | 并发 QPS (30s) | recall |
+|---------|------------|------------|----------------|--------|
+| HannsDB | 0.71ms     | 0.63ms     | 1991.6 QPS     | 0.9465 |
+| zvec    | 0.90ms     | 0.40ms     | 2781.0 QPS     | 0.9410 |
+
+明细：
+- HannsDB: 59842 queries / 30.05s
+- zvec: 83533 queries / 30.01s
+- 并发 QPS 比值: zvec / HannsDB = **1.40×**
+
+### 已知限制（本次测量）
+
+- HannsDB 在 VectorDBBench 并发 worker 里每次都会调用 `optimize()` 重建 HNSW，导致约 207s 启动开销。
+- 根因是 `from_bytes` 加载路径存在 bug（修复中），worker 未能复用已持久化的 HNSW index。
+
+### 结论
+
+- 在当前实现下，zvec 在并发 QPS 上快 **1.40×**。
+- HannsDB 的 serial p99 更低（0.71ms vs 0.90ms），并且 recall 更高（0.9465 vs 0.9410）。
+- `from_bytes` 路径修复后需重新测量并发 QPS，再做最终结论。
