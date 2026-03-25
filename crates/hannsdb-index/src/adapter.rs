@@ -67,6 +67,23 @@ pub trait HnswBackend {
         k: usize,
         ef_search: usize,
     ) -> Result<Vec<HnswSearchHit>, AdapterError>;
+
+    fn search_into(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        ids_out: &mut [i64],
+        dists_out: &mut [f32],
+    ) -> Result<usize, AdapterError> {
+        let hits = self.search(query, k, ef_search)?;
+        let n = hits.len().min(k).min(ids_out.len()).min(dists_out.len());
+        for (i, h) in hits.iter().take(n).enumerate() {
+            ids_out[i] = h.id as i64;
+            dists_out[i] = h.distance;
+        }
+        Ok(n)
+    }
 }
 
 pub struct HnswAdapter<B> {

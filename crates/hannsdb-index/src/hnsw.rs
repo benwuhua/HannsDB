@@ -294,4 +294,31 @@ impl HnswBackend for KnowhereHnswIndex {
             })
             .collect())
     }
+
+    fn search_into(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        ids_out: &mut [i64],
+        dists_out: &mut [f32],
+    ) -> Result<usize, AdapterError> {
+        if query.len() != self.dim {
+            return Err(AdapterError::InvalidDimension {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        let k = k.min(ids_out.len()).min(dists_out.len());
+        let req = knowhere_rs::SearchRequest {
+            top_k: k,
+            nprobe: ef_search,
+            filter: None,
+            params: None,
+            radius: None,
+        };
+        self.inner
+            .search_into(query, &req, ids_out, dists_out)
+            .map_err(|e| AdapterError::Backend(format!("knowhere search_into failed: {e}")))
+    }
 }

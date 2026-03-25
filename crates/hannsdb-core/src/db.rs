@@ -1646,12 +1646,18 @@ fn ann_search(
     top_k: usize,
     ef_search: usize,
 ) -> io::Result<Vec<SearchHit>> {
-    let hits = backend
-        .search(query, top_k, ef_search)
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut ids_buf = vec![0_i64; top_k];
+    let mut dists_buf = vec![0.0_f32; top_k];
+    let n = backend
+        .search_into(query, top_k, ef_search, &mut ids_buf, &mut dists_buf)
         .map_err(adapter_error_to_io)?;
-    let mut mapped = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let ann_idx = usize::try_from(hit.id).map_err(|_| {
+    let mut mapped = Vec::with_capacity(n);
+    for i in 0..n {
+        let ann_idx = usize::try_from(ids_buf[i]).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "optimized ANN hit id cannot be converted to usize",
@@ -1660,12 +1666,12 @@ fn ann_search(
         let external_id = ann_external_ids.get(ann_idx).copied().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("optimized ANN hit id out of range: {}", hit.id),
+                format!("optimized ANN hit id out of range: {}", ids_buf[i]),
             )
         })?;
         let distance = match metric {
-            "ip" => -hit.distance,
-            _ => hit.distance,
+            "ip" => -dists_buf[i],
+            _ => dists_buf[i],
         };
         mapped.push(SearchHit {
             id: external_id,
