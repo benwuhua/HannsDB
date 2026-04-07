@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["python-binding"]
 python-binding = ["dep:pyo3", "dep:numpy"]
 knowhere-backend = ["hannsdb-core/knowhere-backend"]
 

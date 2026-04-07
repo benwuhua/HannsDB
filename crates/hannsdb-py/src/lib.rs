@@ -171,32 +171,19 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             "CollectionSchema requires at least one vector schema",
         ));
     }
-    let primary_vector = schema
+    if !schema
         .vectors
         .iter()
-        .find(|vector| vector.name == schema.primary_vector)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "primary vector '{}' is not defined in vectors",
-                    schema.primary_vector
-                ),
-            )
-        })?;
-    if matches!(
-        primary_vector.index_param.as_ref(),
-        Some(IndexParam::Ivf(_))
-    ) {
+        .any(|vector| vector.name == schema.primary_vector)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "primary vector '{}' must use hnsw or no index_param for the current runtime",
+                "primary vector '{}' is not defined in vectors",
                 schema.primary_vector
             ),
         ));
     }
-
     let fields = schema
         .fields
         .iter()
@@ -2086,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_open_rejects_primary_ivf_index() {
+    fn create_and_open_accepts_primary_ivf_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().to_string_lossy().to_string();
         let schema = CollectionSchema {
@@ -2112,11 +2099,9 @@ mod tests {
             ],
         };
 
-        let result = create_and_open(db_path, schema, Some(CollectionOption::default()));
-        assert!(result.is_err(), "primary IVF must be rejected");
-        assert_eq!(
-            result.err().expect("result is err").kind(),
-            ErrorKind::InvalidInput
-        );
+        let created = create_and_open(db_path.clone(), schema, Some(CollectionOption::default()))
+            .expect("primary IVF should now be accepted");
+        assert_eq!(created.path, db_path);
+        assert_eq!(created.collection_name, "primary_ivf");
     }
 }

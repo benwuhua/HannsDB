@@ -21,3 +21,17 @@ def test_python_facade_reexports_core_schema_and_executor_types():
     assert hannsdb.QueryContext is not None
     assert factory.schema is schema
     assert factory.build().schema is schema
+
+
+def test_star_import_exposes_native_and_facade_symbols():
+    namespace = {}
+    exec("from hannsdb import *", namespace)
+
+    for name in [
+        "MetricType",
+        "HnswIndexParam",
+        "IVFIndexParam",
+        "create_and_open",
+        "QueryExecutorFactory",
+    ]:
+        assert name in namespace
