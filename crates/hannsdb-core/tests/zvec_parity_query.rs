@@ -442,6 +442,71 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
 }
 
 #[test]
+fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombstoned() {
+    let root = unique_temp_dir("hannsdb_typed_query_by_id_tombstoned_shadowing");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("version", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                7,
+                [("version".to_string(), FieldValue::String("old".to_string()))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                8,
+                [(
+                    "version".to_string(),
+                    FieldValue::String("stable".to_string()),
+                )],
+                vec![0.1_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert seg-0001 docs");
+
+    rewrite_collection_to_two_segment_layout(
+        &root,
+        "docs",
+        2,
+        &[Document::new(
+            7,
+            [(
+                "version".to_string(),
+                FieldValue::String("new-deleted".to_string()),
+            )],
+            vec![0.05_f32, 0.0],
+        )],
+        &[0],
+    );
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: Vec::new(),
+                query_by_id: Some(vec![7]),
+                filter: None,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("query_by_id should not resolve a tombstoned newer duplicate");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("query_by_id"));
+}
+
+#[test]
 fn zvec_parity_query_context_rejects_non_default_vector_query_params() {
     let root = unique_temp_dir("hannsdb_typed_query_params");
     let mut db = HannsDb::open(&root).expect("open db");

@@ -1130,11 +1130,12 @@ impl CollectionHandle {
     fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let segment_paths = self.segment_manager.segment_paths()?;
         let mut documents = Vec::with_capacity(external_ids.len());
 
         for external_id in external_ids {
             let mut found = None;
-            for segment in self.segment_manager.segment_paths()? {
+            for segment in &segment_paths {
                 let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
                 let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
                 let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
@@ -1147,8 +1148,11 @@ impl CollectionHandle {
                     ));
                 }
 
-                if let Some(row_idx) = latest_live_row_index(&stored_ids, &tombstone, *external_id)
-                {
+                if let Some(row_idx) = latest_row_index_for_id(&stored_ids, *external_id) {
+                    if tombstone.is_deleted(row_idx) {
+                        found = None;
+                        break;
+                    }
                     let start = row_idx * collection_meta.dimension;
                     let end = start + collection_meta.dimension;
                     found = Some(Document {
@@ -1726,17 +1730,16 @@ fn latest_live_row_index(
     tombstone: &TombstoneMask,
     external_id: i64,
 ) -> Option<usize> {
+    latest_row_index_for_id(stored_ids, external_id)
+        .filter(|row_idx| !tombstone.is_deleted(*row_idx))
+}
+
+fn latest_row_index_for_id(stored_ids: &[i64], external_id: i64) -> Option<usize> {
     stored_ids
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(row_idx, stored_id)| {
-            if *stored_id == external_id && !tombstone.is_deleted(row_idx) {
-                Some(row_idx)
-            } else {
-                None
-            }
-        })
+        .find_map(|(row_idx, stored_id)| (*stored_id == external_id).then_some(row_idx))
 }
 
 fn mark_live_id_deleted(
