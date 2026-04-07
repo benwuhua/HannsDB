@@ -60,12 +60,69 @@ pub struct DeleteRecordsResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SearchRequest {
+#[serde(untagged)]
+pub enum SearchRequest {
+    Legacy(LegacySearchRequest),
+    Typed(TypedSearchRequest),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacySearchRequest {
     pub vector: Vec<f32>,
     pub top_k: usize,
     #[serde(default)]
     pub output_fields: Option<Vec<String>>,
+    #[serde(default)]
     pub filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedSearchRequest {
+    pub top_k: usize,
+    #[serde(default)]
+    pub queries: Vec<TypedVectorQueryRequest>,
+    #[serde(default)]
+    pub query_by_id: Option<Vec<String>>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub output_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_vector: bool,
+    #[serde(default)]
+    pub group_by: Option<TypedQueryGroupByRequest>,
+    #[serde(default)]
+    pub reranker: Option<TypedQueryRerankerRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedVectorQueryRequest {
+    pub field_name: String,
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub param: Option<TypedVectorQueryParamRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedVectorQueryParamRequest {
+    #[serde(default)]
+    pub ef_search: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedQueryGroupByRequest {
+    pub field_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedQueryRerankerRequest {
+    pub model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +141,8 @@ pub struct SearchResponse {
 #[derive(Debug, Deserialize)]
 pub struct FetchRecordsRequest {
     pub ids: Vec<String>,
+    #[serde(default)]
+    pub output_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]

@@ -10,15 +10,19 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{Document, FieldValue};
+use hannsdb_core::query::{
+    QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
+};
 
 use crate::api::{
     CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
     CreateCollectionResponse, CreateIndexResponse, DeleteRecordsRequest, DeleteRecordsResponse,
     DropCollectionResponse, DropIndexResponse, ErrorResponse, FetchRecordResponse,
     FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse, HealthResponse,
-    InsertRecordsRequest, InsertRecordsResponse, ListCollectionsResponse, ScalarIndexesResponse,
-    ScalarIndexRequest, SearchHitResponse, SearchRequest, SearchResponse, SegmentsResponse,
-    UpsertRecordsResponse, VectorIndexesResponse, VectorIndexRequest,
+    InsertRecordsRequest, InsertRecordsResponse, LegacySearchRequest, ListCollectionsResponse,
+    ScalarIndexRequest, ScalarIndexesResponse, SearchHitResponse, SearchRequest, SearchResponse,
+    SegmentsResponse, TypedSearchRequest, UpsertRecordsResponse, VectorIndexRequest,
+    VectorIndexesResponse,
 };
 
 #[derive(Clone)]
@@ -509,6 +513,7 @@ async fn fetch_records(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<FetchRecordsRequest>,
 ) -> Response {
+    let output_fields = request.output_fields.as_deref();
     let external_ids = match parse_external_ids(&request.ids) {
         Ok(ids) => ids,
         Err(error) => {
@@ -530,7 +535,7 @@ async fn fetch_records(
                     .into_iter()
                     .map(|document| FetchRecordResponse {
                         id: document.id.to_string(),
-                        fields: field_values_to_json(document.fields),
+                        fields: select_fetch_output_fields(&document.fields, output_fields),
                         vector: document.vector,
                     })
                     .collect(),
@@ -566,58 +571,9 @@ async fn search_records(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<SearchRequest>,
 ) -> Response {
-    let output_fields = request.output_fields.as_deref();
-    let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
-    let result = if let Some(filter) = request
-        .filter
-        .as_deref()
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-    {
-        state
-            .db
-            .lock()
-            .expect("daemon state mutex poisoned")
-            .query_documents(&collection, &request.vector, request.top_k, Some(filter))
-            .map(|hits| {
-                hits.into_iter()
-                    .map(|hit| SearchHitResponse {
-                        id: hit.id.to_string(),
-                        distance: hit.distance,
-                        fields: select_output_fields(&hit.fields, output_fields),
-                    })
-                    .collect::<Vec<_>>()
-            })
-    } else if include_fields {
-        state
-            .db
-            .lock()
-            .expect("daemon state mutex poisoned")
-            .query_documents(&collection, &request.vector, request.top_k, None)
-            .map(|hits| {
-                hits.into_iter()
-                    .map(|hit| SearchHitResponse {
-                        id: hit.id.to_string(),
-                        distance: hit.distance,
-                        fields: select_output_fields(&hit.fields, output_fields),
-                    })
-                    .collect::<Vec<_>>()
-            })
-    } else {
-        state
-            .db
-            .lock()
-            .expect("daemon state mutex poisoned")
-            .search(&collection, &request.vector, request.top_k)
-            .map(|hits| {
-                hits.into_iter()
-                    .map(|hit| SearchHitResponse {
-                        id: hit.id.to_string(),
-                        distance: hit.distance,
-                        fields: BTreeMap::new(),
-                    })
-                    .collect::<Vec<_>>()
-            })
+    let result = match request {
+        SearchRequest::Legacy(request) => search_records_legacy(&state, &collection, request),
+        SearchRequest::Typed(request) => search_records_typed(&state, &collection, request),
     };
 
     match result {
@@ -636,6 +592,13 @@ async fn search_records(
             }),
         )
             .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -644,6 +607,98 @@ async fn search_records(
         )
             .into_response(),
     }
+}
+
+fn search_records_legacy(
+    state: &DaemonState,
+    collection: &str,
+    request: LegacySearchRequest,
+) -> io::Result<Vec<SearchHitResponse>> {
+    let output_fields = request.output_fields.as_deref();
+    let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
+
+    if let Some(filter) = request
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        return state
+            .db
+            .lock()
+            .expect("daemon state mutex poisoned")
+            .query_documents(collection, &request.vector, request.top_k, Some(filter))
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|hit| SearchHitResponse {
+                        id: hit.id.to_string(),
+                        distance: hit.distance,
+                        fields: select_output_fields(&hit.fields, output_fields),
+                    })
+                    .collect()
+            });
+    }
+
+    if include_fields {
+        return state
+            .db
+            .lock()
+            .expect("daemon state mutex poisoned")
+            .query_documents(collection, &request.vector, request.top_k, None)
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|hit| SearchHitResponse {
+                        id: hit.id.to_string(),
+                        distance: hit.distance,
+                        fields: select_output_fields(&hit.fields, output_fields),
+                    })
+                    .collect()
+            });
+    }
+
+    state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .search(collection, &request.vector, request.top_k)
+        .map(|hits| {
+            hits.into_iter()
+                .map(|hit| SearchHitResponse {
+                    id: hit.id.to_string(),
+                    distance: hit.distance,
+                    fields: BTreeMap::new(),
+                })
+                .collect()
+        })
+}
+
+fn search_records_typed(
+    state: &DaemonState,
+    collection: &str,
+    request: TypedSearchRequest,
+) -> io::Result<Vec<SearchHitResponse>> {
+    let include_fields =
+        matches!(request.output_fields.as_deref(), Some(fields) if !fields.is_empty());
+    let context = build_query_context(request)?;
+
+    state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .query_with_context(collection, &context)
+        .map(|hits| {
+            hits.into_iter()
+                .map(|hit| SearchHitResponse {
+                    id: hit.id.to_string(),
+                    distance: hit.distance,
+                    fields: if include_fields {
+                        field_values_to_json(hit.fields)
+                    } else {
+                        BTreeMap::new()
+                    },
+                })
+                .collect()
+        })
 }
 
 async fn create_vector_index(
@@ -684,9 +739,7 @@ async fn create_vector_index(
     match result {
         Ok(()) => (
             StatusCode::CREATED,
-            Json(CreateIndexResponse {
-                field_name,
-            }),
+            Json(CreateIndexResponse { field_name }),
         )
             .into_response(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
@@ -822,9 +875,7 @@ async fn create_scalar_index(
     match result {
         Ok(()) => (
             StatusCode::CREATED,
-            Json(CreateIndexResponse {
-                field_name,
-            }),
+            Json(CreateIndexResponse { field_name }),
         )
             .into_response(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
@@ -1005,6 +1056,51 @@ fn select_output_fields(
             .collect(),
         _ => BTreeMap::new(),
     }
+}
+
+fn select_fetch_output_fields(
+    fields: &BTreeMap<String, FieldValue>,
+    output_fields: Option<&[String]>,
+) -> BTreeMap<String, serde_json::Value> {
+    match output_fields {
+        Some(names) if !names.is_empty() => select_output_fields(fields, Some(names)),
+        _ => field_values_to_json(fields.clone()),
+    }
+}
+
+fn build_query_context(request: TypedSearchRequest) -> io::Result<QueryContext> {
+    let query_by_id = request
+        .query_by_id
+        .map(|ids| {
+            parse_external_ids(&ids)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+        })
+        .transpose()?;
+
+    Ok(QueryContext {
+        top_k: request.top_k,
+        queries: request
+            .queries
+            .into_iter()
+            .map(|query| VectorQuery {
+                field_name: query.field_name,
+                vector: query.vector,
+                param: query.param.map(|param| VectorQueryParam {
+                    ef_search: param.ef_search,
+                }),
+            })
+            .collect(),
+        query_by_id,
+        filter: request.filter,
+        output_fields: request.output_fields,
+        include_vector: request.include_vector,
+        group_by: request.group_by.map(|group_by| QueryGroupBy {
+            field_name: group_by.field_name,
+        }),
+        reranker: request.reranker.map(|reranker| QueryReranker {
+            model: reranker.model,
+        }),
+    })
 }
 
 fn field_value_to_json(value: FieldValue) -> serde_json::Value {

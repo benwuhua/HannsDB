@@ -175,6 +175,190 @@ async fn records_insert_search_delete_flow_works() {
 }
 
 #[tokio::test]
+async fn search_route_accepts_typed_primary_vector_query_and_projects_output_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42","84"],
+                        "vectors":[[0.0,0.0],[0.2,0.0]],
+                        "fields":[
+                            {"color":"red","shape":"circle"},
+                            {"color":"blue","shape":"square"}
+                        ]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    // Typed daemon parity slice stays within the currently supported primary vector field.
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "queries":[{"field_name":"vector","vector":[0.0,0.0]}],
+                        "output_fields":["color"]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert_eq!(json["hits"][0]["id"], "42");
+    assert_eq!(json["hits"][0]["fields"]["color"], "red");
+    assert!(json["hits"][0]["fields"].get("shape").is_none());
+}
+
+#[tokio::test]
+async fn search_route_returns_bad_request_for_unsupported_typed_shape() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "queries":[{"field_name":"vector","vector":[0.0,0.0]}],
+                        "include_vector":true
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert!(json["error"]
+        .as_str()
+        .expect("error string")
+        .contains("include_vector"));
+}
+
+#[tokio::test]
+async fn fetch_route_projects_selected_output_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42"],
+                        "vectors":[[0.0,0.0]],
+                        "fields":[{"color":"red","shape":"circle"}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"output_fields":["shape"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"][0]["id"], "42");
+    assert_eq!(json["documents"][0]["fields"]["shape"], "circle");
+    assert!(json["documents"][0]["fields"].get("color").is_none());
+    assert_eq!(
+        json["documents"][0]["vector"],
+        serde_json::json!([0.0, 0.0])
+    );
+}
+
+#[tokio::test]
 async fn collections_list_and_drop_flow_works() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
@@ -313,7 +497,7 @@ async fn index_ddl_routes_create_list_and_drop_indexes() {
                     r#"{"field_name":"title","kind":"ivf","metric":"l2","params":{"nlist":8}}"#,
                 ))
                 .expect("build request"),
-    )
+        )
         .await
         .expect("send vector index request");
     let create_vector_status = create_vector.status();
