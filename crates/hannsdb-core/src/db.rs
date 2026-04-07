@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::adapter::{AdapterError, HnswBackend};
@@ -25,7 +25,7 @@ const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 
 pub struct HannsDb {
     root: PathBuf,
-    collection_handles: Mutex<HashMap<String, Arc<CollectionHandle>>>,
+    collection_handles: RwLock<HashMap<String, Arc<CollectionHandle>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,17 +92,27 @@ impl HannsDb {
 
         let mut db = Self {
             root: root.to_path_buf(),
-            collection_handles: Mutex::new(HashMap::new()),
+            collection_handles: RwLock::new(HashMap::new()),
         };
         db.replay_wal_if_needed()?;
         Ok(db)
     }
 
     pub fn open_collection_handle(&self, name: &str) -> io::Result<Arc<CollectionHandle>> {
+        if let Some(handle) = self
+            .collection_handles
+            .read()
+            .expect("collection handles rwlock poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(handle);
+        }
+
         let mut handles = self
             .collection_handles
-            .lock()
-            .expect("collection handles mutex poisoned");
+            .write()
+            .expect("collection handles rwlock poisoned");
         if let Some(handle) = handles.get(name) {
             return Ok(Arc::clone(handle));
         }
@@ -236,8 +246,8 @@ impl HannsDb {
         manifest.collections.retain(|entry| entry != name);
         manifest.save_to_path(&manifest_path(&self.root))?;
         self.collection_handles
-            .lock()
-            .expect("collection handles mutex poisoned")
+            .write()
+            .expect("collection handles rwlock poisoned")
             .remove(name);
         self.invalidate_search_cache(name);
         Ok(())
@@ -267,17 +277,18 @@ impl HannsDb {
             return Ok(());
         }
 
-        let mut segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
-        if segment_set.immutable_segment_ids.is_empty() {
+        let mut version_set = VersionSet::load_from_path(&paths.segment_set)?;
+        if version_set.immutable_segment_ids().is_empty() {
             return Ok(());
         }
 
         fs::create_dir_all(&paths.segments_dir)?;
-        let immutable_segment_ids = segment_set.immutable_segment_ids.clone();
+        let immutable_segment_ids = version_set.immutable_segment_ids().to_vec();
+        let active_segment_id = version_set.active_segment_id().to_string();
         let compacted_segment_id = next_compacted_segment_id(
             immutable_segment_ids
                 .iter()
-                .chain(std::iter::once(&segment_set.active_segment_id)),
+                .chain(std::iter::once(&active_segment_id)),
         );
         let compacted_dir = paths.segments_dir.join(&compacted_segment_id);
         fs::create_dir_all(&compacted_dir)?;
@@ -355,8 +366,11 @@ impl HannsDb {
         )
         .save_to_path(&compacted_dir.join("segment.json"))?;
 
-        segment_set.immutable_segment_ids = vec![compacted_segment_id.clone()];
-        segment_set.save_to_path(&paths.segment_set)?;
+        version_set = VersionSet::new(
+            version_set.active_segment_id().to_string(),
+            vec![compacted_segment_id.clone()],
+        );
+        version_set.save_to_path(&paths.segment_set)?;
         for segment_id in &immutable_segment_ids {
             fs::remove_dir_all(paths.segments_dir.join(segment_id))?;
         }
@@ -721,8 +735,8 @@ impl HannsDb {
         let handle = {
             let handles = self
                 .collection_handles
-                .lock()
-                .expect("collection handles mutex poisoned");
+                .read()
+                .expect("collection handles rwlock poisoned");
             handles.get(collection).cloned()
         };
         if let Some(handle) = handle {
@@ -749,16 +763,18 @@ impl HannsDb {
         }
 
         fs::create_dir_all(&paths.segments_dir)?;
-        let mut set = SegmentSet::new_single("seg-000001");
-        set.rollover();
-        for segment_id in set
-            .immutable_segment_ids
+        let mut legacy_set = crate::segment::SegmentSet::new_single("seg-000001");
+        legacy_set.rollover();
+        let version_set = VersionSet::from_segment_set(legacy_set);
+        let active_segment_id = version_set.active_segment_id().to_string();
+        for segment_id in version_set
+            .immutable_segment_ids()
             .iter()
-            .chain(std::iter::once(&set.active_segment_id))
+            .chain(std::iter::once(&active_segment_id))
         {
             fs::create_dir_all(paths.segments_dir.join(segment_id))?;
         }
-        set.save_to_path(&paths.segment_set)
+        version_set.save_to_path(&paths.segment_set)
     }
 
     fn replay_wal_if_needed(&mut self) -> io::Result<()> {
@@ -918,7 +934,7 @@ impl CollectionHandle {
     }
 
     pub fn optimize(&self) -> io::Result<()> {
-        let mut state = self.load_search_state()?;
+        let state = self.load_search_state()?;
         #[cfg(feature = "knowhere-backend")]
         {
             let mut hnsw_bytes = None;

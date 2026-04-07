@@ -3,6 +3,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hannsdb_core::catalog::COLLECTION_RUNTIME_FORMAT_VERSION;
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{Document, FieldValue};
 use hannsdb_core::segment::{
@@ -111,6 +112,46 @@ fn zvec_parity_recovery_opening_same_collection_twice_reuses_same_handle() {
     assert!(
         Arc::ptr_eq(&handle_a, &handle_b),
         "db should reuse the same collection handle"
+    );
+}
+
+#[test]
+fn zvec_parity_recovery_version_set_persists_format_metadata_on_disk() {
+    let root = unique_temp_dir("hannsdb_zvec_version_set_persisted");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let path = root.join("segment_set.json");
+
+    let version_set = VersionSet::new("seg-0002", vec!["seg-0001".to_string()]);
+    version_set.save_to_path(&path).expect("save version set");
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read version set")).expect("parse json");
+    assert_eq!(
+        persisted.get("format_version").and_then(|value| value.as_u64()),
+        Some(COLLECTION_RUNTIME_FORMAT_VERSION as u64)
+    );
+
+    let loaded = VersionSet::load_from_path(&path).expect("load version set");
+    assert_eq!(loaded, version_set);
+}
+
+#[test]
+fn zvec_parity_recovery_version_set_loads_legacy_segment_set_json() {
+    let root = unique_temp_dir("hannsdb_zvec_version_set_legacy");
+    fs::create_dir_all(&root).expect("create temp dir");
+    let path = root.join("segment_set.json");
+
+    SegmentSet {
+        active_segment_id: "seg-0002".to_string(),
+        immutable_segment_ids: vec!["seg-0001".to_string()],
+    }
+    .save_to_path(&path)
+    .expect("save legacy segment_set");
+
+    let loaded = VersionSet::load_from_path(&path).expect("load legacy version set");
+    assert_eq!(
+        loaded,
+        VersionSet::new("seg-0002", vec!["seg-0001".to_string()])
     );
 }
 
