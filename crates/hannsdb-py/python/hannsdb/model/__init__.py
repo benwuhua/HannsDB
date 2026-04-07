@@ -1,6 +1,6 @@
 from .collection import Collection
 from .doc import Doc
-from .param import QueryContext, QueryGroupBy, QueryReranker, VectorQuery
+from .param import QueryContext, QueryGroupBy, VectorQuery
 from .schema import CollectionSchema, FieldSchema, VectorSchema
 
 __all__ = [
@@ -10,7 +10,6 @@ __all__ = [
     "FieldSchema",
     "QueryContext",
     "QueryGroupBy",
-    "QueryReranker",
     "VectorQuery",
     "VectorSchema",
 ]

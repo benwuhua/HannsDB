@@ -1,6 +1,7 @@
 from . import _native as _native_module
 from ._native import *  # noqa: F401,F403
 from .executor import QueryExecutorFactory
+from .extension import ReRanker, RrfReRanker
 from .model import (
     Collection,
     CollectionSchema,
@@ -8,7 +9,6 @@ from .model import (
     FieldSchema,
     QueryContext,
     QueryGroupBy,
-    QueryReranker,
     VectorQuery,
     VectorSchema,
 )
@@ -22,7 +22,8 @@ _facade_exports = [
     "QueryContext",
     "QueryGroupBy",
     "QueryExecutorFactory",
-    "QueryReranker",
+    "ReRanker",
+    "RrfReRanker",
     "VectorQuery",
     "VectorSchema",
 ]

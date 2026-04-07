@@ -1,3 +1,3 @@
-from .vector_query import QueryContext, QueryGroupBy, QueryReranker, VectorQuery
+from .vector_query import QueryContext, QueryGroupBy, VectorQuery
 
-__all__ = ["QueryContext", "QueryGroupBy", "QueryReranker", "VectorQuery"]
+__all__ = ["QueryContext", "QueryGroupBy", "VectorQuery"]

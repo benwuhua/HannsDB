@@ -32,8 +32,9 @@ def test_star_import_exposes_native_and_facade_symbols():
         "HnswIndexParam",
         "IVFIndexParam",
         "create_and_open",
+        "ReRanker",
         "QueryExecutorFactory",
         "QueryGroupBy",
-        "QueryReranker",
+        "RrfReRanker",
     ]:
         assert name in namespace

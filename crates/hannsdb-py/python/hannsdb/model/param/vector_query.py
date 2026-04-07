@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Optional
 
 from ..._native import VectorQuery
+from ...extension.rerank_function import ReRanker
 
 
 @dataclass(slots=True)
 class QueryGroupBy:
     field_name: str
-
-
-@dataclass(slots=True)
-class QueryReranker:
-    model: str
 
 
 @dataclass(slots=True)
@@ -23,9 +19,9 @@ class QueryContext:
     output_fields: Optional[list[str]] = None
     include_vector: bool = False
     queries: list[VectorQuery] = field(default_factory=list)
-    query_by_id: Optional[list[str]] = None
+    query_by_id: Optional[list[int | str] | int | str] = None
     group_by: Optional[QueryGroupBy] = None
-    reranker: Optional[QueryReranker] = None
+    reranker: Optional[ReRanker] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.queries, list):
@@ -44,4 +40,4 @@ class QueryContext:
             self.output_fields = list(self.output_fields)
 
 
-__all__ = ["QueryContext", "QueryGroupBy", "QueryReranker", "VectorQuery"]
+__all__ = ["QueryContext", "QueryGroupBy", "VectorQuery"]

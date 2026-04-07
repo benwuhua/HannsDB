@@ -1351,6 +1351,30 @@ impl PyVectorQuery {
             },
         }
     }
+
+    #[getter]
+    fn field_name(&self) -> String {
+        self.inner.field_name.clone()
+    }
+
+    #[getter]
+    fn vector(&self) -> Vec<f32> {
+        self.inner.vector.clone()
+    }
+
+    #[getter]
+    fn param(&self, py: Python<'_>) -> PyResult<Option<Py<PyHnswQueryParam>>> {
+        match self.inner.param.as_ref() {
+            Some(param) => Py::new(
+                py,
+                PyHnswQueryParam {
+                    inner: param.clone(),
+                },
+            )
+            .map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(feature = "python-binding")]

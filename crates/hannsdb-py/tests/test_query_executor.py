@@ -43,6 +43,17 @@ def build_collection(tmp_path):
     return collection, schema
 
 
+class RecordingReranker(hannsdb.ReRanker):
+    def __init__(self):
+        super().__init__(topn=2)
+        self.seen_keys = []
+
+    def rerank(self, query_results):
+        self.seen_keys.append(tuple(query_results.keys()))
+        first_key = next(iter(query_results))
+        return list(query_results[first_key])[: self.topn]
+
+
 def test_query_context_accepts_queries_shape():
     query = hannsdb.VectorQuery(
         field_name="dense",
@@ -63,6 +74,17 @@ def test_query_context_normalizes_scalar_output_fields_and_query_by_id():
 
     assert context.output_fields == ["group"]
     assert context.query_by_id == [2]
+
+
+def test_reranker_constructors_validate_arguments():
+    with pytest.raises(ValueError, match="topn"):
+        hannsdb.RrfReRanker(topn=-1)
+    with pytest.raises(ValueError, match="rank_constant"):
+        hannsdb.RrfReRanker(rank_constant=-1)
+    with pytest.raises(TypeError, match="topn"):
+        hannsdb.RrfReRanker(topn="2")
+    with pytest.raises(TypeError, match="rank_constant"):
+        hannsdb.RrfReRanker(rank_constant="60")
 
 
 def test_query_executor_factory_exposes_create_method():
@@ -122,6 +144,48 @@ def test_query_executor_supports_group_by(tmp_path):
     assert [hit.fields["group"] for hit in hits] == [1, 2]
 
 
+def test_query_executor_supports_builtin_rrf_reranker(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=hannsdb.RrfReRanker(topn=3),
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    # `top_k` is the per-query fan-out depth on the reranker path; `topn`
+    # controls the final fused result size.
+    assert [hit.id for hit in hits] == ["2", "1", "3"]
+    assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+
+
+def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+    reranker = RecordingReranker()
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=reranker,
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert reranker.seen_keys == [("dense", "dense#2")]
+    assert [hit.id for hit in hits] == ["1", "2"]
+
+
 def test_query_executor_rejects_core_unsupported_query_shape_as_not_implemented(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
@@ -158,7 +222,7 @@ def test_query_executor_rejects_include_vector_as_not_implemented(tmp_path):
         executor.execute(collection, context)
 
 
-def test_query_executor_still_rejects_reranker(tmp_path):
+def test_query_executor_rejects_query_by_id_with_reranker_as_not_implemented(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
@@ -167,8 +231,9 @@ def test_query_executor_still_rejects_reranker(tmp_path):
         queries=[
             hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
         ],
-        reranker=hannsdb.QueryReranker(model="dummy"),
+        query_by_id=[1],
+        reranker=hannsdb.RrfReRanker(topn=2),
     )
 
-    with pytest.raises(NotImplementedError, match="reranker"):
+    with pytest.raises(NotImplementedError, match="query_by_id"):
         executor.execute(collection, context)
