@@ -36,6 +36,19 @@ def build_schema():
     )
 
 
+def test_collection_schema_accepts_old_positional_vector_schema():
+    title = hannsdb.VectorSchema(
+        name="title",
+        data_type="vector_fp32",
+        dimension=384,
+    )
+
+    schema = hannsdb.CollectionSchema("docs", title)
+
+    assert schema.primary_vector == "title"
+    assert [vector.name for vector in schema.vectors] == ["title"]
+
+
 def test_collection_schema_vectors_property_surface():
     schema = build_schema()
 

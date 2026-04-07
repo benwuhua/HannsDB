@@ -968,14 +968,14 @@ struct PyCollectionSchema {
 #[pymethods]
 impl PyCollectionSchema {
     #[new]
-    #[pyo3(signature = (name, primary_vector=None, vector_schema=None, fields=None, vectors=None))]
+    #[pyo3(signature = (name, vector_schema=None, fields=None, vectors=None, primary_vector=None))]
     fn new(
         py: Python<'_>,
         name: String,
-        primary_vector: Option<String>,
         vector_schema: Option<Py<PyVectorSchema>>,
         fields: Option<Vec<Py<PyFieldSchema>>>,
         vectors: Option<Vec<Py<PyVectorSchema>>>,
+        primary_vector: Option<String>,
     ) -> PyResult<Self> {
         let mut inner_vectors = Vec::new();
         if let Some(vector_schema) = vector_schema {
