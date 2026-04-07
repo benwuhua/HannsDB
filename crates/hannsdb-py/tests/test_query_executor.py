@@ -1,9 +1,16 @@
 import hannsdb
 
 
-def test_query_context_surface_is_missing():
-    getattr(hannsdb, "QueryContext")
+def test_query_context_accepts_queries_shape():
+    query = hannsdb.VectorQuery(
+        field_name="dense",
+        vector=[0.0, 0.1],
+        param=None,
+    )
+
+    hannsdb.QueryContext(queries=[query])
 
 
-def test_query_executor_factory_surface_is_missing():
-    getattr(hannsdb, "QueryExecutorFactory")
+def test_query_executor_factory_exposes_create_method():
+    factory_cls = getattr(hannsdb, "QueryExecutorFactory")
+    getattr(factory_cls, "create")
