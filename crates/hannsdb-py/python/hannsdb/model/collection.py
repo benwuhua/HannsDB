@@ -6,7 +6,7 @@ from typing import Any
 
 from .. import _native as _native_module
 from .._native import CollectionOption, HnswIndexParam, IVFIndexParam
-from ..model.schema.collection_schema import CollectionSchema
+from ..model.schema.collection_schema import CollectionSchema, _coerce_collection_schema
 from ..model.schema.field_schema import FieldSchema, VectorSchema
 
 __all__ = ["Collection", "create_and_open", "open"]
@@ -16,6 +16,13 @@ def _build_query_executor(schema: CollectionSchema):
     from ..executor import QueryExecutorFactory
 
     return QueryExecutorFactory.create(schema).build()
+
+
+def _schema_to_native(schema):
+    native_getter = getattr(schema, "_get_native", None)
+    if native_getter is not None:
+        return native_getter()
+    return schema
 
 
 def _build_query_context(
@@ -161,8 +168,8 @@ def _schema_from_collection_metadata(path: Path) -> CollectionSchema:
 class Collection:
     def __init__(self, core_collection, schema: CollectionSchema | None = None):
         self._core = core_collection
-        self._schema = schema
-        self._querier = _build_query_executor(schema) if schema is not None else None
+        self._schema = _coerce_collection_schema(schema) if schema is not None else None
+        self._querier = _build_query_executor(self._schema) if self._schema is not None else None
 
     @classmethod
     def _from_core(
@@ -180,6 +187,7 @@ class Collection:
                 / "collection.json"
             )
             schema = _schema_from_collection_metadata(metadata_path)
+        schema = _coerce_collection_schema(schema)
         inst._schema = schema
         inst._querier = _build_query_executor(schema)
         return inst
@@ -278,7 +286,7 @@ class Collection:
 
 
 def create_and_open(path, schema, option: CollectionOption | None = None):
-    core_collection = _native_module.create_and_open(path, schema, option)
+    core_collection = _native_module.create_and_open(path, _schema_to_native(schema), option)
     return Collection._from_core(core_collection, schema=schema)
 
 

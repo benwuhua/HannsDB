@@ -6,6 +6,12 @@ import hannsdb
 import pytest
 
 
+def test_schema_types_are_pure_python_wrappers():
+    assert hannsdb.CollectionSchema.__module__ == "hannsdb.model.schema.collection_schema"
+    assert hannsdb.FieldSchema.__module__ == "hannsdb.model.schema.field_schema"
+    assert hannsdb.VectorSchema.__module__ == "hannsdb.model.schema.field_schema"
+
+
 def build_schema():
     title = hannsdb.VectorSchema(
         name="title",
@@ -50,6 +56,13 @@ def test_collection_schema_accepts_old_positional_vector_schema():
 
     assert schema.primary_vector == "title"
     assert [vector.name for vector in schema.vectors] == ["title"]
+
+
+def test_schema_helpers_can_find_fields_and_vectors():
+    schema = build_schema()
+
+    assert schema.field("session_id").name == "session_id"
+    assert schema.vector("dense").dimension == 384
 
 
 def test_vector_query_is_a_pure_python_dataclass_and_flattens_numpy_arrays():
@@ -108,6 +121,46 @@ def test_create_and_open_accepts_primary_ivf_index(tmp_path):
         "metric": "l2",
         "nlist": 1024,
     }
+
+    collection.destroy()
+
+
+def test_create_and_open_accepts_pure_python_schema_and_reopens_as_wrappers(tmp_path):
+    schema = build_schema()
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+
+    assert collection.schema is schema
+    assert isinstance(collection.schema, hannsdb.CollectionSchema)
+    assert isinstance(collection.schema.field("session_id"), hannsdb.FieldSchema)
+    assert isinstance(collection.schema.vector("dense"), hannsdb.VectorSchema)
+    assert collection.schema._get_native().__class__ == hannsdb._native.CollectionSchema
+
+    reopened = hannsdb.open(str(tmp_path))
+    assert isinstance(reopened.schema, hannsdb.CollectionSchema)
+    assert isinstance(reopened.schema.field("tags"), hannsdb.FieldSchema)
+    assert isinstance(reopened.schema.vector("title"), hannsdb.VectorSchema)
+
+    collection.destroy()
+
+
+def test_create_and_open_accepts_legacy_native_schema_input(tmp_path):
+    schema = hannsdb._native.CollectionSchema(
+        name="docs",
+        fields=[],
+        vectors=[
+            hannsdb._native.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=384,
+            )
+        ],
+    )
+
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+
+    assert isinstance(collection.schema, hannsdb.CollectionSchema)
+    assert collection.schema.name == "docs"
+    assert collection.schema.vector("dense").dimension == 384
 
     collection.destroy()
 
