@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hannsdb_core::catalog::ManifestMetadata;
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
-    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
+    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+    VectorIndexSchema,
 };
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
@@ -1089,4 +1090,144 @@ fn collection_api_drop_primary_vector_descriptor_reverts_to_schema_fallback() {
         .search("docs", &[1.0_f32, 0.0], 1)
         .expect("search should use schema fallback");
     assert_eq!(fallback_hits[0].id, 1, "schema l2 fallback should prefer nearest vector");
+}
+
+#[test]
+fn collection_api_schema_created_ivf_primary_vector_optimizes_and_searches() {
+    let root = unique_temp_dir("hannsdb_collection_api_schema_ivf_primary_vector");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2)
+                .with_index_param(VectorIndexSchema::ivf(Some("cosine"), 4)),
+        ],
+    };
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection with ivf primary vector");
+    db.insert("docs", &[1, 2], &[0.9_f32, 0.4, 10.0, 0.0])
+        .expect("insert vectors");
+
+    db.optimize_collection("docs")
+        .expect("optimize should use schema ivf fallback");
+
+    let hits = db
+        .search("docs", &[1.0_f32, 0.0], 1)
+        .expect("search should use schema ivf fallback");
+    assert_eq!(hits[0].id, 2);
+}
+
+#[test]
+fn collection_api_drop_scalar_index_removes_only_scalar_descriptor() {
+    let root = unique_temp_dir("hannsdb_collection_api_drop_scalar_index_descriptor");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("category", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Flat,
+            metric: Some("l2".to_string()),
+            params: json!({}),
+        },
+    )
+    .expect("register vector descriptor");
+    db.create_scalar_index(
+        "docs",
+        ScalarIndexDescriptor {
+            field_name: "category".to_string(),
+            kind: ScalarIndexKind::Inverted,
+            params: json!({
+                "tokenizer": "keyword"
+            }),
+        },
+    )
+    .expect("register scalar descriptor");
+
+    db.drop_scalar_index("docs", "category")
+        .expect("drop scalar descriptor");
+
+    assert!(db.list_scalar_indexes("docs").expect("list scalar").is_empty());
+    assert_eq!(db.list_vector_indexes("docs").expect("list vector").len(), 1);
+}
+
+#[test]
+fn collection_api_create_vector_index_rejects_invalid_descriptor() {
+    let root = unique_temp_dir("hannsdb_collection_api_reject_invalid_vector_descriptor");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let err = db
+        .create_vector_index(
+            "docs",
+            VectorIndexDescriptor {
+                field_name: "vector".to_string(),
+                kind: VectorIndexKind::Flat,
+                metric: Some("bogus".to_string()),
+                params: json!({}),
+            },
+        )
+        .expect_err("invalid metric should be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn collection_api_vector_index_ddl_removes_stale_hnsw_blob() {
+    let root = unique_temp_dir("hannsdb_collection_api_remove_stale_hnsw_blob");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let blob_path = root.join("collections").join("docs").join("hnsw_index.bin");
+    fs::write(&blob_path, b"stale graph").expect("write stale hnsw blob");
+
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Flat,
+            metric: Some("l2".to_string()),
+            params: json!({}),
+        },
+    )
+    .expect("create vector descriptor should invalidate stale blob");
+    assert!(!blob_path.exists(), "stale hnsw blob should be removed on create");
+
+    fs::write(&blob_path, b"stale graph").expect("rewrite stale hnsw blob");
+    db.drop_vector_index("docs", "vector")
+        .expect("drop vector descriptor should invalidate stale blob");
+    assert!(!blob_path.exists(), "stale hnsw blob should be removed on drop");
+}
+
+#[test]
+fn collection_api_ignores_persisted_hnsw_blob_when_rebuild_is_required() {
+    let root = unique_temp_dir("hannsdb_collection_api_ignore_persisted_hnsw_blob");
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
+        db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 10.0, 10.0])
+            .expect("insert vectors");
+        fs::write(
+            root.join("collections").join("docs").join("hnsw_index.bin"),
+            b"unsupported persisted graph",
+        )
+        .expect("write unsupported blob");
+    }
+
+    let db = HannsDb::open(&root).expect("reopen db");
+    let hits = db
+        .search("docs", &[0.1_f32, -0.1], 1)
+        .expect("search should rebuild from records instead of using unsupported blob");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 11);
 }

@@ -163,7 +163,7 @@ impl HannsDb {
         schema: &CollectionSchema,
         log_wal: bool,
     ) -> io::Result<()> {
-        let primary_vector = schema.primary_vector().ok_or_else(|| {
+        let _primary_vector = schema.primary_vector().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -172,18 +172,6 @@ impl HannsDb {
                 ),
             )
         })?;
-        if matches!(
-            primary_vector.index_param.as_ref(),
-            Some(VectorIndexSchema::Ivf { .. })
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "primary vector '{}' must use hnsw or no index_param for the current runtime",
-                    schema.primary_vector_name()
-                ),
-            ));
-        }
         let dimension = schema.dimension();
         if dimension == 0 {
             return Err(io::Error::new(
@@ -278,11 +266,13 @@ impl HannsDb {
     ) -> io::Result<()> {
         let paths = self.collection_paths(collection);
         let metadata = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        if !metadata
+        let vector = if let Some(vector) = metadata
             .vectors
             .iter()
-            .any(|vector| vector.name == descriptor.field_name)
+            .find(|vector| vector.name == descriptor.field_name)
         {
+            vector
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -290,11 +280,13 @@ impl HannsDb {
                     descriptor.field_name, collection
                 ),
             ));
-        }
+        };
+        validate_vector_index_descriptor(vector.dimension, &descriptor)?;
 
         let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         catalog.upsert_vector_index(descriptor);
         catalog.save_to_path(&paths.index_catalog)?;
+        invalidate_persisted_hnsw_blob(&paths.dir)?;
         self.invalidate_search_cache(collection);
         Ok(())
     }
@@ -313,6 +305,7 @@ impl HannsDb {
             ));
         }
         catalog.save_to_path(&paths.index_catalog)?;
+        invalidate_persisted_hnsw_blob(&paths.dir)?;
         self.invalidate_search_cache(collection);
         Ok(())
     }
@@ -346,6 +339,23 @@ impl HannsDb {
 
         let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         catalog.upsert_scalar_index(descriptor);
+        catalog.save_to_path(&paths.index_catalog)?;
+        Ok(())
+    }
+
+    pub fn drop_scalar_index(&self, collection: &str, field_name: &str) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        if !catalog.drop_scalar_index(field_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "scalar index descriptor not found for field '{}' in '{}'",
+                    field_name, collection
+                ),
+            ));
+        }
         catalog.save_to_path(&paths.index_catalog)?;
         Ok(())
     }
@@ -1259,6 +1269,13 @@ impl CollectionHandle {
     }
 
     fn try_load_persisted_ann_state(&self) -> io::Result<Option<CachedSearchState>> {
+        #[cfg(not(feature = "knowhere-backend"))]
+        {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "knowhere-backend")]
+        {
         let paths = self.collection_paths();
         let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
         if !hnsw_path.exists() {
@@ -1324,6 +1341,7 @@ impl CollectionHandle {
                 );
                 Ok(None)
             }
+        }
         }
     }
 
@@ -1708,6 +1726,100 @@ fn mark_live_id_deleted(
         if *stored_id == external_id {
             let _ = tombstone.mark_deleted(row_idx);
         }
+    }
+}
+
+fn validate_vector_index_descriptor(
+    dimension: usize,
+    descriptor: &VectorIndexDescriptor,
+) -> io::Result<()> {
+    if dimension == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector dimension must be > 0",
+        ));
+    }
+
+    let params = descriptor.params.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector index params must be a JSON object",
+        )
+    })?;
+
+    match descriptor.kind {
+        VectorIndexKind::Flat => {
+            if !params.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "flat index does not accept params",
+                ));
+            }
+        }
+        VectorIndexKind::Ivf => {
+            for key in params.keys() {
+                if key != "nlist" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported ivf param: {key}"),
+                    ));
+                }
+            }
+            if let Some(nlist) = params.get("nlist") {
+                let nlist = nlist.as_u64().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf nlist must be an unsigned integer",
+                    )
+                })?;
+                if nlist == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf nlist must be > 0",
+                    ));
+                }
+            }
+        }
+        VectorIndexKind::Hnsw => {
+            for key in params.keys() {
+                if key != "m" && key != "ef_construction" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported hnsw param: {key}"),
+                    ));
+                }
+            }
+            for key in ["m", "ef_construction"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    DefaultIndexFactory::default()
+        .create_vector_index(dimension, descriptor, None)
+        .map(|_| ())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
+}
+
+fn invalidate_persisted_hnsw_blob(collection_dir: &Path) -> io::Result<()> {
+    let hnsw_path = collection_dir.join(HNSW_INDEX_FILE);
+    match fs::remove_file(&hnsw_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

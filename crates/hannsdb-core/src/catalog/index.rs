@@ -45,6 +45,13 @@ impl IndexCatalog {
             .retain(|descriptor| descriptor.field_name != field_name);
         before != self.vector_indexes.len()
     }
+
+    pub fn drop_scalar_index(&mut self, field_name: &str) -> bool {
+        let before = self.scalar_indexes.len();
+        self.scalar_indexes
+            .retain(|descriptor| descriptor.field_name != field_name);
+        before != self.scalar_indexes.len()
+    }
 }
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
