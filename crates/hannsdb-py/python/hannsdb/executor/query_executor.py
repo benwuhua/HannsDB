@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from ..extension.rerank_function import ReRanker
@@ -20,7 +20,10 @@ class QueryExecutor:
             raw_value = os.getenv(env_name)
             if raw_value is None:
                 continue
-            concurrency = int(raw_value)
+            try:
+                concurrency = int(raw_value)
+            except ValueError as error:
+                raise ValueError(f"{env_name} must be an integer, got {raw_value!r}") from error
             return max(1, concurrency)
         return 1
 
@@ -60,13 +63,30 @@ class QueryExecutor:
 
         concurrency = self._query_concurrency()
         if concurrency > 1 and len(fan_out_contexts) > 1:
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [
-                    (result_key, executor.submit(collection.query_context, query_context))
-                    for result_key, query_context in fan_out_contexts
-                ]
-                for result_key, future in futures:
-                    query_results[result_key] = future.result()
+            executor = ThreadPoolExecutor(max_workers=concurrency)
+            futures = {}
+            ordered_results: list[tuple[str, Any] | None] = [None] * len(fan_out_contexts)
+            try:
+                futures = {
+                    executor.submit(collection.query_context, query_context): (
+                        index,
+                        result_key,
+                    )
+                    for index, (result_key, query_context) in enumerate(fan_out_contexts)
+                }
+                for future in as_completed(futures):
+                    index, result_key = futures[future]
+                    ordered_results[index] = (result_key, future.result())
+            except Exception:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True, cancel_futures=False)
+                for item in ordered_results:
+                    if item is None:
+                        raise RuntimeError("query fan-out completed without a result")
+                    result_key, docs = item
+                    query_results[result_key] = docs
         else:
             for result_key, query_context in fan_out_contexts:
                 # `top_k` still controls per-query candidate depth on the fan-out path;

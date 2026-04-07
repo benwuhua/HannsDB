@@ -301,6 +301,38 @@ def test_query_executor_propagates_errors_from_concurrent_fanout(
         executor.execute(proxy, context)
 
 
+def test_query_executor_surfaces_fast_failure_before_slow_neighbor(
+    tmp_path, monkeypatch
+):
+    collection, schema = build_collection(tmp_path)
+    proxy = InstrumentedCollection(
+        collection,
+        delays={
+            (0.0, 0.0): 0.25,
+        },
+        fail_key=(0.2, 0.0),
+    )
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=RecordingReranker(),
+    )
+
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="forced failure"):
+        executor.execute(proxy, context)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.15
+
+
 def test_query_executor_rejects_core_unsupported_query_shape_as_not_implemented(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
