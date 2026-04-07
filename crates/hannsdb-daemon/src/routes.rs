@@ -651,23 +651,41 @@ async fn create_vector_index(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<VectorIndexRequest>,
 ) -> Response {
+    let VectorIndexRequest {
+        field_name,
+        kind,
+        metric,
+        params,
+    } = request;
     let descriptor = serde_json::json!({
-        "field_name": request.field_name,
-        "kind": request.kind,
-        "metric": request.metric,
-        "params": request.params,
+        "field_name": field_name,
+        "kind": kind,
+        "metric": metric,
+        "params": params,
     });
+    let descriptor = match serde_json::from_value(descriptor) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
-        .create_vector_index(&collection, serde_json::from_value(descriptor).expect("descriptor"));
+        .create_vector_index(&collection, descriptor);
 
     match result {
         Ok(()) => (
             StatusCode::CREATED,
             Json(CreateIndexResponse {
-                field_name: request.field_name,
+                field_name,
             }),
         )
             .into_response(),
@@ -773,22 +791,39 @@ async fn create_scalar_index(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<ScalarIndexRequest>,
 ) -> Response {
+    let ScalarIndexRequest {
+        field_name,
+        kind,
+        params,
+    } = request;
     let descriptor = serde_json::json!({
-        "field_name": request.field_name,
-        "kind": request.kind,
-        "params": request.params,
+        "field_name": field_name,
+        "kind": kind,
+        "params": params,
     });
+    let descriptor = match serde_json::from_value(descriptor) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
-        .create_scalar_index(&collection, serde_json::from_value(descriptor).expect("descriptor"));
+        .create_scalar_index(&collection, descriptor);
 
     match result {
         Ok(()) => (
             StatusCode::CREATED,
             Json(CreateIndexResponse {
-                field_name: request.field_name,
+                field_name,
             }),
         )
             .into_response(),

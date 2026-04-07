@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import hannsdb
+import pytest
 
 
 def build_schema():
@@ -95,6 +96,14 @@ def test_create_and_open_persists_richer_schema(tmp_path):
 def test_collection_index_ddl_surface_persists_and_lists_indexes(tmp_path):
     collection = hannsdb.create_and_open(str(tmp_path), build_schema())
 
+    hnsw_blob = (
+        Path(collection.path)
+        / "collections"
+        / collection.collection_name
+        / "hnsw_index.bin"
+    )
+    hnsw_blob.write_bytes(b"stale graph")
+
     collection.create_vector_index(
         "title",
         hannsdb.IVFIndexParam(metric_type="l2", nlist=8),
@@ -117,11 +126,25 @@ def test_collection_index_ddl_surface_persists_and_lists_indexes(tmp_path):
     assert catalog["vector_indexes"][0]["params"] == {"nlist": 8}
     assert catalog["scalar_indexes"][0]["field_name"] == "session_id"
     assert catalog["scalar_indexes"][0]["kind"] == "inverted"
+    assert not hnsw_blob.exists()
 
     collection.drop_vector_index("title")
     collection.drop_scalar_index("session_id")
 
     assert collection.list_vector_indexes() == []
     assert collection.list_scalar_indexes() == []
+    assert not hnsw_blob.exists()
+
+    collection.destroy()
+
+
+def test_collection_index_ddl_surface_runs_core_validation(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+
+    with pytest.raises(ValueError):
+        collection.create_vector_index(
+            "missing_vector",
+            hannsdb.IVFIndexParam(metric_type="l2", nlist=8),
+        )
 
     collection.destroy()

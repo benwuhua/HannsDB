@@ -409,6 +409,57 @@ async fn index_ddl_routes_create_list_and_drop_indexes() {
 }
 
 #[tokio::test]
+async fn index_ddl_routes_reject_invalid_kind_without_panic() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create_collection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create_collection.status(), StatusCode::CREATED);
+
+    let create_vector = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/vector")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"title","kind":"bogus","params":{"nlist":8}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send invalid vector index request");
+    assert_eq!(create_vector.status(), StatusCode::BAD_REQUEST);
+
+    let create_scalar = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/scalar")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"session_id","kind":"bogus","params":{}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send invalid scalar index request");
+    assert_eq!(create_scalar.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn drop_missing_collection_returns_not_found() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
