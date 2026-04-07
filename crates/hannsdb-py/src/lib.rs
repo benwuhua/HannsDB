@@ -1552,7 +1552,7 @@ fn py_open(
 }
 
 #[cfg(feature = "python-binding")]
-#[pymodule(name = "hannsdb")]
+#[pymodule(name = "_native")]
 fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMetricType>()?;
     module.add_class::<PyQuantizeType>()?;

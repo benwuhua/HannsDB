@@ -1,0 +1,7 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "hannsdb._native"

@@ -11,7 +11,7 @@ python-binding = ["dep:pyo3", "dep:numpy"]
 knowhere-backend = ["hannsdb-core/knowhere-backend"]
 
 [lib]
-name = "hannsdb"
+name = "_native"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
@@ -25,3 +25,5 @@ tempfile.workspace = true
 
 [package.metadata.maturin]
 name = "hannsdb"
+module-name = "hannsdb._native"
+python-source = "python"
