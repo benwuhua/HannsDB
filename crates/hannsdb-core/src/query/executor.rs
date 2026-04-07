@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -24,6 +24,7 @@ impl QueryExecutor {
         }
 
         let mut best_hits = HashMap::new();
+        let mut shadowed_ids = HashSet::new();
         for segment in segment_manager.segment_paths()? {
             let records = load_records_or_empty(&segment.records, collection.dimension)?;
             let external_ids = load_record_ids_or_empty(&segment.external_ids)?;
@@ -37,10 +38,18 @@ impl QueryExecutor {
                 ));
             }
 
-            for (row_idx, vector) in records.chunks_exact(collection.dimension).enumerate() {
+            for row_idx in (0..external_ids.len()).rev() {
                 if tombstone.is_deleted(row_idx) {
                     continue;
                 }
+                let id = external_ids[row_idx];
+                if !shadowed_ids.insert(id) {
+                    continue;
+                }
+
+                let start = row_idx * collection.dimension;
+                let end = start + collection.dimension;
+                let vector = &records[start..end];
 
                 let fields = &payloads[row_idx];
                 if let Some(filter) = plan.filter.as_ref() {
@@ -50,7 +59,7 @@ impl QueryExecutor {
                 }
 
                 let candidate = DocumentHit {
-                    id: external_ids[row_idx],
+                    id,
                     distance: best_distance(plan, vector, &collection.metric)?,
                     fields: fields.clone(),
                 };

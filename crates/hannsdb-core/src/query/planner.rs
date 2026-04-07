@@ -110,6 +110,17 @@ impl QueryPlanner {
 }
 
 fn validate_vector_query(collection: &CollectionMetadata, query: &VectorQuery) -> io::Result<()> {
+    if query
+        .param
+        .as_ref()
+        .is_some_and(|param| param.ef_search.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "vector query param ef_search is not supported on the typed brute-force path yet",
+        ));
+    }
+
     let Some(vector_schema) = collection
         .vectors
         .iter()
