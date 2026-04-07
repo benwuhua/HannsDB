@@ -10,3 +10,4 @@
 .coord/tasks/
 .coord/watch/
 .coord/workers/
+/.worktrees/
