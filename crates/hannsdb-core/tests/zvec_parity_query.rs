@@ -1,22 +1,27 @@
-use serde::Serialize;
+use hannsdb_core::db::{DocumentHit, HannsDb};
 use serde_json::{json, Value};
+use std::io;
 
-#[derive(Serialize)]
-struct CurrentSingleVectorQueryRequest<'a> {
-    collection: &'a str,
-    query: &'a [f32],
-    top_k: usize,
-    filter: Option<&'a str>,
+type CurrentQueryDocumentsSignature =
+    fn(&HannsDb, &str, &[f32], usize, Option<&str>) -> io::Result<Vec<DocumentHit>>;
+
+fn current_query_documents_signature() -> CurrentQueryDocumentsSignature {
+    HannsDb::query_documents
 }
 
 fn current_query_request_value() -> Value {
-    serde_json::to_value(CurrentSingleVectorQueryRequest {
-        collection: "docs",
-        query: &[0.0_f32, 0.1],
-        top_k: 5,
-        filter: None,
+    let _query_fn = current_query_documents_signature();
+    let collection = "docs";
+    let query = vec![0.0_f32, 0.1];
+    let top_k = 5;
+    let filter: Option<&str> = None;
+
+    json!({
+        "collection": collection,
+        "query": query,
+        "top_k": top_k,
+        "filter": filter
     })
-    .expect("serialize current single-vector query shape")
 }
 
 #[test]
