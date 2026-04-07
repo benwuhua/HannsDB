@@ -5,11 +5,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-#[cfg(feature = "knowhere-backend")]
-use hannsdb_index::adapter::{AdapterError, HnswBackend};
-use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor};
-#[cfg(feature = "knowhere-backend")]
-use hannsdb_index::hnsw::{InMemoryHnswIndex, KnowhereHnswIndex};
+use hannsdb_index::adapter::{AdapterError, VectorIndexBackend};
+use hannsdb_index::descriptor::{
+    ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind,
+};
+use hannsdb_index::factory::DefaultIndexFactory;
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
@@ -22,7 +22,6 @@ use crate::segment::{
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
-#[cfg(feature = "knowhere-backend")]
 const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 const INDEX_CATALOG_FILE: &str = "indexes.json";
 
@@ -62,17 +61,12 @@ struct CachedSearchState {
     tombstone: Arc<TombstoneMask>,
     dimension: usize,
     metric: String,
-    #[cfg(feature = "knowhere-backend")]
-    hnsw_m: usize,
-    #[cfg(feature = "knowhere-backend")]
-    hnsw_ef_construction: usize,
-    #[cfg(feature = "knowhere-backend")]
+    primary_index: VectorIndexDescriptor,
     optimized_ann: Option<OptimizedAnnState>,
 }
 
-#[cfg(feature = "knowhere-backend")]
 struct OptimizedAnnState {
-    backend: Arc<dyn HnswBackend + Send + Sync>,
+    backend: Arc<dyn VectorIndexBackend>,
     ann_external_ids: Arc<Vec<i64>>,
     metric: String,
 }
@@ -931,28 +925,23 @@ impl CollectionHandle {
         top_k: usize,
         _ef_search: usize,
     ) -> io::Result<Vec<SearchHit>> {
-        #[cfg(feature = "knowhere-backend")]
         let ef_search = _ef_search.max(1);
         let mut cache = self
             .search_cache
             .lock()
             .expect("search cache mutex poisoned");
         if cache.is_none() {
-            #[cfg(feature = "knowhere-backend")]
             let state = if let Some(ann_state) = self.try_load_persisted_ann_state()? {
                 ann_state
             } else {
                 self.load_search_state()?
             };
-            #[cfg(not(feature = "knowhere-backend"))]
-            let state = self.load_search_state()?;
             *cache = Some(state);
         }
 
         let state = cache
             .as_ref()
             .expect("search cache must contain requested collection");
-        #[cfg(feature = "knowhere-backend")]
         if let Some(optimized_ann) = state.optimized_ann.as_ref() {
             let optimized_snapshot = (
                 Arc::clone(&optimized_ann.backend),
@@ -993,13 +982,13 @@ impl CollectionHandle {
 
     pub fn optimize(&self) -> io::Result<()> {
         let _index_registry = Arc::clone(&self.index_registry);
-        let state = self.load_search_state()?;
+        let mut state = self.load_search_state()?;
+        let mut hnsw_bytes = None;
+        state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
         #[cfg(feature = "knowhere-backend")]
         {
-            let mut hnsw_bytes = None;
-            state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
+            let paths = self.collection_paths();
             if let Some(bytes) = hnsw_bytes {
-                let paths = self.collection_paths();
                 if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
                     log::warn!("Failed to persist HNSW index: {e}");
                 } else {
@@ -1008,6 +997,11 @@ impl CollectionHandle {
                         bytes.len(),
                         self.name
                     );
+                }
+            } else {
+                let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+                if hnsw_path.exists() {
+                    let _ = fs::remove_file(hnsw_path);
                 }
             }
         }
@@ -1216,6 +1210,8 @@ impl CollectionHandle {
     fn load_search_state(&self) -> io::Result<CachedSearchState> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        let primary_index = resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
         let metric = collection_meta.metric.clone();
         let segment_paths = self.segment_manager.segment_paths()?;
 
@@ -1251,107 +1247,17 @@ impl CollectionHandle {
             }
         }
 
-        #[cfg(feature = "knowhere-backend")]
-        let optimized_ann = {
-            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-            if hnsw_path.exists() {
-                match fs::read(&hnsw_path).and_then(|bytes| {
-                    KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
-                        .map_err(|e| io::Error::other(format!("{e:?}")))
-                }) {
-                    Ok(backend) => Some(OptimizedAnnState {
-                        backend: Arc::new(backend),
-                        ann_external_ids: Arc::new(external_ids.clone()),
-                        metric: metric.to_ascii_lowercase(),
-                    }),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to load persisted HNSW index from '{}': {e}",
-                            hnsw_path.display()
-                        );
-                        let metric_lc = metric.to_ascii_lowercase();
-                        match KnowhereHnswIndex::new(
-                            collection_meta.dimension,
-                            &metric_lc,
-                            collection_meta.hnsw_m,
-                            collection_meta.hnsw_ef_construction,
-                        ) {
-                            Ok(mut backend) => {
-                                match backend
-                                    .insert_flat_identity(&records, collection_meta.dimension)
-                                {
-                                    Ok(()) => {
-                                        match backend.serialize_to_bytes() {
-                                            Ok(rebuilt) => {
-                                                if let Err(write_err) =
-                                                    fs::write(&hnsw_path, &rebuilt)
-                                                {
-                                                    log::warn!(
-                                                        "Failed to rewrite rebuilt HNSW index to '{}': {write_err}",
-                                                        hnsw_path.display()
-                                                    );
-                                                } else {
-                                                    log::info!(
-                                                        "Rebuilt and rewrote HNSW index for '{}' ({} bytes)",
-                                                        self.name, rebuilt.len()
-                                                    );
-                                                }
-                                            }
-                                            Err(ser_err) => {
-                                                log::warn!(
-                                                    "Failed to serialize rebuilt HNSW index: {:?}",
-                                                    ser_err
-                                                );
-                                            }
-                                        }
-                                        Some(OptimizedAnnState {
-                                            backend: Arc::new(backend),
-                                            ann_external_ids: Arc::new(external_ids.clone()),
-                                            metric: metric_lc,
-                                        })
-                                    }
-                                    Err(rebuild_err) => {
-                                        log::warn!(
-                                            "Failed to rebuild HNSW index in-memory for '{}': {:?}",
-                                            self.name,
-                                            rebuild_err
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Err(create_err) => {
-                                log::warn!(
-                                    "Failed to create HNSW backend for rebuild on '{}': {:?}",
-                                    self.name,
-                                    create_err
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
         Ok(CachedSearchState {
             records: Arc::new(records),
             external_ids: Arc::new(external_ids),
             tombstone: Arc::new(TombstoneMask::new(0)),
             dimension: collection_meta.dimension,
             metric,
-            #[cfg(feature = "knowhere-backend")]
-            hnsw_m: collection_meta.hnsw_m,
-            #[cfg(feature = "knowhere-backend")]
-            hnsw_ef_construction: collection_meta.hnsw_ef_construction,
-            #[cfg(feature = "knowhere-backend")]
-            optimized_ann,
+            primary_index,
+            optimized_ann: None,
         })
     }
 
-    #[cfg(feature = "knowhere-backend")]
     fn try_load_persisted_ann_state(&self) -> io::Result<Option<CachedSearchState>> {
         let paths = self.collection_paths();
         let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
@@ -1360,8 +1266,17 @@ impl CollectionHandle {
         }
 
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        let primary_index = resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
+        if primary_index.kind != VectorIndexKind::Hnsw {
+            return Ok(None);
+        }
         let metric = collection_meta.metric.clone();
-        let metric_lc = metric.to_ascii_lowercase();
+        let metric_lc = primary_index
+            .metric
+            .clone()
+            .unwrap_or_else(|| metric.clone())
+            .to_ascii_lowercase();
         let segment_paths = self.segment_manager.segment_paths()?;
 
         let mut live_external_ids = Vec::new();
@@ -1376,8 +1291,9 @@ impl CollectionHandle {
         }
 
         match fs::read(&hnsw_path).and_then(|bytes| {
-            KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
-                .map_err(|e| io::Error::other(format!("{e:?}")))
+            DefaultIndexFactory::default()
+                .create_vector_index(collection_meta.dimension, &primary_index, Some(&bytes))
+                .map_err(adapter_error_to_io)
         }) {
             Ok(backend) => {
                 log::info!(
@@ -1392,12 +1308,9 @@ impl CollectionHandle {
                     tombstone: Arc::new(TombstoneMask::new(0)),
                     dimension: collection_meta.dimension,
                     metric,
-                    #[cfg(feature = "knowhere-backend")]
-                    hnsw_m: collection_meta.hnsw_m,
-                    #[cfg(feature = "knowhere-backend")]
-                    hnsw_ef_construction: collection_meta.hnsw_ef_construction,
+                    primary_index,
                     optimized_ann: Some(OptimizedAnnState {
-                        backend: Arc::new(backend),
+                        backend: Arc::from(backend),
                         ann_external_ids,
                         metric: metric_lc,
                     }),
@@ -1798,12 +1711,78 @@ fn mark_live_id_deleted(
     }
 }
 
-#[cfg(feature = "knowhere-backend")]
+fn resolve_primary_vector_descriptor(
+    collection_meta: &CollectionMetadata,
+    index_catalog: &IndexCatalog,
+) -> io::Result<VectorIndexDescriptor> {
+    if let Some(descriptor) = index_catalog
+        .vector_indexes
+        .iter()
+        .find(|descriptor| descriptor.field_name == collection_meta.primary_vector)
+    {
+        return Ok(descriptor.clone());
+    }
+
+    let primary_vector = collection_meta
+        .vectors
+        .iter()
+        .find(|vector| vector.name == collection_meta.primary_vector)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "primary vector '{}' is not defined in collection metadata",
+                    collection_meta.primary_vector
+                ),
+            )
+        })?;
+
+    let (kind, metric, params) = match primary_vector.index_param.as_ref() {
+        Some(VectorIndexSchema::Ivf { metric, nlist }) => (
+            VectorIndexKind::Ivf,
+            metric.clone(),
+            serde_json::json!({ "nlist": nlist }),
+        ),
+        Some(VectorIndexSchema::Hnsw {
+            metric,
+            m,
+            ef_construction,
+        }) => (
+            VectorIndexKind::Hnsw,
+            metric.clone(),
+            serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction
+            }),
+        ),
+        None => (
+            VectorIndexKind::Hnsw,
+            Some(collection_meta.metric.clone()),
+            serde_json::json!({
+                "m": collection_meta.hnsw_m,
+                "ef_construction": collection_meta.hnsw_ef_construction
+            }),
+        ),
+    };
+
+    Ok(VectorIndexDescriptor {
+        field_name: collection_meta.primary_vector.clone(),
+        kind,
+        metric,
+        params,
+    })
+}
+
 fn build_optimized_ann_state(
     state: &CachedSearchState,
     index_bytes_out: &mut Option<Vec<u8>>,
 ) -> io::Result<OptimizedAnnState> {
-    let metric = state.metric.to_ascii_lowercase();
+    let metric = state
+        .primary_index
+        .metric
+        .clone()
+        .unwrap_or_else(|| state.metric.clone())
+        .to_ascii_lowercase();
     let (ann_external_ids, flat_vectors) = if state.tombstone.deleted_count() == 0 {
         (
             Arc::clone(&state.external_ids),
@@ -1826,46 +1805,25 @@ fn build_optimized_ann_state(
         (Arc::new(live_external_ids), flat_vectors)
     };
 
-    if metric == "l2" || metric == "cosine" || metric == "ip" {
-        let mut backend = KnowhereHnswIndex::new(
-            state.dimension,
-            &metric,
-            state.hnsw_m,
-            state.hnsw_ef_construction,
-        )
+    let mut backend = DefaultIndexFactory::default()
+        .create_vector_index(state.dimension, &state.primary_index, None)
         .map_err(adapter_error_to_io)?;
-        if !flat_vectors.is_empty() {
-            backend
-                .insert_flat_identity(&flat_vectors, state.dimension)
-                .map_err(adapter_error_to_io)?;
-        }
-        *index_bytes_out = backend.serialize_to_bytes().ok();
-        return Ok(OptimizedAnnState {
-            backend: Arc::new(backend),
-            ann_external_ids,
-            metric,
-        });
-    }
-
-    let mut backend =
-        InMemoryHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
     if !flat_vectors.is_empty() {
         backend
             .insert_flat_identity(&flat_vectors, state.dimension)
             .map_err(adapter_error_to_io)?;
     }
-    *index_bytes_out = None;
+    *index_bytes_out = backend.serialize_to_bytes().map_err(adapter_error_to_io)?;
 
     Ok(OptimizedAnnState {
-        backend: Arc::new(backend),
+        backend: Arc::from(backend),
         ann_external_ids,
         metric,
     })
 }
 
-#[cfg(feature = "knowhere-backend")]
 fn ann_search(
-    backend: &(dyn HnswBackend + Send + Sync),
+    backend: &dyn VectorIndexBackend,
     ann_external_ids: &[i64],
     metric: &str,
     query: &[f32],
@@ -1896,6 +1854,7 @@ fn ann_search(
             )
         })?;
         let distance = match metric {
+            "l2" => dists_buf[i].max(0.0).sqrt(),
             "ip" => -dists_buf[i],
             _ => dists_buf[i],
         };
@@ -1907,7 +1866,6 @@ fn ann_search(
     Ok(mapped)
 }
 
-#[cfg(feature = "knowhere-backend")]
 fn adapter_error_to_io(err: AdapterError) -> io::Error {
     match err {
         AdapterError::InvalidDimension { expected, got } => io::Error::new(

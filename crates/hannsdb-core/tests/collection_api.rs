@@ -993,3 +993,100 @@ fn collection_api_drop_vector_index_keeps_other_descriptors() {
         1
     );
 }
+
+#[test]
+fn collection_api_optimize_uses_explicit_flat_descriptor_for_primary_vector() {
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_flat_descriptor");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[1, 2], &[0.9_f32, 0.4, 10.0, 0.0])
+        .expect("insert vectors");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Flat,
+            metric: Some("cosine".to_string()),
+            params: json!({}),
+        },
+    )
+    .expect("register flat descriptor");
+
+    db.optimize_collection("docs")
+        .expect("optimize should use explicit flat descriptor");
+
+    let hits = db
+        .search("docs", &[1.0_f32, 0.0], 1)
+        .expect("search should use explicit flat descriptor");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2, "cosine flat index should prefer aligned vector");
+}
+
+#[test]
+fn collection_api_optimize_uses_explicit_ivf_descriptor_for_primary_vector() {
+    let root = unique_temp_dir("hannsdb_collection_api_optimize_ivf_descriptor");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[1, 2], &[0.9_f32, 0.4, 10.0, 0.0])
+        .expect("insert vectors");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Ivf,
+            metric: Some("cosine".to_string()),
+            params: json!({
+                "nlist": 4
+            }),
+        },
+    )
+    .expect("register ivf descriptor");
+
+    db.optimize_collection("docs")
+        .expect("optimize should use explicit ivf descriptor");
+
+    let hits = db
+        .search("docs", &[1.0_f32, 0.0], 1)
+        .expect("search should use explicit ivf descriptor");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2, "cosine ivf index should prefer aligned vector");
+}
+
+#[test]
+fn collection_api_drop_primary_vector_descriptor_reverts_to_schema_fallback() {
+    let root = unique_temp_dir("hannsdb_collection_api_drop_descriptor_reverts_fallback");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[1, 2], &[0.9_f32, 0.4, 10.0, 0.0])
+        .expect("insert vectors");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Flat,
+            metric: Some("cosine".to_string()),
+            params: json!({}),
+        },
+    )
+    .expect("register flat descriptor");
+
+    db.optimize_collection("docs")
+        .expect("optimize should use explicit flat descriptor");
+    let descriptor_hits = db
+        .search("docs", &[1.0_f32, 0.0], 1)
+        .expect("search should use explicit descriptor");
+    assert_eq!(descriptor_hits[0].id, 2);
+
+    db.drop_vector_index("docs", "vector")
+        .expect("drop explicit descriptor");
+    db.optimize_collection("docs")
+        .expect("optimize should fall back to schema");
+
+    let fallback_hits = db
+        .search("docs", &[1.0_f32, 0.0], 1)
+        .expect("search should use schema fallback");
+    assert_eq!(fallback_hits[0].id, 1, "schema l2 fallback should prefer nearest vector");
+}
