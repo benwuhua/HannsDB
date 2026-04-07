@@ -33,5 +33,7 @@ def test_star_import_exposes_native_and_facade_symbols():
         "IVFIndexParam",
         "create_and_open",
         "QueryExecutorFactory",
+        "QueryGroupBy",
+        "QueryReranker",
     ]:
         assert name in namespace

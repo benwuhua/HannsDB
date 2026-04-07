@@ -1,7 +1,17 @@
 from . import _native as _native_module
 from ._native import *  # noqa: F401,F403
 from .executor import QueryExecutorFactory
-from .model import Collection, CollectionSchema, Doc, FieldSchema, QueryContext, VectorQuery, VectorSchema
+from .model import (
+    Collection,
+    CollectionSchema,
+    Doc,
+    FieldSchema,
+    QueryContext,
+    QueryGroupBy,
+    QueryReranker,
+    VectorQuery,
+    VectorSchema,
+)
 
 _native_exports = [name for name in dir(_native_module) if not name.startswith("_")]
 _facade_exports = [
@@ -10,7 +20,9 @@ _facade_exports = [
     "Doc",
     "FieldSchema",
     "QueryContext",
+    "QueryGroupBy",
     "QueryExecutorFactory",
+    "QueryReranker",
     "VectorQuery",
     "VectorSchema",
 ]

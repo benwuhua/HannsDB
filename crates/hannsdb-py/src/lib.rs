@@ -16,6 +16,10 @@ use hannsdb_core::document::{
     FieldValue, ScalarFieldSchema as CoreScalarFieldSchema,
     VectorFieldSchema as CoreVectorFieldSchema, VectorIndexSchema as CoreVectorIndexSchema,
 };
+use hannsdb_core::query::{
+    QueryContext as CoreQueryContext, QueryGroupBy as CoreQueryGroupBy,
+    VectorQuery as CoreVectorQuery, VectorQueryParam as CoreVectorQueryParam,
+};
 
 pub fn bootstrap_symbol() -> &'static str {
     "hannsdb_py_bootstrap"
@@ -248,6 +252,92 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
 fn parse_doc_id(id: &str) -> std::io::Result<i64> {
     id.parse::<i64>().map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "doc id must parse to i64")
+    })
+}
+
+#[cfg(feature = "python-binding")]
+fn parse_query_ids(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<Vec<i64>>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+
+    let items: Vec<Py<PyAny>> = value.extract()?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item.bind(py);
+        if let Ok(id) = item.extract::<i64>() {
+            parsed.push(id);
+            continue;
+        }
+
+        let id = item.extract::<String>()?;
+        parsed.push(parse_doc_id(&id).map_err(io_to_py_err)?);
+    }
+    if parsed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
+}
+
+#[cfg(feature = "python-binding")]
+fn py_query_context_to_core(
+    py: Python<'_>,
+    context: &Bound<'_, PyAny>,
+) -> PyResult<CoreQueryContext> {
+    let top_k = context.getattr("top_k")?.extract::<usize>()?;
+    let queries = context.getattr("queries")?;
+    let query_objects: Vec<Py<PyAny>> = queries.extract()?;
+    let mut core_queries = Vec::with_capacity(query_objects.len());
+    for query_object in query_objects {
+        let py_query = query_object.bind(py).extract::<PyRef<'_, PyVectorQuery>>()?;
+        core_queries.push(CoreVectorQuery {
+            field_name: py_query.inner.field_name.clone(),
+            vector: py_query.inner.vector.clone(),
+            param: py_query.inner.param.as_ref().map(|param| CoreVectorQueryParam {
+                ef_search: Some(param.ef),
+            }),
+        });
+    }
+
+    let query_by_id_attr = context.getattr("query_by_id")?;
+    let query_by_id = parse_query_ids(py, &query_by_id_attr)?;
+    let filter = context.getattr("filter")?.extract::<Option<String>>()?;
+    let output_fields = context.getattr("output_fields")?.extract::<Option<Vec<String>>>()?;
+    let include_vector = context.getattr("include_vector")?.extract::<bool>()?;
+    if include_vector {
+        return Err(PyValueError::new_err(
+            "include_vector is not supported on the Python facade yet",
+        ));
+    }
+
+    let reranker = context.getattr("reranker")?;
+    if !reranker.is_none() {
+        return Err(PyValueError::new_err(
+            "reranker is not supported on the Python facade yet",
+        ));
+    }
+
+    let group_by_attr = context.getattr("group_by")?;
+    let group_by = match group_by_attr {
+        value if value.is_none() => None,
+        value => Some(CoreQueryGroupBy {
+            field_name: value.getattr("field_name")?.extract::<String>()?,
+        }),
+    };
+
+    Ok(CoreQueryContext {
+        top_k,
+        queries: core_queries,
+        query_by_id,
+        filter,
+        output_fields,
+        include_vector,
+        group_by,
+        reranker: None,
     })
 }
 
@@ -613,6 +703,28 @@ impl Collection {
                 id: hit.id.to_string(),
                 score: Some(hit.distance),
                 fields: select_output_fields(&document.fields, &output_fields),
+                vectors: BTreeMap::new(),
+            })
+            .collect())
+    }
+
+    #[cfg(feature = "python-binding")]
+    pub fn query_context(
+        &self,
+        py: Python<'_>,
+        context: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Doc>> {
+        let core_context = py_query_context_to_core(py, context)?;
+        let hits = self
+            .db
+            .query_with_context(&self.collection_name, &core_context)
+            .map_err(io_to_py_err)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| Doc {
+                id: hit.id.to_string(),
+                score: Some(hit.distance),
+                fields: hit.fields,
                 vectors: BTreeMap::new(),
             })
             .collect())
@@ -1382,6 +1494,18 @@ impl PyCollection {
             .inner_ref()?
             .query(output_fields, topk, filter.as_deref(), vectors)
             .map_err(io_to_py_err)?;
+        docs.into_iter()
+            .map(|doc| Py::new(py, PyDoc { inner: doc }))
+            .collect()
+    }
+
+    #[pyo3(signature = (context))]
+    fn query_context(
+        &self,
+        py: Python<'_>,
+        context: Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Py<PyDoc>>> {
+        let docs = self.inner_ref()?.query_context(py, &context)?;
         docs.into_iter()
             .map(|doc| Py::new(py, PyDoc { inner: doc }))
             .collect()

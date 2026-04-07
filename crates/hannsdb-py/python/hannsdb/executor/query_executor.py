@@ -14,22 +14,9 @@ class QueryExecutor:
     def execute(self, collection: Any, context: QueryContext):
         if context.include_vector:
             raise NotImplementedError("include_vector is not supported by the Python facade yet")
-        if context.query_by_id is not None:
-            raise NotImplementedError("query_by_id is not supported by the Python facade yet")
         if context.reranker is not None:
             raise NotImplementedError("reranker is not supported by the Python facade yet")
-        if context.group_by is not None:
-            raise NotImplementedError("group_by is not supported by the Python facade yet")
-        if len(context.queries) != 1:
-            raise NotImplementedError("Python facade currently supports exactly one vector query")
-
-        query = context.queries[0]
-        return collection.query(
-            vectors=query,
-            output_fields=context.output_fields,
-            topk=context.top_k,
-            filter=context.filter,
-        )
+        return collection.query_context(context)
 
 
 @dataclass(slots=True)
