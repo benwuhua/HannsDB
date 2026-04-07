@@ -110,9 +110,9 @@ fn wal_recovery_create_collection_record_keeps_full_schema() {
 
     match record {
         WalRecord::CreateCollection { schema, .. } => {
-            assert_eq!(schema.primary_vector, "dense");
-            assert_eq!(schema.dimension, 2);
-            assert_eq!(schema.metric, "cosine");
+            assert_eq!(schema.primary_vector_name(), "dense");
+            assert_eq!(schema.dimension(), 2);
+            assert_eq!(schema.metric(), "cosine");
             assert_eq!(
                 schema.fields,
                 vec![

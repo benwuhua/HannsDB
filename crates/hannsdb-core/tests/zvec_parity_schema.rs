@@ -1,20 +1,27 @@
-use hannsdb_core::catalog::CollectionMetadata;
-use hannsdb_core::document::{CollectionSchema, FieldType, ScalarFieldSchema};
+use hannsdb_core::catalog::{CollectionMetadata, CATALOG_FORMAT_VERSION};
+use hannsdb_core::document::{
+    CollectionSchema, FieldType, ScalarFieldSchema, VectorFieldSchema, VectorIndexSchema,
+};
 use serde_json::{json, Value};
 
 fn stored_schema_value() -> Value {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("collection.json");
-    let schema = CollectionSchema::new(
-        "dense",
-        384,
-        "cosine",
-        vec![
+    let schema = CollectionSchema {
+        fields: vec![
             ScalarFieldSchema::new("session_id", FieldType::String),
-            ScalarFieldSchema::new("tags", FieldType::String),
+            ScalarFieldSchema::new("tags", FieldType::String).with_flags(true, true),
             ScalarFieldSchema::new("created_at", FieldType::Int64),
         ],
-    );
+        vectors: vec![
+            VectorFieldSchema::new("dense", 384).with_index_param(VectorIndexSchema::hnsw(
+                Some("cosine"),
+                32,
+                128,
+            )),
+            VectorFieldSchema::new("title", 384),
+        ],
+    };
     let metadata = CollectionMetadata::new_with_schema("docs", schema);
 
     metadata
@@ -27,24 +34,17 @@ fn stored_schema_value() -> Value {
 #[test]
 fn zvec_parity_schema_round_trips_multiple_vector_fields() {
     let actual = stored_schema_value();
-    let vectors = actual
-        .get("vectors")
-        .cloned()
+    let vectors = actual["vectors"]
+        .as_array()
         .expect("schema should expose vector metadata");
-    let expected_vectors = json!([
-        {
-            "name": "dense",
-            "data_type": "VectorFp32",
-            "dimension": 384
-        },
-        {
-            "name": "title",
-            "data_type": "VectorFp32",
-            "dimension": 384
-        }
-    ]);
 
-    assert_eq!(vectors, expected_vectors);
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0]["name"], "dense");
+    assert_eq!(vectors[0]["data_type"], "VectorFp32");
+    assert_eq!(vectors[0]["dimension"], 384);
+    assert_eq!(vectors[1]["name"], "title");
+    assert_eq!(vectors[1]["data_type"], "VectorFp32");
+    assert_eq!(vectors[1]["dimension"], 384);
 }
 
 #[test]
@@ -64,6 +64,7 @@ fn zvec_parity_schema_round_trips_vector_index_metadata() {
         .expect("vector should expose index metadata");
     let expected_index_param = json!({
         "kind": "hnsw",
+        "metric": "cosine",
         "m": 32,
         "ef_construction": 128
     });
@@ -96,4 +97,69 @@ fn zvec_parity_schema_round_trips_nullable_and_array_scalar_fields() {
     ]);
 
     assert_eq!(actual_fields, expected_fields);
+}
+
+#[test]
+fn zvec_parity_schema_migrates_legacy_single_vector_metadata_into_field_registries() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("collection.json");
+    let legacy_metadata = json!({
+        "format_version": CATALOG_FORMAT_VERSION,
+        "name": "docs",
+        "dimension": 384,
+        "metric": "cosine",
+        "primary_vector": "dense",
+        "fields": [
+            {
+                "name": "session_id",
+                "data_type": "String"
+            }
+        ],
+        "hnsw_m": 16,
+        "hnsw_ef_construction": 128
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&legacy_metadata).expect("serialize legacy metadata"),
+    )
+    .expect("write legacy metadata");
+
+    let loaded = CollectionMetadata::load_from_path(&path).expect("load collection metadata");
+    let schema = loaded.schema();
+
+    assert_eq!(
+        schema.fields,
+        vec![ScalarFieldSchema::new("session_id", FieldType::String)]
+    );
+    assert_eq!(
+        schema.vectors,
+        vec![
+            VectorFieldSchema::new("dense", 384).with_index_param(VectorIndexSchema::hnsw(
+                Some("cosine"),
+                16,
+                128
+            ))
+        ]
+    );
+}
+
+#[test]
+fn zvec_parity_schema_legacy_constructor_maps_to_single_primary_vector_registry() {
+    let schema = CollectionSchema::new(
+        "dense",
+        384,
+        "cosine",
+        vec![ScalarFieldSchema::new("session_id", FieldType::String)],
+    );
+
+    assert_eq!(
+        schema.vectors,
+        vec![
+            VectorFieldSchema::new("dense", 384).with_index_param(VectorIndexSchema::hnsw(
+                Some("cosine"),
+                16,
+                128
+            ))
+        ]
+    );
 }

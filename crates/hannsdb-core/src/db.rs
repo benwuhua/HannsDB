@@ -117,7 +117,8 @@ impl HannsDb {
         schema: &CollectionSchema,
         log_wal: bool,
     ) -> io::Result<()> {
-        if schema.dimension == 0 {
+        let dimension = schema.dimension();
+        if dimension == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "collection dimension must be > 0",
@@ -147,7 +148,7 @@ impl HannsDb {
         let collection = CollectionMetadata::new_with_schema(name, schema.clone());
         collection.save_to_path(&paths.collection_meta)?;
 
-        let segment = SegmentMetadata::new("seg-0001", schema.dimension, 0, 0);
+        let segment = SegmentMetadata::new("seg-0001", dimension, 0, 0);
         segment.save_to_path(&paths.segment_meta)?;
 
         let tombstone = TombstoneMask::new(0);
@@ -769,7 +770,10 @@ impl HannsDb {
     }
 
     #[cfg(feature = "knowhere-backend")]
-    fn try_load_persisted_ann_state(&self, collection: &str) -> io::Result<Option<CachedSearchState>> {
+    fn try_load_persisted_ann_state(
+        &self,
+        collection: &str,
+    ) -> io::Result<Option<CachedSearchState>> {
         let paths = self.collection_paths(collection);
         let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
         if !hnsw_path.exists() {
@@ -954,11 +958,15 @@ impl HannsDb {
                             collection_meta.hnsw_ef_construction,
                         ) {
                             Ok(mut backend) => {
-                                match backend.insert_flat_identity(&records, collection_meta.dimension) {
+                                match backend
+                                    .insert_flat_identity(&records, collection_meta.dimension)
+                                {
                                     Ok(()) => {
                                         match backend.serialize_to_bytes() {
                                             Ok(rebuilt) => {
-                                                if let Err(write_err) = fs::write(&hnsw_path, &rebuilt) {
+                                                if let Err(write_err) =
+                                                    fs::write(&hnsw_path, &rebuilt)
+                                                {
                                                     log::warn!(
                                                         "Failed to rewrite rebuilt HNSW index to '{}': {write_err}",
                                                         hnsw_path.display()
@@ -986,7 +994,8 @@ impl HannsDb {
                                     Err(rebuild_err) => {
                                         log::warn!(
                                             "Failed to rebuild HNSW index in-memory for '{}': {:?}",
-                                            collection, rebuild_err
+                                            collection,
+                                            rebuild_err
                                         );
                                         None
                                     }
@@ -995,7 +1004,8 @@ impl HannsDb {
                             Err(create_err) => {
                                 log::warn!(
                                     "Failed to create HNSW backend for rebuild on '{}': {:?}",
-                                    collection, create_err
+                                    collection,
+                                    create_err
                                 );
                                 None
                             }
@@ -1583,7 +1593,10 @@ fn build_optimized_ann_state(
 ) -> io::Result<OptimizedAnnState> {
     let metric = state.metric.to_ascii_lowercase();
     let (ann_external_ids, flat_vectors) = if state.tombstone.deleted_count() == 0 {
-        (Arc::clone(&state.external_ids), state.records.as_ref().clone())
+        (
+            Arc::clone(&state.external_ids),
+            state.records.as_ref().clone(),
+        )
     } else {
         let live_count = state
             .external_ids
@@ -1622,7 +1635,8 @@ fn build_optimized_ann_state(
         });
     }
 
-    let mut backend = InMemoryHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
+    let mut backend =
+        InMemoryHnswIndex::new(state.dimension, &metric).map_err(adapter_error_to_io)?;
     if !flat_vectors.is_empty() {
         backend
             .insert_flat_identity(&flat_vectors, state.dimension)

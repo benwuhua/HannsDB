@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
 
 #[cfg(feature = "python-binding")]
+use numpy::PyReadonlyArray1;
+#[cfg(feature = "python-binding")]
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 #[cfg(feature = "python-binding")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
-use pyo3::types::{PyBool, PyDict};
-#[cfg(feature = "python-binding")]
-use numpy::PyReadonlyArray1;
+use pyo3::types::{PyAny, PyBool, PyDict};
 
 use hannsdb_core::catalog::CollectionMetadata;
 use hannsdb_core::document::{
     CollectionSchema as CoreCollectionSchema, Document as CoreDocument, FieldType as CoreFieldType,
-    FieldValue,
+    FieldValue, ScalarFieldSchema as CoreScalarFieldSchema,
+    VectorFieldSchema as CoreVectorFieldSchema, VectorIndexSchema as CoreVectorIndexSchema,
 };
 
 pub fn bootstrap_symbol() -> &'static str {
@@ -78,6 +79,18 @@ pub struct HnswIndexParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfIndexParam {
+    pub metric_type: Option<MetricType>,
+    pub nlist: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexParam {
+    Hnsw(HnswIndexParam),
+    Ivf(IvfIndexParam),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HnswQueryParam {
     pub ef: usize,
     pub is_using_refiner: bool,
@@ -94,7 +107,7 @@ pub struct VectorSchema {
     pub name: String,
     pub data_type: DataType,
     pub dimension: usize,
-    pub index_param: Option<HnswIndexParam>,
+    pub index_param: Option<IndexParam>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,22 +152,19 @@ pub struct Collection {
 
 pub fn init(_log_level: LogLevel) {}
 
-fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCollectionSchema> {
-    if schema.vectors.len() != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "v1 requires exactly one vector schema",
-        ));
+fn metric_type_name(metric: MetricType) -> &'static str {
+    match metric {
+        MetricType::L2 => "l2",
+        MetricType::Cosine => "cosine",
+        MetricType::Ip => "ip",
     }
+}
 
-    let vector = schema
-        .vectors
-        .first()
-        .expect("checked vector schema length");
-    if vector.data_type != DataType::VectorFp32 {
+fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCollectionSchema> {
+    if schema.vectors.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "vector schema must use vector_fp32",
+            "CollectionSchema requires at least one vector schema",
         ));
     }
 
@@ -162,7 +172,7 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
         .fields
         .iter()
         .map(|field| {
-            Ok(hannsdb_core::document::ScalarFieldSchema::new(
+            Ok(CoreScalarFieldSchema::new(
                 field.name.clone(),
                 match field.data_type {
                     DataType::String => CoreFieldType::String,
@@ -180,31 +190,40 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
-    let metric = vector
-        .index_param
-        .as_ref()
-        .and_then(|params| params.metric_type)
-        .map(|metric| match metric {
-            MetricType::L2 => "l2",
-            MetricType::Cosine => "cosine",
-            MetricType::Ip => "ip",
-        })
-        .unwrap_or("l2");
-    let hnsw_m = vector.index_param.as_ref().map(|params| params.m).unwrap_or(16);
-    let hnsw_ef_construction = vector
-        .index_param
-        .as_ref()
-        .map(|params| params.ef_construction)
-        .unwrap_or(128);
+    let vectors = schema
+        .vectors
+        .iter()
+        .map(|vector| {
+            if vector.data_type != DataType::VectorFp32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "vector schema must use vector_fp32",
+                ));
+            }
 
-    Ok(CoreCollectionSchema {
-        primary_vector: vector.name.clone(),
-        dimension: vector.dimension,
-        metric: metric.to_string(),
-        fields,
-        hnsw_m,
-        hnsw_ef_construction,
-    })
+            let index_param = match vector.index_param.as_ref() {
+                Some(IndexParam::Hnsw(params)) => Some(CoreVectorIndexSchema::hnsw(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.ef_construction,
+                )),
+                Some(IndexParam::Ivf(params)) => Some(CoreVectorIndexSchema::ivf(
+                    params.metric_type.map(metric_type_name),
+                    params.nlist,
+                )),
+                None => None,
+            };
+
+            Ok(CoreVectorFieldSchema {
+                name: vector.name.clone(),
+                data_type: CoreFieldType::VectorFp32,
+                dimension: vector.dimension,
+                index_param,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    Ok(CoreCollectionSchema { fields, vectors })
 }
 
 fn parse_doc_id(id: &str) -> std::io::Result<i64> {
@@ -280,7 +299,7 @@ pub fn create_and_open(
     Ok(Collection {
         path,
         collection_name: schema.name,
-        primary_vector_name: core_schema.primary_vector,
+        primary_vector_name: core_schema.primary_vector_name().to_string(),
         option: option.unwrap_or_default(),
         db,
     })
@@ -741,6 +760,28 @@ impl PyHnswIndexParam {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "IVFIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyIVFIndexParam {
+    inner: IvfIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyIVFIndexParam {
+    #[new]
+    #[pyo3(signature = (metric_type=None, nlist=1024))]
+    fn new(metric_type: Option<String>, nlist: usize) -> PyResult<Self> {
+        Ok(Self {
+            inner: IvfIndexParam {
+                metric_type: metric_type.as_deref().map(parse_metric_type).transpose()?,
+                nlist,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "HnswQueryParam", module = "hannsdb")]
 #[derive(Clone)]
 struct PyHnswQueryParam {
@@ -781,6 +822,22 @@ impl PyFieldSchema {
             },
         })
     }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name.clone()
+    }
+
+    #[getter]
+    fn data_type(&self) -> &'static str {
+        match self.inner.data_type {
+            DataType::String => "string",
+            DataType::Int64 => "int64",
+            DataType::Float64 => "float64",
+            DataType::Bool => "bool",
+            DataType::VectorFp32 => "vector_fp32",
+        }
+    }
 }
 
 #[cfg(feature = "python-binding")]
@@ -800,9 +857,30 @@ impl PyVectorSchema {
         name: String,
         data_type: String,
         dimension: usize,
-        index_param: Option<Py<PyHnswIndexParam>>,
+        index_param: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let index_param = index_param.map(|param| param.borrow(py).inner.clone());
+        let index_param = match index_param {
+            Some(param) => {
+                let bound = param.bind(py);
+                if bound.is_instance_of::<PyHnswIndexParam>() {
+                    Some(IndexParam::Hnsw(
+                        bound
+                            .extract::<PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyIVFIndexParam>() {
+                    Some(IndexParam::Ivf(
+                        bound.extract::<PyRef<'_, PyIVFIndexParam>>()?.inner.clone(),
+                    ))
+                } else {
+                    return Err(PyValueError::new_err(
+                        "index_param must be HnswIndexParam or IVFIndexParam",
+                    ));
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             inner: VectorSchema {
                 name,
@@ -811,6 +889,27 @@ impl PyVectorSchema {
                 index_param,
             },
         })
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name.clone()
+    }
+
+    #[getter]
+    fn data_type(&self) -> &'static str {
+        match self.inner.data_type {
+            DataType::String => "string",
+            DataType::Int64 => "int64",
+            DataType::Float64 => "float64",
+            DataType::Bool => "bool",
+            DataType::VectorFp32 => "vector_fp32",
+        }
+    }
+
+    #[getter]
+    fn dimension(&self) -> usize {
+        self.inner.dimension
     }
 }
 
@@ -861,6 +960,31 @@ impl PyCollectionSchema {
                 vectors: inner_vectors,
             },
         })
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name.clone()
+    }
+
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> PyResult<Vec<Py<PyFieldSchema>>> {
+        self.inner
+            .fields
+            .iter()
+            .cloned()
+            .map(|field| Py::new(py, PyFieldSchema { inner: field }))
+            .collect()
+    }
+
+    #[getter]
+    fn vectors(&self, py: Python<'_>) -> PyResult<Vec<Py<PyVectorSchema>>> {
+        self.inner
+            .vectors
+            .iter()
+            .cloned()
+            .map(|vector| Py::new(py, PyVectorSchema { inner: vector }))
+            .collect()
     }
 }
 
@@ -1202,6 +1326,7 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyOptimizeOption>()?;
     module.add_class::<PyCollectionOption>()?;
     module.add_class::<PyHnswIndexParam>()?;
+    module.add_class::<PyIVFIndexParam>()?;
     module.add_class::<PyHnswQueryParam>()?;
     module.add_class::<PyFieldSchema>()?;
     module.add_class::<PyVectorSchema>()?;
