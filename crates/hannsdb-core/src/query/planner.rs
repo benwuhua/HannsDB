@@ -74,7 +74,7 @@ impl QueryPlanner {
                 .is_some()
         });
         let is_single_vector_fast_path =
-            context.queries.len() == 1 && context.query_by_id.is_none();
+            context.queries.len() == 1 && context.query_by_id.is_none() && filter.is_none();
         if uses_ef_search && !is_single_vector_fast_path {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

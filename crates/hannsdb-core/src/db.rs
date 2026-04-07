@@ -1269,39 +1269,8 @@ impl CollectionHandle {
         let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         let primary_index = resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
         let metric = collection_meta.metric.clone();
-        let segment_paths = self.segment_manager.segment_paths()?;
-
-        let mut records = Vec::new();
-        let mut external_ids = Vec::new();
-
-        for segment in segment_paths {
-            let segment_records =
-                load_records_or_empty(&segment.records, collection_meta.dimension)?;
-            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-            if segment_external_ids
-                .len()
-                .saturating_mul(collection_meta.dimension)
-                != segment_records.len()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "records and ids are not aligned",
-                ));
-            }
-
-            for (row_idx, vector) in segment_records
-                .chunks_exact(collection_meta.dimension)
-                .enumerate()
-            {
-                if tombstone.is_deleted(row_idx) {
-                    continue;
-                }
-                records.extend_from_slice(vector);
-                external_ids.push(segment_external_ids[row_idx]);
-            }
-        }
+        let (records, external_ids) =
+            load_shadowed_live_records(&self.segment_manager, collection_meta.dimension)?;
 
         Ok(CachedSearchState {
             records: Arc::new(records),
@@ -1341,18 +1310,6 @@ impl CollectionHandle {
                 .clone()
                 .unwrap_or_else(|| metric.clone())
                 .to_ascii_lowercase();
-            let segment_paths = self.segment_manager.segment_paths()?;
-
-            let mut live_external_ids = Vec::new();
-            for segment in segment_paths {
-                let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-                for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
-                    if !tombstone.is_deleted(row_idx) {
-                        live_external_ids.push(external_id);
-                    }
-                }
-            }
 
             match fs::read(&hnsw_path).and_then(|bytes| {
                 DefaultIndexFactory::default()
@@ -1360,25 +1317,19 @@ impl CollectionHandle {
                     .map_err(adapter_error_to_io)
             }) {
                 Ok(backend) => {
+                    let mut state = self.load_search_state()?;
                     log::info!(
                         "Loaded persisted HNSW index for '{}' from '{}'",
                         self.name,
                         hnsw_path.display()
                     );
-                    let ann_external_ids = Arc::new(live_external_ids);
-                    Ok(Some(CachedSearchState {
-                        records: Arc::new(Vec::new()),
-                        external_ids: Arc::clone(&ann_external_ids),
-                        tombstone: Arc::new(TombstoneMask::new(0)),
-                        dimension: collection_meta.dimension,
-                        metric,
-                        primary_index,
-                        optimized_ann: Some(OptimizedAnnState {
-                            backend: Arc::from(backend),
-                            ann_external_ids,
-                            metric: metric_lc,
-                        }),
-                    }))
+                    let ann_external_ids = Arc::clone(&state.external_ids);
+                    state.optimized_ann = Some(OptimizedAnnState {
+                        backend: Arc::from(backend),
+                        ann_external_ids,
+                        metric: metric_lc,
+                    });
+                    Ok(Some(state))
                 }
                 Err(e) => {
                     log::warn!(
@@ -1409,6 +1360,44 @@ impl CollectionHandle {
         *snapshot = version_set;
         Ok(())
     }
+}
+
+fn load_shadowed_live_records(
+    segment_manager: &SegmentManager,
+    dimension: usize,
+) -> io::Result<(Vec<f32>, Vec<i64>)> {
+    let mut records = Vec::new();
+    let mut external_ids = Vec::new();
+    let mut shadowed_ids = HashSet::new();
+
+    for segment in segment_manager.segment_paths()? {
+        let segment_records = load_records_or_empty(&segment.records, dimension)?;
+        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+        if segment_external_ids.len().saturating_mul(dimension) != segment_records.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "records and ids are not aligned",
+            ));
+        }
+
+        for row_idx in (0..segment_external_ids.len()).rev() {
+            let external_id = segment_external_ids[row_idx];
+            if !shadowed_ids.insert(external_id) {
+                continue;
+            }
+            if tombstone.is_deleted(row_idx) {
+                continue;
+            }
+            let start = row_idx * dimension;
+            let end = start + dimension;
+            records.extend_from_slice(&segment_records[start..end]);
+            external_ids.push(external_id);
+        }
+    }
+
+    Ok((records, external_ids))
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
