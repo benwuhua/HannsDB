@@ -103,6 +103,45 @@ def test_collection_query_routes_through_executor_and_query_context_delegate(mon
     assert [call[0] for call in calls] == ["build", "execute", "query_context"]
 
 
+def test_collection_query_accepts_legacy_vector_arguments(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def query_context(self, context):
+            calls.append(("query_context", context))
+            return ["native-result"]
+
+    class FakeExecutor:
+        def execute(self, collection, context):
+            calls.append(("execute", collection, context))
+            return collection.query_context(context)
+
+    class FakeFactory:
+        def build(self):
+            calls.append(("build", None, None))
+            return FakeExecutor()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    query = hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)
+
+    result = collection.query(vectors=query, output_fields=[], topk=1, filter="")
+
+    assert result == ["native-result"]
+    assert [call[0] for call in calls] == ["build", "execute", "query_context"]
+    _, _, context = calls[1]
+    assert context.top_k == 1
+    assert context.output_fields == []
+    assert context.filter == ""
+    assert len(context.queries) == 1
+    assert context.queries[0].field_name == "dense"
+
+
 def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
     schema = build_schema()
     calls = []
@@ -163,11 +202,6 @@ def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
             return object()
 
     monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-    monkeypatch.setattr(
-        hannsdb.Collection,
-        "_refresh_schema",
-        lambda self: calls.append(("refresh_schema", None)),
-    )
 
     collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
 
@@ -196,12 +230,32 @@ def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
         "list_scalar_indexes",
         "flush",
         "create_vector_index",
-        "refresh_schema",
         "drop_vector_index",
-        "refresh_schema",
         "create_scalar_index",
-        "refresh_schema",
         "drop_scalar_index",
-        "refresh_schema",
         "destroy",
     ]
+
+
+def test_ddl_surface_keeps_base_schema_but_indexes_are_visible_and_survive_reopen(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+    schema_before = collection.schema
+
+    collection.create_vector_index(
+        "title",
+        hannsdb.IVFIndexParam(metric_type="l2", nlist=8),
+    )
+    collection.create_scalar_index("session_id")
+
+    assert collection.schema is schema_before
+    assert [vector.name for vector in collection.schema.vectors] == ["title", "dense"]
+    assert collection.list_vector_indexes() == ["title"]
+    assert collection.list_scalar_indexes() == ["session_id"]
+
+    reopened = hannsdb.open(str(tmp_path))
+
+    assert [vector.name for vector in reopened.schema.vectors] == ["title", "dense"]
+    assert reopened.list_vector_indexes() == ["title"]
+    assert reopened.list_scalar_indexes() == ["session_id"]
+
+    collection.destroy()

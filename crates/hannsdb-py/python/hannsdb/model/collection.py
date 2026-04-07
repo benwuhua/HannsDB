@@ -18,6 +18,37 @@ def _build_query_executor(schema: CollectionSchema):
     return QueryExecutorFactory.create(schema).build()
 
 
+def _build_query_context(
+    vectors=None,
+    output_fields=None,
+    topk: int = 100,
+    filter: str | None = None,
+    include_vector: bool = False,
+    reranker=None,
+    query_by_id=None,
+    group_by=None,
+):
+    from ..model.param.vector_query import QueryContext
+
+    if vectors is None:
+        query_list = []
+    elif isinstance(vectors, (list, tuple)):
+        query_list = list(vectors)
+    else:
+        query_list = [vectors]
+
+    return QueryContext(
+        top_k=topk,
+        filter=filter,
+        output_fields=output_fields,
+        include_vector=include_vector,
+        queries=query_list,
+        query_by_id=query_by_id,
+        group_by=group_by,
+        reranker=reranker,
+    )
+
+
 def _field_data_type_name(data_type: str) -> str:
     mapping = {
         "Bool": "bool",
@@ -153,13 +184,6 @@ class Collection:
         inst._querier = _build_query_executor(schema)
         return inst
 
-    def _refresh_schema(self) -> None:
-        metadata_path = (
-            Path(self.path) / "collections" / self.collection_name / "collection.json"
-        )
-        self._schema = _schema_from_collection_metadata(metadata_path)
-        self._querier = _build_query_executor(self._schema)
-
     @property
     def path(self) -> str:
         return self._core.path
@@ -176,8 +200,39 @@ class Collection:
     def stats(self):
         return self._core.stats
 
-    def query(self, context):
-        return self._querier.execute(self, context)
+    def query(
+        self,
+        vectors=None,
+        output_fields=None,
+        topk: int = 100,
+        filter: str | None = None,
+        include_vector: bool = False,
+        reranker=None,
+        query_by_id=None,
+        group_by=None,
+        query_context=None,
+        context=None,
+    ):
+        from ..model.param.vector_query import QueryContext
+
+        if query_context is not None and context is not None:
+            raise TypeError("query() received both query_context and context")
+        if query_context is None:
+            query_context = context
+        if query_context is None and isinstance(vectors, QueryContext):
+            query_context = vectors
+        if query_context is None:
+            query_context = _build_query_context(
+                vectors=vectors,
+                output_fields=output_fields,
+                topk=topk,
+                filter=filter,
+                include_vector=include_vector,
+                reranker=reranker,
+                query_by_id=query_by_id,
+                group_by=group_by,
+            )
+        return self._querier.execute(self, query_context)
 
     def query_context(self, context):
         return self._core.query_context(context)
@@ -201,24 +256,16 @@ class Collection:
         return self._core.destroy()
 
     def create_vector_index(self, field_name, index_param=None):
-        result = self._core.create_vector_index(field_name, index_param)
-        self._refresh_schema()
-        return result
+        return self._core.create_vector_index(field_name, index_param)
 
     def drop_vector_index(self, field_name):
-        result = self._core.drop_vector_index(field_name)
-        self._refresh_schema()
-        return result
+        return self._core.drop_vector_index(field_name)
 
     def create_scalar_index(self, field_name):
-        result = self._core.create_scalar_index(field_name)
-        self._refresh_schema()
-        return result
+        return self._core.create_scalar_index(field_name)
 
     def drop_scalar_index(self, field_name):
-        result = self._core.drop_scalar_index(field_name)
-        self._refresh_schema()
-        return result
+        return self._core.drop_scalar_index(field_name)
 
     def list_vector_indexes(self):
         return self._core.list_vector_indexes()
