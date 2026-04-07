@@ -1,3 +1,31 @@
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MetricKind {
+    L2,
+    Cosine,
+    Ip,
+}
+
+impl MetricKind {
+    pub(crate) fn parse(metric: &str) -> Result<Self, AdapterError> {
+        match metric.to_ascii_lowercase().as_str() {
+            "l2" => Ok(Self::L2),
+            "cosine" => Ok(Self::Cosine),
+            "ip" => Ok(Self::Ip),
+            other => Err(AdapterError::Backend(format!(
+                "unsupported metric: {other}"
+            ))),
+        }
+    }
+
+    pub(crate) fn distance(self, query: &[f32], vector: &[f32]) -> f32 {
+        match self {
+            Self::L2 => l2_sq(query, vector),
+            Self::Cosine => cosine_distance(query, vector),
+            Self::Ip => -dot(query, vector),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterError {
     InvalidDimension { expected: usize, got: usize },
@@ -11,7 +39,7 @@ pub struct HnswSearchHit {
     pub distance: f32,
 }
 
-pub trait HnswBackend {
+pub trait VectorIndexBackend: Send + Sync {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError>;
     fn insert_flat(
         &mut self,
@@ -84,7 +112,15 @@ pub trait HnswBackend {
         }
         Ok(n)
     }
+
+    fn serialize_to_bytes(&self) -> Result<Option<Vec<u8>>, AdapterError> {
+        Ok(None)
+    }
 }
+
+pub trait HnswBackend: VectorIndexBackend {}
+
+impl<T> HnswBackend for T where T: VectorIndexBackend + ?Sized {}
 
 pub struct HnswAdapter<B> {
     backend: B,
@@ -117,4 +153,28 @@ where
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         self.backend.search(query, k, ef_search)
     }
+}
+
+fn l2_sq(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(a, b)| {
+            let d = a - b;
+            d * d
+        })
+        .sum()
+}
+
+fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).sum()
+}
+
+fn cosine_distance(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let num = dot(lhs, rhs);
+    let lhs_norm = lhs.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let rhs_norm = rhs.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if lhs_norm == 0.0 || rhs_norm == 0.0 {
+        return 1.0;
+    }
+    1.0 - (num / (lhs_norm * rhs_norm))
 }

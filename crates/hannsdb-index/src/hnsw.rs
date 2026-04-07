@@ -1,32 +1,4 @@
-use crate::adapter::{AdapterError, HnswBackend, HnswSearchHit};
-
-#[derive(Debug, Clone, Copy)]
-enum MetricKind {
-    L2,
-    Cosine,
-    Ip,
-}
-
-impl MetricKind {
-    fn parse(metric: &str) -> Result<Self, AdapterError> {
-        match metric.to_ascii_lowercase().as_str() {
-            "l2" => Ok(Self::L2),
-            "cosine" => Ok(Self::Cosine),
-            "ip" => Ok(Self::Ip),
-            other => Err(AdapterError::Backend(format!(
-                "unsupported metric: {other}"
-            ))),
-        }
-    }
-
-    fn distance(self, query: &[f32], vector: &[f32]) -> f32 {
-        match self {
-            Self::L2 => l2_sq(query, vector),
-            Self::Cosine => cosine_distance(query, vector),
-            Self::Ip => -dot(query, vector),
-        }
-    }
-}
+use crate::adapter::{AdapterError, HnswSearchHit, MetricKind, VectorIndexBackend};
 
 pub struct InMemoryHnswIndex {
     dim: usize,
@@ -45,7 +17,7 @@ impl InMemoryHnswIndex {
     }
 }
 
-impl HnswBackend for InMemoryHnswIndex {
+impl VectorIndexBackend for InMemoryHnswIndex {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError> {
         for (_, v) in vectors {
             if v.len() != self.dim {
@@ -89,30 +61,6 @@ impl HnswBackend for InMemoryHnswIndex {
     }
 }
 
-fn l2_sq(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter()
-        .zip(rhs.iter())
-        .map(|(a, b)| {
-            let d = a - b;
-            d * d
-        })
-        .sum()
-}
-
-fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).sum()
-}
-
-fn cosine_distance(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let num = dot(lhs, rhs);
-    let lhs_norm = lhs.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let rhs_norm = rhs.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if lhs_norm == 0.0 || rhs_norm == 0.0 {
-        return 1.0;
-    }
-    1.0 - (num / (lhs_norm * rhs_norm))
-}
-
 #[cfg(feature = "knowhere-backend")]
 pub struct KnowhereHnswIndex {
     dim: usize,
@@ -146,31 +94,32 @@ impl KnowhereHnswIndex {
     }
 
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, AdapterError> {
-        self.inner
-            .serialize_to_bytes()
-            .map_err(|e| AdapterError::Backend(format!("hnsw serialize failed (dim={}): {e}", self.dim)))
+        self.inner.serialize_to_bytes().map_err(|e| {
+            AdapterError::Backend(format!("hnsw serialize failed (dim={}): {e}", self.dim))
+        })
     }
 
     pub fn from_bytes(dim: usize, bytes: &[u8]) -> Result<Self, AdapterError> {
-        let inner = std::panic::catch_unwind(|| knowhere_rs::HnswIndex::deserialize_from_bytes(bytes))
-            .map_err(|_| {
-                AdapterError::Backend(format!(
-                    "hnsw deserialize panicked (dim={dim}, bytes={})",
-                    bytes.len()
-                ))
-            })?
-            .map_err(|e| {
-                AdapterError::Backend(format!(
-                    "hnsw deserialize failed (dim={dim}, bytes={}): {e}",
-                    bytes.len()
-                ))
-            })?;
+        let inner =
+            std::panic::catch_unwind(|| knowhere_rs::HnswIndex::deserialize_from_bytes(bytes))
+                .map_err(|_| {
+                    AdapterError::Backend(format!(
+                        "hnsw deserialize panicked (dim={dim}, bytes={})",
+                        bytes.len()
+                    ))
+                })?
+                .map_err(|e| {
+                    AdapterError::Backend(format!(
+                        "hnsw deserialize failed (dim={dim}, bytes={}): {e}",
+                        bytes.len()
+                    ))
+                })?;
         Ok(Self { dim, inner })
     }
 }
 
 #[cfg(feature = "knowhere-backend")]
-impl HnswBackend for KnowhereHnswIndex {
+impl VectorIndexBackend for KnowhereHnswIndex {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError> {
         for (_, v) in vectors {
             if v.len() != self.dim {
@@ -320,5 +269,9 @@ impl HnswBackend for KnowhereHnswIndex {
         self.inner
             .search_into(query, &req, ids_out, dists_out)
             .map_err(|e| AdapterError::Backend(format!("knowhere search_into failed: {e}")))
+    }
+
+    fn serialize_to_bytes(&self) -> Result<Option<Vec<u8>>, AdapterError> {
+        KnowhereHnswIndex::serialize_to_bytes(self).map(Some)
     }
 }

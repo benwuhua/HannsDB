@@ -10,4 +10,6 @@ default = []
 knowhere-backend = ["dep:knowhere-rs"]
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 knowhere-rs = { path = "../../../knowhere-rs", optional = true }

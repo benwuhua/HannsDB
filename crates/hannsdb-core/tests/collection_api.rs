@@ -12,6 +12,10 @@ use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
 use hannsdb_core::wal::{append_wal_record, WalRecord};
+use hannsdb_index::descriptor::{
+    ScalarIndexDescriptor, ScalarIndexKind, VectorIndexDescriptor, VectorIndexKind,
+};
+use serde_json::json;
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -258,7 +262,10 @@ fn collection_api_multi_segment_read_paths_use_segment_aware_loading() {
     let fetched = db
         .fetch_documents("docs", &[10, 30, 40])
         .expect("fetch across segments");
-    let fetched_ids = fetched.iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![10, 30]);
 
     let hits = db
@@ -865,5 +872,124 @@ fn collection_api_optimize_benchmark_entry() {
     println!(
         "OPT_BENCH_TIMING_MS create={} insert={} optimize={} search={} total={}",
         create_ms, insert_ms, optimize_ms, search_ms, total_ms
+    );
+}
+
+#[test]
+fn collection_api_persists_index_descriptors_across_reopen() {
+    let root = unique_temp_dir("hannsdb_collection_api_index_descriptor_persistence");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("category", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let vector_descriptor = VectorIndexDescriptor {
+        field_name: "vector".to_string(),
+        kind: VectorIndexKind::Ivf,
+        metric: Some("l2".to_string()),
+        params: json!({
+            "nlist": 8
+        }),
+    };
+    let scalar_descriptor = ScalarIndexDescriptor {
+        field_name: "category".to_string(),
+        kind: ScalarIndexKind::Inverted,
+        params: json!({
+            "tokenizer": "keyword"
+        }),
+    };
+
+    db.create_vector_index("docs", vector_descriptor.clone())
+        .expect("register vector descriptor");
+    db.create_scalar_index("docs", scalar_descriptor.clone())
+        .expect("register scalar descriptor");
+
+    assert_eq!(
+        db.list_vector_indexes("docs")
+            .expect("list vector descriptors"),
+        vec![vector_descriptor.clone()]
+    );
+    assert_eq!(
+        db.list_scalar_indexes("docs")
+            .expect("list scalar descriptors"),
+        vec![scalar_descriptor.clone()]
+    );
+    assert!(
+        root.join("collections")
+            .join("docs")
+            .join("indexes.json")
+            .exists(),
+        "index metadata file should be written"
+    );
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    assert_eq!(
+        reopened
+            .list_vector_indexes("docs")
+            .expect("list vector descriptors after reopen"),
+        vec![vector_descriptor]
+    );
+    assert_eq!(
+        reopened
+            .list_scalar_indexes("docs")
+            .expect("list scalar descriptors after reopen"),
+        vec![scalar_descriptor]
+    );
+}
+
+#[test]
+fn collection_api_drop_vector_index_keeps_other_descriptors() {
+    let root = unique_temp_dir("hannsdb_collection_api_drop_vector_index_descriptor");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("category", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "vector".to_string(),
+            kind: VectorIndexKind::Flat,
+            metric: Some("l2".to_string()),
+            params: json!({}),
+        },
+    )
+    .expect("register vector descriptor");
+    db.create_scalar_index(
+        "docs",
+        ScalarIndexDescriptor {
+            field_name: "category".to_string(),
+            kind: ScalarIndexKind::Inverted,
+            params: json!({
+                "tokenizer": "keyword"
+            }),
+        },
+    )
+    .expect("register scalar descriptor");
+
+    db.drop_vector_index("docs", "vector")
+        .expect("drop vector descriptor");
+
+    assert!(
+        db.list_vector_indexes("docs")
+            .expect("list vector descriptors")
+            .is_empty(),
+        "vector descriptor should be removed"
+    );
+    assert_eq!(
+        db.list_scalar_indexes("docs")
+            .expect("list scalar descriptors")
+            .len(),
+        1
     );
 }

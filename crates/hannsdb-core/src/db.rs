@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::adapter::{AdapterError, HnswBackend};
+use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor};
 #[cfg(feature = "knowhere-backend")]
 use hannsdb_index::hnsw::{InMemoryHnswIndex, KnowhereHnswIndex};
 
-use crate::catalog::{CollectionMetadata, ManifestMetadata};
+use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
 use crate::query::{distance_by_metric, parse_filter, search_by_metric, SearchHit};
 use crate::segment::{
@@ -21,7 +22,9 @@ use crate::segment::{
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
+#[cfg(feature = "knowhere-backend")]
 const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
+const INDEX_CATALOG_FILE: &str = "indexes.json";
 
 pub struct HannsDb {
     root: PathBuf,
@@ -59,7 +62,9 @@ struct CachedSearchState {
     tombstone: Arc<TombstoneMask>,
     dimension: usize,
     metric: String,
+    #[cfg(feature = "knowhere-backend")]
     hnsw_m: usize,
+    #[cfg(feature = "knowhere-backend")]
     hnsw_ef_construction: usize,
     #[cfg(feature = "knowhere-backend")]
     optimized_ann: Option<OptimizedAnnState>,
@@ -272,6 +277,91 @@ impl HannsDb {
         Ok(manifest.collections)
     }
 
+    pub fn create_vector_index(
+        &self,
+        collection: &str,
+        descriptor: VectorIndexDescriptor,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let metadata = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        if !metadata
+            .vectors
+            .iter()
+            .any(|vector| vector.name == descriptor.field_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "vector field '{}' is not defined in collection '{}'",
+                    descriptor.field_name, collection
+                ),
+            ));
+        }
+
+        let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        catalog.upsert_vector_index(descriptor);
+        catalog.save_to_path(&paths.index_catalog)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
+    pub fn drop_vector_index(&self, collection: &str, field_name: &str) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        if !catalog.drop_vector_index(field_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "vector index descriptor not found for field '{}' in '{}'",
+                    field_name, collection
+                ),
+            ));
+        }
+        catalog.save_to_path(&paths.index_catalog)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
+    pub fn list_vector_indexes(&self, collection: &str) -> io::Result<Vec<VectorIndexDescriptor>> {
+        let paths = self.collection_paths(collection);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        Ok(IndexCatalog::load_from_path(&paths.index_catalog)?.vector_indexes)
+    }
+
+    pub fn create_scalar_index(
+        &self,
+        collection: &str,
+        descriptor: ScalarIndexDescriptor,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let metadata = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        if !metadata
+            .fields
+            .iter()
+            .any(|field| field.name == descriptor.field_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "scalar field '{}' is not defined in collection '{}'",
+                    descriptor.field_name, collection
+                ),
+            ));
+        }
+
+        let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        catalog.upsert_scalar_index(descriptor);
+        catalog.save_to_path(&paths.index_catalog)?;
+        Ok(())
+    }
+
+    pub fn list_scalar_indexes(&self, collection: &str) -> io::Result<Vec<ScalarIndexDescriptor>> {
+        let paths = self.collection_paths(collection);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        Ok(IndexCatalog::load_from_path(&paths.index_catalog)?.scalar_indexes)
+    }
+
     pub fn flush_collection(&self, name: &str) -> io::Result<()> {
         self.open_collection_handle(name)?.flush()
     }
@@ -326,8 +416,7 @@ impl HannsDb {
                 ));
             }
 
-            let segment_paths =
-                SegmentPaths::from_segment_dir(segment_dir, segment_id.clone());
+            let segment_paths = SegmentPaths::from_segment_dir(segment_dir, segment_id.clone());
             let segment_records = load_records(&segment_paths.records, collection_meta.dimension)?;
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
@@ -996,7 +1085,8 @@ impl CollectionHandle {
         match filter.map(str::trim) {
             None | Some("") => {
                 let hits = self.search(query, top_k)?;
-                let documents = self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
+                let documents =
+                    self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
                 Ok(hits
                     .into_iter()
                     .zip(documents)
@@ -1252,7 +1342,9 @@ impl CollectionHandle {
             tombstone: Arc::new(TombstoneMask::new(0)),
             dimension: collection_meta.dimension,
             metric,
+            #[cfg(feature = "knowhere-backend")]
             hnsw_m: collection_meta.hnsw_m,
+            #[cfg(feature = "knowhere-backend")]
             hnsw_ef_construction: collection_meta.hnsw_ef_construction,
             #[cfg(feature = "knowhere-backend")]
             optimized_ann,
@@ -1300,7 +1392,9 @@ impl CollectionHandle {
                     tombstone: Arc::new(TombstoneMask::new(0)),
                     dimension: collection_meta.dimension,
                     metric,
+                    #[cfg(feature = "knowhere-backend")]
                     hnsw_m: collection_meta.hnsw_m,
+                    #[cfg(feature = "knowhere-backend")]
                     hnsw_ef_construction: collection_meta.hnsw_ef_construction,
                     optimized_ann: Some(OptimizedAnnState {
                         backend: Arc::new(backend),
@@ -1352,6 +1446,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
     CollectionPaths {
         dir: dir.clone(),
         collection_meta: dir.join("collection.json"),
+        index_catalog: dir.join(INDEX_CATALOG_FILE),
         segment_set: dir.join("segment_set.json"),
         segments_dir: dir.join("segments"),
         segment_meta: dir.join("segment.json"),
@@ -1365,6 +1460,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
 struct CollectionPaths {
     dir: PathBuf,
     collection_meta: PathBuf,
+    index_catalog: PathBuf,
     segment_set: PathBuf,
     segments_dir: PathBuf,
     segment_meta: PathBuf,

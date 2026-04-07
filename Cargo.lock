@@ -464,6 +464,8 @@ name = "hannsdb-index"
 version = "0.1.0"
 dependencies = [
  "knowhere-rs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
