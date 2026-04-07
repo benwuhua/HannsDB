@@ -67,7 +67,6 @@ pub enum SearchRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LegacySearchRequest {
     pub vector: Vec<f32>,
     pub top_k: usize,

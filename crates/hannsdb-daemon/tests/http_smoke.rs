@@ -294,6 +294,53 @@ async fn search_route_returns_bad_request_for_unsupported_typed_shape() {
 }
 
 #[tokio::test]
+async fn search_route_returns_daemon_error_envelope_for_malformed_typed_body() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":"oops",
+                        "queries":[{"field_name":"vector","vector":[0.0,0.0]}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert!(
+        json.get("error").is_some(),
+        "daemon error envelope should be returned"
+    );
+}
+
+#[tokio::test]
 async fn fetch_route_projects_selected_output_fields() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
@@ -356,6 +403,122 @@ async fn fetch_route_projects_selected_output_fields() {
         json["documents"][0]["vector"],
         serde_json::json!([0.0, 0.0])
     );
+}
+
+#[tokio::test]
+async fn fetch_route_returns_empty_fields_for_explicit_empty_output_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42"],
+                        "vectors":[[0.0,0.0]],
+                        "fields":[{"color":"red","shape":"circle"}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"output_fields":[]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"][0]["fields"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn legacy_search_route_ignores_extra_unknown_keys() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42"],"vectors":[[0.0,0.0]],"fields":[{"color":"red"}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"vector":[0.0,0.0],"top_k":1,"unexpected":"ignored"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert_eq!(json["hits"][0]["id"], "42");
 }
 
 #[tokio::test]

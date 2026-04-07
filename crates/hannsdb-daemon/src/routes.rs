@@ -3,7 +3,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{rejection::JsonRejection, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -569,8 +569,21 @@ async fn fetch_records(
 async fn search_records(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
-    Json(request): Json<SearchRequest>,
+    request: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: rejection.body_text(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
     let result = match request {
         SearchRequest::Legacy(request) => search_records_legacy(&state, &collection, request),
         SearchRequest::Typed(request) => search_records_typed(&state, &collection, request),
@@ -1063,8 +1076,8 @@ fn select_fetch_output_fields(
     output_fields: Option<&[String]>,
 ) -> BTreeMap<String, serde_json::Value> {
     match output_fields {
-        Some(names) if !names.is_empty() => select_output_fields(fields, Some(names)),
-        _ => field_values_to_json(fields.clone()),
+        Some(names) => select_output_fields(fields, Some(names)),
+        None => field_values_to_json(fields.clone()),
     }
 }
 
