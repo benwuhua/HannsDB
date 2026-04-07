@@ -404,21 +404,7 @@ impl HannsDb {
     }
 
     pub fn get_collection_info(&self, name: &str) -> io::Result<CollectionInfo> {
-        let paths = self.collection_paths(name);
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let live_count = segment_meta
-            .record_count
-            .saturating_sub(segment_meta.deleted_count);
-
-        Ok(CollectionInfo {
-            name: collection_meta.name,
-            dimension: collection_meta.dimension,
-            metric: collection_meta.metric,
-            record_count: segment_meta.record_count,
-            deleted_count: segment_meta.deleted_count,
-            live_count,
-        })
+        self.open_collection_handle(name)?.collection_info()
     }
 
     pub fn list_collection_segments(&self, name: &str) -> io::Result<Vec<CollectionSegmentInfo>> {
@@ -638,34 +624,8 @@ impl HannsDb {
         collection: &str,
         external_ids: &[i64],
     ) -> io::Result<Vec<Document>> {
-        let paths = self.collection_paths(collection);
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let records = load_records_or_empty(&paths.records, collection_meta.dimension)?;
-        let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        let payloads = load_payloads_or_empty(&paths.payloads, stored_ids.len())?;
-        let tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
-
-        if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "records and ids are not aligned",
-            ));
-        }
-
-        let mut documents = Vec::with_capacity(external_ids.len());
-        for external_id in external_ids {
-            if let Some(row_idx) = latest_live_row_index(&stored_ids, &tombstone, *external_id) {
-                let start = row_idx * collection_meta.dimension;
-                let end = start + collection_meta.dimension;
-                documents.push(Document {
-                    id: *external_id,
-                    fields: payloads[row_idx].clone(),
-                    vector: records[start..end].to_vec(),
-                });
-            }
-        }
-
-        Ok(documents)
+        self.open_collection_handle(collection)?
+            .fetch_documents(external_ids)
     }
 
     pub fn delete(&mut self, collection: &str, external_ids: &[i64]) -> io::Result<usize> {
@@ -771,25 +731,10 @@ impl HannsDb {
             return Ok(());
         }
 
-        // Backward compatibility: existing collections keep flat-file read/write.
-        // This trigger materializes segment-set metadata and directories once.
-        if paths.segment_set.exists() {
-            return Ok(());
-        }
-
-        fs::create_dir_all(&paths.segments_dir)?;
-        let mut legacy_set = crate::segment::SegmentSet::new_single("seg-000001");
-        legacy_set.rollover();
-        let version_set = VersionSet::from_segment_set(legacy_set);
-        let active_segment_id = version_set.active_segment_id().to_string();
-        for segment_id in version_set
-            .immutable_segment_ids()
-            .iter()
-            .chain(std::iter::once(&active_segment_id))
-        {
-            fs::create_dir_all(paths.segments_dir.join(segment_id))?;
-        }
-        version_set.save_to_path(&paths.segment_set)
+        let _ = (paths, segment_meta);
+        // Auto-rollover is intentionally disabled until the mutable segment
+        // writer can initialize a fully readable multi-segment layout.
+        Ok(())
     }
 
     fn replay_wal_if_needed(&mut self) -> io::Result<()> {
@@ -993,6 +938,28 @@ impl CollectionHandle {
             .clone())
     }
 
+    fn collection_info(&self) -> io::Result<CollectionInfo> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        let mut record_count = 0usize;
+        let mut deleted_count = 0usize;
+        for segment in self.segment_manager.segment_paths()? {
+            let metadata = SegmentMetadata::load_from_path(&segment.metadata)?;
+            record_count += metadata.record_count;
+            deleted_count += metadata.deleted_count;
+        }
+
+        Ok(CollectionInfo {
+            name: collection_meta.name,
+            dimension: collection_meta.dimension,
+            metric: collection_meta.metric,
+            record_count,
+            deleted_count,
+            live_count: record_count.saturating_sub(deleted_count),
+        })
+    }
+
     fn flush(&self) -> io::Result<()> {
         let paths = self.collection_paths();
         let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
@@ -1047,28 +1014,38 @@ impl CollectionHandle {
     fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let records = load_records_or_empty(&paths.records, collection_meta.dimension)?;
-        let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        let payloads = load_payloads_or_empty(&paths.payloads, stored_ids.len())?;
-        let tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
-
-        if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "records and ids are not aligned",
-            ));
-        }
-
         let mut documents = Vec::with_capacity(external_ids.len());
+
         for external_id in external_ids {
-            if let Some(row_idx) = latest_live_row_index(&stored_ids, &tombstone, *external_id) {
-                let start = row_idx * collection_meta.dimension;
-                let end = start + collection_meta.dimension;
-                documents.push(Document {
-                    id: *external_id,
-                    fields: payloads[row_idx].clone(),
-                    vector: records[start..end].to_vec(),
-                });
+            let mut found = None;
+            for segment in self.segment_manager.segment_paths()? {
+                let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+                let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+                let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+                if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "records and ids are not aligned",
+                    ));
+                }
+
+                if let Some(row_idx) = latest_live_row_index(&stored_ids, &tombstone, *external_id)
+                {
+                    let start = row_idx * collection_meta.dimension;
+                    let end = start + collection_meta.dimension;
+                    found = Some(Document {
+                        id: *external_id,
+                        fields: payloads[row_idx].clone(),
+                        vector: records[start..end].to_vec(),
+                    });
+                    break;
+                }
+            }
+
+            if let Some(document) = found {
+                documents.push(document);
             }
         }
 

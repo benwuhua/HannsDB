@@ -209,6 +209,105 @@ fn collection_api_filter_query_respects_cross_segment_tombstones() {
 }
 
 #[test]
+fn collection_api_multi_segment_read_paths_use_segment_aware_loading() {
+    let root = unique_temp_dir("hannsdb_collection_api_multi_segment_reads");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let first_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![1.0_f32, 1.0],
+        ),
+    ];
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let second_docs = vec![
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(3))],
+            vec![0.1_f32, 0.0],
+        ),
+        Document::new(
+            40,
+            vec![("group".to_string(), FieldValue::Int64(4))],
+            vec![0.2_f32, 0.0],
+        ),
+    ];
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[1]);
+
+    let info = db.get_collection_info("docs").expect("collection info");
+    assert_eq!(info.record_count, 4);
+    assert_eq!(info.deleted_count, 1);
+    assert_eq!(info.live_count, 3);
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 30, 40])
+        .expect("fetch across segments");
+    let fetched_ids = fetched.iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![10, 30]);
+
+    let hits = db
+        .query_documents("docs", &[0.0_f32, 0.0], 3, None)
+        .expect("unfiltered query across segments");
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![10, 30, 20]);
+}
+
+#[test]
+fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layout() {
+    let root = unique_temp_dir("hannsdb_collection_api_rollover_guard");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+
+    let to_delete: Vec<i64> = (0..21).collect();
+    let deleted = db.delete("docs", &to_delete).expect("delete docs");
+    assert_eq!(deleted, 21);
+
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("follow-up insert after rollover threshold");
+
+    assert!(
+        !root
+            .join("collections")
+            .join("docs")
+            .join("segment_set.json")
+            .exists(),
+        "incomplete auto-rollover must stay disabled"
+    );
+
+    let info = db.get_collection_info("docs").expect("collection info");
+    assert_eq!(info.record_count, 101);
+    assert_eq!(info.deleted_count, 21);
+    assert_eq!(info.live_count, 80);
+
+    let hits = db
+        .search("docs", &[0.0_f32, 0.0], 3)
+        .expect("search after rollover-eligible sequence");
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![200, 21, 22]);
+}
+
+#[test]
 fn collection_api_delete_masks_results() {
     let root = unique_temp_dir("hannsdb_collection_api_delete");
     let mut db = HannsDb::open(&root).expect("open db");
