@@ -45,6 +45,11 @@ def build_schema():
     )
 
 
+class ConstantReprIndexParam:
+    def __repr__(self):
+        return "<constant-repr-index-param>"
+
+
 def test_collection_schema_accepts_old_positional_vector_schema():
     title = hannsdb.VectorSchema(
         name="title",
@@ -143,6 +148,30 @@ def test_create_and_open_accepts_pure_python_schema_and_reopens_as_wrappers(tmp_
     collection.destroy()
 
 
+def test_vector_and_collection_schema_do_not_use_index_param_repr_for_equality_or_hash():
+    left = hannsdb.VectorSchema(
+        name="dense",
+        data_type="vector_fp32",
+        dimension=384,
+        index_param=ConstantReprIndexParam(),
+    )
+    right = hannsdb.VectorSchema(
+        name="dense",
+        data_type="vector_fp32",
+        dimension=384,
+        index_param=ConstantReprIndexParam(),
+    )
+
+    assert left != right
+    assert len({left, right}) == 2
+
+    left_collection = hannsdb.CollectionSchema("docs", vectors=[left])
+    right_collection = hannsdb.CollectionSchema("docs", vectors=[right])
+
+    assert left_collection != right_collection
+    assert len({left_collection, right_collection}) == 2
+
+
 def test_create_and_open_accepts_legacy_native_schema_input(tmp_path):
     schema = hannsdb._native.CollectionSchema(
         name="docs",
@@ -161,6 +190,43 @@ def test_create_and_open_accepts_legacy_native_schema_input(tmp_path):
     assert isinstance(collection.schema, hannsdb.CollectionSchema)
     assert collection.schema.name == "docs"
     assert collection.schema.vector("dense").dimension == 384
+
+    collection.destroy()
+
+
+def test_open_recovers_legacy_dimension_style_collection_json(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+
+    legacy_metadata = {
+        "format_version": 1,
+        "name": "docs",
+        "primary_vector": "dense",
+        "fields": [
+            {
+                "name": "session_id",
+                "data_type": "String",
+                "nullable": False,
+                "array": False,
+            }
+        ],
+        "dimension": 384,
+        "metric": "cosine",
+        "hnsw_m": 32,
+        "hnsw_ef_construction": 128,
+    }
+    (
+        tmp_path
+        / "collections"
+        / "docs"
+        / "collection.json"
+    ).write_text(json.dumps(legacy_metadata))
+
+    reopened = hannsdb.open(str(tmp_path))
+
+    assert reopened.schema.name == "docs"
+    assert reopened.schema.primary_vector == "dense"
+    assert [field.name for field in reopened.schema.fields] == ["session_id"]
+    assert reopened.schema.vector("dense").dimension == 384
 
     collection.destroy()
 

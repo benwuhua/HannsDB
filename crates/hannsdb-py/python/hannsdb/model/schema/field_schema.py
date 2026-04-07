@@ -131,9 +131,3 @@ class VectorSchema:
             f"name={self.name!r}, data_type={self.data_type!r}, "
             f"dimension={self.dimension!r}, index_param={self.index_param!r})"
         )
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, VectorSchema) and self._as_tuple() == other._as_tuple()
-
-    def __hash__(self) -> int:
-        return hash(self._as_tuple())

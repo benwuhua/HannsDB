@@ -101,9 +101,3 @@ class CollectionSchema:
             f"name={self.name!r}, primary_vector={self.primary_vector!r}, "
             f"fields={list(self._fields)!r}, vectors={list(self._vectors)!r})"
         )
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, CollectionSchema) and self._as_tuple() == other._as_tuple()
-
-    def __hash__(self) -> int:
-        return hash(self._as_tuple())
