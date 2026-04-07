@@ -1,4 +1,5 @@
 import hannsdb
+import pytest
 
 
 def build_schema():
@@ -140,6 +141,43 @@ def test_collection_query_accepts_legacy_vector_arguments(monkeypatch):
     assert context.filter == ""
     assert len(context.queries) == 1
     assert context.queries[0].field_name == "dense"
+
+
+def test_collection_query_accepts_pure_python_vector_query_with_numpy_input(tmp_path):
+    np = pytest.importorskip("numpy")
+
+    schema = build_schema()
+    collection = hannsdb.Collection._from_core(
+        type(
+            "FakeCore",
+            (),
+            {
+                "path": "/tmp/hannsdb",
+                "collection_name": "docs",
+                "query_context": lambda self, context: ["native-result"],
+            },
+        )(),
+        schema=schema,
+    )
+    collection._querier = type(
+        "FakeExecutor",
+        (),
+        {
+            "execute": lambda self, core_collection, context: core_collection.query_context(
+                context
+            )
+        },
+    )()
+
+    query = hannsdb.VectorQuery(
+        field_name="dense",
+        vector=np.array([[0.0, 0.0]], dtype=np.float32),
+        param=None,
+    )
+
+    result = collection.query(vectors=query, output_fields=[], topk=1, filter="")
+
+    assert result == ["native-result"]
 
 
 def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):

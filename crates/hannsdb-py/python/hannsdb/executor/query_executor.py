@@ -10,7 +10,7 @@ from ..model.param.vector_query import QueryContext
 from ..model.schema.collection_schema import CollectionSchema
 
 
-@dataclass(slots=True)
+@dataclass
 class QueryExecutor:
     schema: CollectionSchema
 
@@ -96,7 +96,7 @@ class QueryExecutor:
         return context.reranker.rerank(query_results)
 
 
-@dataclass(slots=True)
+@dataclass
 class QueryExecutorFactory:
     schema: CollectionSchema
 

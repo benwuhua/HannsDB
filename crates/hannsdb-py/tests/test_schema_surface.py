@@ -1,4 +1,5 @@
 import json
+import dataclasses
 from pathlib import Path
 
 import hannsdb
@@ -49,6 +50,21 @@ def test_collection_schema_accepts_old_positional_vector_schema():
 
     assert schema.primary_vector == "title"
     assert [vector.name for vector in schema.vectors] == ["title"]
+
+
+def test_vector_query_is_a_pure_python_dataclass_and_flattens_numpy_arrays():
+    np = pytest.importorskip("numpy")
+
+    assert dataclasses.is_dataclass(hannsdb.VectorQuery)
+
+    query = hannsdb.VectorQuery(
+        field_name="dense",
+        vector=np.array([[1, 2], [3, 4]], dtype=np.float32),
+        param=None,
+    )
+
+    assert query.field_name == "dense"
+    assert query.vector == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_create_and_open_accepts_primary_ivf_index(tmp_path):

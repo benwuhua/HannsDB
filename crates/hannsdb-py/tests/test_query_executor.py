@@ -113,6 +113,22 @@ def test_query_context_accepts_queries_shape():
     assert context.queries
 
 
+def test_query_context_accepts_legacy_native_vector_query(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    legacy_query = hannsdb._native.VectorQuery(
+        field_name="dense",
+        vector=[0.0, 0.0],
+        param=None,
+    )
+    context = hannsdb.QueryContext(queries=[legacy_query])
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["1", "2", "3"]
+
+
 def test_query_context_normalizes_scalar_output_fields_and_query_by_id():
     context = hannsdb.QueryContext(
         output_fields="group",

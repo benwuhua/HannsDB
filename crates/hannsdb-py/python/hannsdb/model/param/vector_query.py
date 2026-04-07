@@ -1,18 +1,58 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
-from ..._native import VectorQuery
 from ...extension.rerank_function import ReRanker
 
 
-@dataclass(slots=True)
+def _flatten_vector(value: Any):
+    if isinstance(value, (str, bytes, bytearray, dict)):
+        raise TypeError("vector must be a sequence of numbers")
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flatten_vector(item)
+        return
+
+    try:
+        iterator = iter(value)
+    except TypeError:
+        yield value
+        return
+
+    for item in iterator:
+        yield from _flatten_vector(item)
+
+
+def _normalize_vector(vector: Any) -> list[float]:
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover - numpy is optional at runtime
+        np = None
+
+    if np is not None and isinstance(vector, np.ndarray):
+        return [float(item) for item in np.asarray(vector).reshape(-1).tolist()]
+
+    return [float(item) for item in _flatten_vector(vector)]
+
+
+@dataclass
+class VectorQuery:
+    field_name: str
+    vector: Any
+    param: Optional[Any] = None
+
+    def __post_init__(self) -> None:
+        self.vector = _normalize_vector(self.vector)
+
+
+@dataclass
 class QueryGroupBy:
     field_name: str
 
 
-@dataclass(slots=True)
+@dataclass
 class QueryContext:
     top_k: int = 10
     filter: Optional[str] = None

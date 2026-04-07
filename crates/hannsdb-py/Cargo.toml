@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hannsdb-core = { path = "../hannsdb-core" }
-pyo3 = { version = "0.23", features = ["abi3-py39", "auto-initialize"], optional = true }
+pyo3 = { version = "0.23", features = ["abi3-py39", "auto-initialize", "extension-module"], optional = true }
 numpy = { version = "0.23", optional = true }
 
 [dev-dependencies]

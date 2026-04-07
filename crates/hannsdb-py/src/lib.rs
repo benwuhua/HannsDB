@@ -281,6 +281,27 @@ fn parse_query_ids(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<
 }
 
 #[cfg(feature = "python-binding")]
+fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery> {
+    let field_name = query.getattr("field_name")?.extract::<String>()?;
+    let vector = query.getattr("vector")?.extract::<Vec<f32>>()?;
+    let param = query.getattr("param")?;
+    let param = if param.is_none() {
+        None
+    } else {
+        Some(HnswQueryParam {
+            ef: param.getattr("ef")?.extract::<usize>()?,
+            is_using_refiner: false,
+        })
+    };
+
+    Ok(VectorQuery {
+        field_name,
+        vector,
+        param,
+    })
+}
+
+#[cfg(feature = "python-binding")]
 fn py_query_context_to_core(
     py: Python<'_>,
     context: &Bound<'_, PyAny>,
@@ -290,19 +311,13 @@ fn py_query_context_to_core(
     let query_objects: Vec<Py<PyAny>> = queries.extract()?;
     let mut core_queries = Vec::with_capacity(query_objects.len());
     for query_object in query_objects {
-        let py_query = query_object
-            .bind(py)
-            .extract::<PyRef<'_, PyVectorQuery>>()?;
+        let query = py_vector_query_from_pyany(&query_object.bind(py))?;
         core_queries.push(CoreVectorQuery {
-            field_name: py_query.inner.field_name.clone(),
-            vector: py_query.inner.vector.clone(),
-            param: py_query
-                .inner
-                .param
-                .as_ref()
-                .map(|param| CoreVectorQueryParam {
-                    ef_search: Some(param.ef),
-                }),
+            field_name: query.field_name,
+            vector: query.vector,
+            param: query.param.map(|param| CoreVectorQueryParam {
+                ef_search: Some(param.ef),
+            }),
         });
     }
 
@@ -1054,6 +1069,16 @@ impl PyHnswQueryParam {
             },
         }
     }
+
+    #[getter]
+    fn ef(&self) -> usize {
+        self.inner.ef
+    }
+
+    #[getter]
+    fn is_using_refiner(&self) -> bool {
+        self.inner.is_using_refiner
+    }
 }
 
 #[cfg(feature = "python-binding")]
@@ -1483,14 +1508,12 @@ impl PyCollection {
     fn query(
         &self,
         py: Python<'_>,
-        vectors: Py<PyVectorQuery>,
+        vectors: Bound<'_, PyAny>,
         output_fields: Option<Vec<String>>,
         topk: usize,
         filter: Option<String>,
     ) -> PyResult<Vec<Py<PyDoc>>> {
-        let borrowed = vectors.borrow(py);
-        let vectors = borrowed.inner.clone();
-        drop(borrowed);
+        let vectors = py_vector_query_from_pyany(&vectors)?;
         let inner = self.inner_ref()?;
         let empty_output_fields = output_fields
             .as_ref()
