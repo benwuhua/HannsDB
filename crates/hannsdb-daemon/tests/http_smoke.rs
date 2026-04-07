@@ -522,6 +522,55 @@ async fn legacy_search_route_ignores_extra_unknown_keys() {
 }
 
 #[tokio::test]
+async fn search_route_rejects_mixed_legacy_and_typed_body_shapes() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "vector":[0.0,0.0],
+                        "top_k":1,
+                        "queries":[{"field_name":"vector","vector":[0.0,0.0]}],
+                        "include_vector":true
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert!(
+        json.get("error").is_some(),
+        "daemon error envelope should be returned"
+    );
+}
+
+#[tokio::test]
 async fn collections_list_and_drop_flow_works() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

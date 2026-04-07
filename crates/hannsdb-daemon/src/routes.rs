@@ -569,7 +569,7 @@ async fn fetch_records(
 async fn search_records(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
-    request: Result<Json<SearchRequest>, JsonRejection>,
+    request: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let request = match request {
         Ok(Json(request)) => request,
@@ -581,6 +581,12 @@ async fn search_records(
                 }),
             )
                 .into_response()
+        }
+    };
+    let request = match classify_search_request(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
         }
     };
 
@@ -620,6 +626,37 @@ async fn search_records(
         )
             .into_response(),
     }
+}
+
+fn classify_search_request(payload: serde_json::Value) -> Result<SearchRequest, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "search request body must be a JSON object".to_string())?;
+
+    let has_legacy_marker = object.contains_key("vector");
+    let has_typed_marker = [
+        "queries",
+        "query_by_id",
+        "include_vector",
+        "group_by",
+        "reranker",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key));
+
+    if has_legacy_marker && has_typed_marker {
+        return Err("search request body cannot mix legacy and typed query keys".to_string());
+    }
+
+    if has_legacy_marker {
+        return serde_json::from_value::<LegacySearchRequest>(payload)
+            .map(SearchRequest::Legacy)
+            .map_err(|error| error.to_string());
+    }
+
+    serde_json::from_value::<TypedSearchRequest>(payload)
+        .map(SearchRequest::Typed)
+        .map_err(|error| error.to_string())
 }
 
 fn search_records_legacy(
