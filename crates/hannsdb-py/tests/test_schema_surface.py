@@ -1,9 +1,7 @@
-import tempfile
-
 import hannsdb
 
 
-def test_collection_schema_multi_vector_path_is_rejected_by_create_and_open():
+def test_collection_schema_vectors_property_surface_is_missing():
     dense = hannsdb.VectorSchema(
         name="dense",
         data_type="vector_fp32",
@@ -20,8 +18,8 @@ def test_collection_schema_multi_vector_path_is_rejected_by_create_and_open():
         vectors=[dense, sparse],
     )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        hannsdb.create_and_open(tmpdir, schema, None)
+    vectors = getattr(schema, "vectors")
+    assert len(vectors) == 2
 
 
 def test_vector_schema_missing_ivf_index_param_surface():

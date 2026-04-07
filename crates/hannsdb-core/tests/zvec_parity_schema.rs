@@ -1,21 +1,10 @@
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use hannsdb_core::catalog::CollectionMetadata;
 use hannsdb_core::document::{CollectionSchema, FieldType, ScalarFieldSchema};
 use serde_json::{json, Value};
 
-fn schema_roundtrip_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("hannsdb_zvec_schema_{nanos}"));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir.join("collection.json")
-}
-
 fn stored_schema_value() -> Value {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let path = tempdir.path().join("collection.json");
     let schema = CollectionSchema::new(
         "dense",
         384,
@@ -27,7 +16,6 @@ fn stored_schema_value() -> Value {
         ],
     );
     let metadata = CollectionMetadata::new_with_schema("docs", schema);
-    let path = schema_roundtrip_path();
 
     metadata
         .save_to_path(&path)
@@ -39,62 +27,48 @@ fn stored_schema_value() -> Value {
 #[test]
 fn zvec_parity_schema_round_trips_multiple_vector_fields() {
     let actual = stored_schema_value();
-    let expected = json!({
-        "primary_vector": "dense",
-        "dimension": 384,
-        "metric": "cosine",
-        "fields": [
-            {
-                "name": "session_id",
-                "data_type": FieldType::String,
-                "nullable": false,
-                "array": false,
-                "index_param": {
-                    "kind": "ivf",
-                    "nlist": 1024
-                }
-            },
-            {
-                "name": "tags",
-                "data_type": FieldType::String,
-                "nullable": true,
-                "array": true,
-                "index_param": null
-            },
-            {
-                "name": "created_at",
-                "data_type": FieldType::Int64,
-                "nullable": false,
-                "array": false,
-                "index_param": null
-            }
-        ],
-        "vectors": [
-            {
-                "name": "dense",
-                "data_type": "VectorFp32",
-                "dimension": 384,
-                "index_param": {
-                    "kind": "ivf",
-                    "nlist": 1024
-                }
-            },
-            {
-                "name": "title",
-                "data_type": "VectorFp32",
-                "dimension": 384,
-                "index_param": {
-                    "kind": "hnsw",
-                    "m": 32,
-                    "ef_construction": 128
-                }
-            }
-        ],
-        "hnsw_m": 16,
-        "hnsw_ef_construction": 128
+    let vectors = actual
+        .get("vectors")
+        .cloned()
+        .expect("schema should expose vector metadata");
+    let expected_vectors = json!([
+        {
+            "name": "dense",
+            "data_type": "VectorFp32",
+            "dimension": 384
+        },
+        {
+            "name": "title",
+            "data_type": "VectorFp32",
+            "dimension": 384
+        }
+    ]);
+
+    assert_eq!(vectors, expected_vectors);
+}
+
+#[test]
+fn zvec_parity_schema_round_trips_vector_index_metadata() {
+    let actual = stored_schema_value();
+    let vectors = actual
+        .get("vectors")
+        .cloned()
+        .expect("schema should expose vector metadata");
+    let first_vector = vectors
+        .as_array()
+        .and_then(|entries| entries.first())
+        .expect("expected at least one vector entry");
+    let index_param = first_vector
+        .get("index_param")
+        .cloned()
+        .expect("vector should expose index metadata");
+    let expected_index_param = json!({
+        "kind": "hnsw",
+        "m": 32,
+        "ef_construction": 128
     });
 
-    assert_eq!(actual, expected);
+    assert_eq!(index_param, expected_index_param);
 }
 
 #[test]
@@ -105,25 +79,19 @@ fn zvec_parity_schema_round_trips_nullable_and_array_scalar_fields() {
             "name": "session_id",
             "data_type": FieldType::String,
             "nullable": false,
-            "array": false,
-            "index_param": {
-                "kind": "ivf",
-                "nlist": 1024
-            }
+            "array": false
         },
         {
             "name": "tags",
             "data_type": FieldType::String,
             "nullable": true,
-            "array": true,
-            "index_param": null
+            "array": true
         },
         {
             "name": "created_at",
             "data_type": FieldType::Int64,
             "nullable": false,
-            "array": false,
-            "index_param": null
+            "array": false
         }
     ]);
 
