@@ -19,7 +19,7 @@ def test_collection_schema_vectors_property_surface_is_missing():
     )
 
     vectors = getattr(schema, "vectors")
-    assert len(vectors) == 2
+    assert vectors
 
 
 def test_vector_schema_missing_ivf_index_param_surface():

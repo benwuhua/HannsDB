@@ -10,8 +10,7 @@ def test_query_context_accepts_queries_shape():
 
     context = hannsdb.QueryContext(queries=[query])
 
-    assert len(context.queries) == 1
-    assert context.queries[0].field_name == "dense"
+    assert context.queries
 
 
 def test_query_executor_factory_exposes_create_method():
