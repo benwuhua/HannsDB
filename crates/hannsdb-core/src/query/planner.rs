@@ -6,7 +6,21 @@ use crate::document::Document;
 use super::{parse_filter, FilterExpr, QueryContext, VectorQuery};
 
 #[derive(Debug, Clone)]
-pub(crate) struct QueryPlan {
+pub(crate) enum QueryPlan {
+    LegacySingleVector(LegacySingleVectorPlan),
+    BruteForce(BruteForceQueryPlan),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LegacySingleVectorPlan {
+    pub(crate) top_k: usize,
+    pub(crate) filter: Option<String>,
+    pub(crate) vector: Vec<f32>,
+    pub(crate) ef_search: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BruteForceQueryPlan {
     pub(crate) top_k: usize,
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) recall_sources: Vec<PlannedRecallSource>,
@@ -45,14 +59,57 @@ impl QueryPlanner {
             ));
         }
 
-        let filter = match context.filter.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(filter) => Some(parse_filter(filter)?),
-        };
+        let filter = context
+            .filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|filter| !filter.is_empty())
+            .map(str::to_owned);
+
+        let uses_ef_search = context.queries.iter().any(|query| {
+            query
+                .param
+                .as_ref()
+                .and_then(|param| param.ef_search)
+                .is_some()
+        });
+        let is_single_vector_fast_path =
+            context.queries.len() == 1 && context.query_by_id.is_none();
+        if uses_ef_search && !is_single_vector_fast_path {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "vector query param ef_search is only supported on the typed single-vector fast path",
+            ));
+        }
+
+        if is_single_vector_fast_path {
+            let query = &context.queries[0];
+            validate_vector_query(collection, query, true)?;
+            if filter.is_some()
+                && query
+                    .param
+                    .as_ref()
+                    .and_then(|param| param.ef_search)
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "vector query param ef_search is not supported with filtered typed single-vector fast path queries",
+                ));
+            }
+            return Ok(QueryPlan::LegacySingleVector(LegacySingleVectorPlan {
+                top_k: context.top_k,
+                filter,
+                vector: query.vector.clone(),
+                ef_search: query.param.as_ref().and_then(|param| param.ef_search),
+            }));
+        }
+
+        let filter = filter.as_deref().map(parse_filter).transpose()?;
 
         let mut recall_sources = Vec::new();
         for query in &context.queries {
-            validate_vector_query(collection, query)?;
+            validate_vector_query(collection, query, false)?;
             recall_sources.push(PlannedRecallSource {
                 kind: RecallSourceKind::ExplicitVector {
                     field_name: query.field_name.clone(),
@@ -101,19 +158,24 @@ impl QueryPlanner {
             ));
         }
 
-        Ok(QueryPlan {
+        Ok(QueryPlan::BruteForce(BruteForceQueryPlan {
             top_k: context.top_k,
             filter,
             recall_sources,
-        })
+        }))
     }
 }
 
-fn validate_vector_query(collection: &CollectionMetadata, query: &VectorQuery) -> io::Result<()> {
-    if query
-        .param
-        .as_ref()
-        .is_some_and(|param| param.ef_search.is_some())
+fn validate_vector_query(
+    collection: &CollectionMetadata,
+    query: &VectorQuery,
+    allow_ef_search: bool,
+) -> io::Result<()> {
+    if !allow_ef_search
+        && query
+            .param
+            .as_ref()
+            .is_some_and(|param| param.ef_search.is_some())
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,

@@ -12,8 +12,8 @@ use hannsdb_index::factory::DefaultIndexFactory;
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
 use crate::query::{
-    distance_by_metric, parse_filter, search_by_metric, QueryContext, QueryExecutor, QueryPlanner,
-    SearchHit,
+    distance_by_metric, parse_filter, search_by_metric, QueryContext, QueryExecutor, QueryPlan,
+    QueryPlanner, SearchHit,
 };
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
@@ -1009,7 +1009,17 @@ impl CollectionHandle {
             None => Vec::new(),
         };
         let plan = QueryPlanner::build(&collection_meta, context, &query_by_id_documents)?;
-        QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)
+        match plan {
+            QueryPlan::LegacySingleVector(plan) => self.query_documents_with_ef(
+                &plan.vector,
+                plan.top_k,
+                plan.filter.as_deref(),
+                plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
+            ),
+            QueryPlan::BruteForce(plan) => {
+                QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)
+            }
+        }
     }
 
     pub fn optimize(&self) -> io::Result<()> {
@@ -1108,9 +1118,19 @@ impl CollectionHandle {
         top_k: usize,
         filter: Option<&str>,
     ) -> io::Result<Vec<DocumentHit>> {
+        self.query_documents_with_ef(query, top_k, filter, DEFAULT_EF_SEARCH)
+    }
+
+    fn query_documents_with_ef(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&str>,
+        ef_search: usize,
+    ) -> io::Result<Vec<DocumentHit>> {
         match filter.map(str::trim) {
             None | Some("") => {
-                let hits = self.search(query, top_k)?;
+                let hits = self.search_with_ef(query, top_k, ef_search)?;
                 let documents =
                     self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
                 Ok(hits

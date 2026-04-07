@@ -8,7 +8,7 @@ use crate::db::DocumentHit;
 use crate::document::FieldValue;
 use crate::segment::{load_payloads, load_record_ids, load_records, SegmentManager, TombstoneMask};
 
-use super::planner::QueryPlan;
+use super::planner::BruteForceQueryPlan;
 use super::search::distance_by_metric;
 
 pub(crate) struct QueryExecutor;
@@ -17,7 +17,7 @@ impl QueryExecutor {
     pub(crate) fn execute(
         segment_manager: &SegmentManager,
         collection: &CollectionMetadata,
-        plan: &QueryPlan,
+        plan: &BruteForceQueryPlan,
     ) -> io::Result<Vec<DocumentHit>> {
         if plan.top_k == 0 {
             return Ok(Vec::new());
@@ -76,7 +76,7 @@ impl QueryExecutor {
     }
 }
 
-fn best_distance(plan: &QueryPlan, vector: &[f32], metric: &str) -> io::Result<f32> {
+fn best_distance(plan: &BruteForceQueryPlan, vector: &[f32], metric: &str) -> io::Result<f32> {
     let mut best = None;
     for source in &plan.recall_sources {
         let _ = &source.kind;

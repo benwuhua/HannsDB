@@ -352,7 +352,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
                     vector: vec![0.0_f32, 0.0],
                     param: None,
                 }],
-                query_by_id: None,
+                query_by_id: Some(vec![8]),
                 filter: None,
                 group_by: None,
                 reranker: None,
@@ -429,7 +429,7 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
                     vector: vec![0.0_f32, 0.0],
                     param: None,
                 }],
-                query_by_id: None,
+                query_by_id: Some(vec![8]),
                 filter: None,
                 group_by: None,
                 reranker: None,
@@ -507,17 +507,31 @@ fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombsto
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_non_default_vector_query_params() {
-    let root = unique_temp_dir("hannsdb_typed_query_params");
+fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path() {
+    let root = unique_temp_dir("hannsdb_typed_query_single_vector_ef_search");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
         .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(1, [], vec![0.0_f32, 0.0]),
+            Document::new(2, [], vec![0.2_f32, 0.0]),
+            Document::new(3, [], vec![0.1_f32, 0.0]),
+            Document::new(4, [], vec![5.0_f32, 5.0]),
+        ],
+    )
+    .expect("insert documents");
 
-    let err = db
+    let legacy_hits = db
+        .search_with_ef("docs", &[0.0_f32, 0.0], 3, 64)
+        .expect("legacy search_with_ef");
+
+    let typed_hits = db
         .query_with_context(
             "docs",
             &QueryContext {
-                top_k: 1,
+                top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
                     vector: vec![0.0_f32, 0.0],
@@ -531,7 +545,52 @@ fn zvec_parity_query_context_rejects_non_default_vector_query_params() {
                 reranker: None,
             },
         )
-        .expect_err("non-default vector query params should be rejected");
+        .expect("typed query should reuse the legacy single-vector path");
+
+    assert_eq!(
+        typed_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        legacy_hits.iter().map(|hit| hit.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        typed_hits
+            .iter()
+            .map(|hit| hit.distance)
+            .collect::<Vec<_>>(),
+        legacy_hits
+            .iter()
+            .map(|hit| hit.distance)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
+    let root = unique_temp_dir("hannsdb_typed_query_params");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert_documents("docs", &[Document::new(7, [], vec![0.0_f32, 0.0])])
+        .expect("insert documents");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: Some(vec![7]),
+                filter: None,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("mixed query_by_id + ef_search should be rejected");
 
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("ef_search"));
