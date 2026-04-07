@@ -15,7 +15,8 @@ use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema}
 use crate::query::{distance_by_metric, parse_filter, search_by_metric, SearchHit};
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
-    load_records, SegmentMetadata, SegmentSet, TombstoneMask,
+    load_records, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
+    VersionSet,
 };
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
@@ -24,7 +25,7 @@ const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 
 pub struct HannsDb {
     root: PathBuf,
-    search_cache: Mutex<HashMap<String, CachedSearchState>>,
+    collection_handles: Mutex<HashMap<String, Arc<CollectionHandle>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,12 @@ struct OptimizedAnnState {
     metric: String,
 }
 
+pub struct CollectionHandle {
+    name: String,
+    root: PathBuf,
+    search_cache: Mutex<Option<CachedSearchState>>,
+}
+
 impl HannsDb {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
@@ -85,10 +92,26 @@ impl HannsDb {
 
         let mut db = Self {
             root: root.to_path_buf(),
-            search_cache: Mutex::new(HashMap::new()),
+            collection_handles: Mutex::new(HashMap::new()),
         };
         db.replay_wal_if_needed()?;
         Ok(db)
+    }
+
+    pub fn open_collection_handle(&self, name: &str) -> io::Result<Arc<CollectionHandle>> {
+        let mut handles = self
+            .collection_handles
+            .lock()
+            .expect("collection handles mutex poisoned");
+        if let Some(handle) = handles.get(name) {
+            return Ok(Arc::clone(handle));
+        }
+
+        let paths = self.collection_paths(name);
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let handle = Arc::new(CollectionHandle::new(name.to_string(), self.root.clone()));
+        handles.insert(name.to_string(), Arc::clone(&handle));
+        Ok(handle)
     }
 
     pub fn create_collection(
@@ -212,6 +235,10 @@ impl HannsDb {
         let mut manifest = ManifestMetadata::load_from_path(&manifest_path(&self.root))?;
         manifest.collections.retain(|entry| entry != name);
         manifest.save_to_path(&manifest_path(&self.root))?;
+        self.collection_handles
+            .lock()
+            .expect("collection handles mutex poisoned")
+            .remove(name);
         self.invalidate_search_cache(name);
         Ok(())
     }
@@ -222,40 +249,11 @@ impl HannsDb {
     }
 
     pub fn flush_collection(&self, name: &str) -> io::Result<()> {
-        let paths = self.collection_paths(name);
-        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
-        let _ = load_wal_records(&wal_path(&self.root))?;
-        Ok(())
+        self.open_collection_handle(name)?.flush()
     }
 
     pub fn optimize_collection(&self, name: &str) -> io::Result<()> {
-        let state = self.load_search_state(name)?;
-        #[cfg(feature = "knowhere-backend")]
-        let mut state = state;
-        #[cfg(feature = "knowhere-backend")]
-        {
-            let mut hnsw_bytes = None;
-            state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
-            if let Some(bytes) = hnsw_bytes {
-                let paths = self.collection_paths(name);
-                if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
-                    log::warn!("Failed to persist HNSW index: {e}");
-                } else {
-                    log::info!(
-                        "Persisted HNSW index ({} bytes) for collection '{name}'",
-                        bytes.len()
-                    );
-                }
-            }
-        }
-        let mut cache = self
-            .search_cache
-            .lock()
-            .expect("search cache mutex poisoned");
-        cache.insert(name.to_string(), state);
-        Ok(())
+        self.open_collection_handle(name)?.optimize()
     }
 
     pub fn compact_collection(&mut self, name: &str) -> io::Result<()> {
@@ -283,7 +281,8 @@ impl HannsDb {
         );
         let compacted_dir = paths.segments_dir.join(&compacted_segment_id);
         fs::create_dir_all(&compacted_dir)?;
-        let compacted_paths = SegmentPaths::from_segment_dir(compacted_dir.clone());
+        let compacted_paths =
+            SegmentPaths::from_segment_dir(compacted_dir.clone(), compacted_segment_id.clone());
 
         let mut compacted_ids = Vec::new();
         let mut compacted_records = Vec::new();
@@ -302,7 +301,8 @@ impl HannsDb {
                 ));
             }
 
-            let segment_paths = SegmentPaths::from_segment_dir(segment_dir);
+            let segment_paths =
+                SegmentPaths::from_segment_dir(segment_dir, segment_id.clone());
             let segment_records = load_records(&segment_paths.records, collection_meta.dimension)?;
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
@@ -394,39 +394,7 @@ impl HannsDb {
     }
 
     pub fn list_collection_segments(&self, name: &str) -> io::Result<Vec<CollectionSegmentInfo>> {
-        let paths = self.collection_paths(name);
-        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-
-        if !paths.segment_set.exists() {
-            let segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-            return Ok(vec![CollectionSegmentInfo {
-                id: segment_meta.segment_id,
-                live_count: segment_meta
-                    .record_count
-                    .saturating_sub(segment_meta.deleted_count),
-                dead_count: segment_meta.deleted_count,
-                ann_ready: false,
-            }]);
-        }
-
-        let segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
-        let mut segment_ids = Vec::with_capacity(1 + segment_set.immutable_segment_ids.len());
-        segment_ids.push(segment_set.active_segment_id);
-        segment_ids.extend(segment_set.immutable_segment_ids);
-
-        segment_ids
-            .into_iter()
-            .map(|segment_id| {
-                let segment_dir = paths.segments_dir.join(&segment_id);
-                let metadata = SegmentMetadata::load_from_path(&segment_dir.join("segment.json"))?;
-                Ok(CollectionSegmentInfo {
-                    id: segment_id,
-                    live_count: metadata.record_count.saturating_sub(metadata.deleted_count),
-                    dead_count: metadata.deleted_count,
-                    ann_ready: segment_dir.join("ann").exists(),
-                })
-            })
-            .collect()
+        self.open_collection_handle(name)?.list_segments()
     }
 
     pub fn insert(
@@ -730,129 +698,8 @@ impl HannsDb {
         top_k: usize,
         _ef_search: usize,
     ) -> io::Result<Vec<SearchHit>> {
-        #[cfg(feature = "knowhere-backend")]
-        let ef_search = _ef_search.max(1);
-        let mut cache = self
-            .search_cache
-            .lock()
-            .expect("search cache mutex poisoned");
-        if !cache.contains_key(collection) {
-            #[cfg(feature = "knowhere-backend")]
-            let state = if let Some(ann_state) = self.try_load_persisted_ann_state(collection)? {
-                ann_state
-            } else {
-                self.load_search_state(collection)?
-            };
-            #[cfg(not(feature = "knowhere-backend"))]
-            let state = self.load_search_state(collection)?;
-            cache.insert(collection.to_string(), state);
-        }
-
-        let state = cache
-            .get(collection)
-            .expect("search cache must contain requested collection");
-        #[cfg(feature = "knowhere-backend")]
-        if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-            let optimized_snapshot = (
-                Arc::clone(&optimized_ann.backend),
-                Arc::clone(&optimized_ann.ann_external_ids),
-                optimized_ann.metric.clone(),
-            );
-            drop(cache);
-            return ann_search(
-                optimized_snapshot.0.as_ref(),
-                optimized_snapshot.1.as_slice(),
-                &optimized_snapshot.2,
-                query,
-                top_k,
-                ef_search,
-            );
-        }
-        let brute_force_snapshot = (
-            Arc::clone(&state.records),
-            Arc::clone(&state.external_ids),
-            Arc::clone(&state.tombstone),
-            state.dimension,
-            state.metric.clone(),
-        );
-        drop(cache);
-
-        let (records, external_ids, tombstone, dimension, metric) = brute_force_snapshot;
-
-        search_by_metric(
-            &records,
-            &external_ids,
-            dimension,
-            tombstone.as_ref(),
-            query,
-            top_k,
-            &metric,
-        )
-    }
-
-    #[cfg(feature = "knowhere-backend")]
-    fn try_load_persisted_ann_state(
-        &self,
-        collection: &str,
-    ) -> io::Result<Option<CachedSearchState>> {
-        let paths = self.collection_paths(collection);
-        let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-        if !hnsw_path.exists() {
-            return Ok(None);
-        }
-
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let metric = collection_meta.metric.clone();
-        let metric_lc = metric.to_ascii_lowercase();
-        let segment_paths = self.search_segment_paths(collection)?;
-
-        // Fast path: only reconstruct live external IDs for ANN id mapping.
-        let mut live_external_ids = Vec::new();
-        for segment in segment_paths {
-            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-            for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
-                if !tombstone.is_deleted(row_idx) {
-                    live_external_ids.push(external_id);
-                }
-            }
-        }
-
-        match fs::read(&hnsw_path).and_then(|bytes| {
-            KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
-                .map_err(|e| io::Error::other(format!("{e:?}")))
-        }) {
-            Ok(backend) => {
-                log::info!(
-                    "Loaded persisted HNSW index for '{}' from '{}'",
-                    collection,
-                    hnsw_path.display()
-                );
-                let ann_external_ids = Arc::new(live_external_ids);
-                Ok(Some(CachedSearchState {
-                    records: Arc::new(Vec::new()),
-                    external_ids: Arc::clone(&ann_external_ids),
-                    tombstone: Arc::new(TombstoneMask::new(0)),
-                    dimension: collection_meta.dimension,
-                    metric,
-                    hnsw_m: collection_meta.hnsw_m,
-                    hnsw_ef_construction: collection_meta.hnsw_ef_construction,
-                    optimized_ann: Some(OptimizedAnnState {
-                        backend: Arc::new(backend),
-                        ann_external_ids,
-                        metric: metric_lc,
-                    }),
-                }))
-            }
-            Err(e) => {
-                log::warn!(
-                    "Fast persisted HNSW load failed for '{}' from '{}': {e}",
-                    collection,
-                    hnsw_path.display()
-                );
-                Ok(None)
-            }
-        }
+        self.open_collection_handle(collection)?
+            .search_with_ef(query, top_k, _ef_search)
     }
 
     pub fn query_documents(
@@ -862,201 +709,25 @@ impl HannsDb {
         top_k: usize,
         filter: Option<&str>,
     ) -> io::Result<Vec<DocumentHit>> {
-        match filter.map(str::trim) {
-            None | Some("") => {
-                let hits = self.search(collection, query, top_k)?;
-                let documents = self.fetch_documents(
-                    collection,
-                    &hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
-                )?;
-                Ok(hits
-                    .into_iter()
-                    .zip(documents)
-                    .map(|(hit, document)| DocumentHit {
-                        id: hit.id,
-                        distance: hit.distance,
-                        fields: document.fields,
-                    })
-                    .collect())
-            }
-            Some(filter) => self.query_documents_with_filter(collection, query, top_k, filter),
-        }
+        self.open_collection_handle(collection)?
+            .query_documents(query, top_k, filter)
     }
 
     fn collection_paths(&self, name: &str) -> CollectionPaths {
-        let dir = self.root.join("collections").join(name);
-        CollectionPaths {
-            dir: dir.clone(),
-            collection_meta: dir.join("collection.json"),
-            segment_set: dir.join("segment_set.json"),
-            segments_dir: dir.join("segments"),
-            segment_meta: dir.join("segment.json"),
-            records: dir.join("records.bin"),
-            external_ids: dir.join("ids.bin"),
-            payloads: dir.join("payloads.jsonl"),
-            tombstones: dir.join("tombstones.json"),
-        }
-    }
-
-    fn search_segment_paths(&self, collection: &str) -> io::Result<Vec<SegmentPaths>> {
-        let paths = self.collection_paths(collection);
-        if !paths.segment_set.exists() {
-            return Ok(vec![SegmentPaths::from_collection(&paths)]);
-        }
-
-        let segment_set = SegmentSet::load_from_path(&paths.segment_set)?;
-        let mut segment_ids = Vec::with_capacity(1 + segment_set.immutable_segment_ids.len());
-        segment_ids.push(segment_set.active_segment_id);
-        segment_ids.extend(segment_set.immutable_segment_ids);
-
-        Ok(segment_ids
-            .into_iter()
-            .map(|segment_id| SegmentPaths::from_segment_dir(paths.segments_dir.join(segment_id)))
-            .collect())
-    }
-
-    fn load_search_state(&self, collection: &str) -> io::Result<CachedSearchState> {
-        let paths = self.collection_paths(collection);
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let metric = collection_meta.metric.clone();
-        let segment_paths = self.search_segment_paths(collection)?;
-
-        let mut records = Vec::new();
-        let mut external_ids = Vec::new();
-
-        for segment in segment_paths {
-            let segment_records =
-                load_records_or_empty(&segment.records, collection_meta.dimension)?;
-            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-            if segment_external_ids
-                .len()
-                .saturating_mul(collection_meta.dimension)
-                != segment_records.len()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "records and ids are not aligned",
-                ));
-            }
-
-            for (row_idx, vector) in segment_records
-                .chunks_exact(collection_meta.dimension)
-                .enumerate()
-            {
-                if tombstone.is_deleted(row_idx) {
-                    continue;
-                }
-                records.extend_from_slice(vector);
-                external_ids.push(segment_external_ids[row_idx]);
-            }
-        }
-
-        #[cfg(feature = "knowhere-backend")]
-        let optimized_ann = {
-            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-            if hnsw_path.exists() {
-                match fs::read(&hnsw_path).and_then(|bytes| {
-                    KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
-                        .map_err(|e| io::Error::other(format!("{e:?}")))
-                }) {
-                    Ok(backend) => Some(OptimizedAnnState {
-                        backend: Arc::new(backend),
-                        ann_external_ids: Arc::new(external_ids.clone()),
-                        metric: metric.to_ascii_lowercase(),
-                    }),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to load persisted HNSW index from '{}': {e}",
-                            hnsw_path.display()
-                        );
-                        let metric_lc = metric.to_ascii_lowercase();
-                        match KnowhereHnswIndex::new(
-                            collection_meta.dimension,
-                            &metric_lc,
-                            collection_meta.hnsw_m,
-                            collection_meta.hnsw_ef_construction,
-                        ) {
-                            Ok(mut backend) => {
-                                match backend
-                                    .insert_flat_identity(&records, collection_meta.dimension)
-                                {
-                                    Ok(()) => {
-                                        match backend.serialize_to_bytes() {
-                                            Ok(rebuilt) => {
-                                                if let Err(write_err) =
-                                                    fs::write(&hnsw_path, &rebuilt)
-                                                {
-                                                    log::warn!(
-                                                        "Failed to rewrite rebuilt HNSW index to '{}': {write_err}",
-                                                        hnsw_path.display()
-                                                    );
-                                                } else {
-                                                    log::info!(
-                                                        "Rebuilt and rewrote HNSW index for '{}' ({} bytes)",
-                                                        collection, rebuilt.len()
-                                                    );
-                                                }
-                                            }
-                                            Err(ser_err) => {
-                                                log::warn!(
-                                                    "Failed to serialize rebuilt HNSW index: {:?}",
-                                                    ser_err
-                                                );
-                                            }
-                                        }
-                                        Some(OptimizedAnnState {
-                                            backend: Arc::new(backend),
-                                            ann_external_ids: Arc::new(external_ids.clone()),
-                                            metric: metric_lc,
-                                        })
-                                    }
-                                    Err(rebuild_err) => {
-                                        log::warn!(
-                                            "Failed to rebuild HNSW index in-memory for '{}': {:?}",
-                                            collection,
-                                            rebuild_err
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Err(create_err) => {
-                                log::warn!(
-                                    "Failed to create HNSW backend for rebuild on '{}': {:?}",
-                                    collection,
-                                    create_err
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
-        Ok(CachedSearchState {
-            records: Arc::new(records),
-            external_ids: Arc::new(external_ids),
-            tombstone: Arc::new(TombstoneMask::new(0)),
-            dimension: collection_meta.dimension,
-            metric,
-            hnsw_m: collection_meta.hnsw_m,
-            hnsw_ef_construction: collection_meta.hnsw_ef_construction,
-            #[cfg(feature = "knowhere-backend")]
-            optimized_ann,
-        })
+        collection_paths_for_root(&self.root, name)
     }
 
     fn invalidate_search_cache(&self, collection: &str) {
-        let mut cache = self
-            .search_cache
-            .lock()
-            .expect("search cache mutex poisoned");
-        cache.remove(collection);
+        let handle = {
+            let handles = self
+                .collection_handles
+                .lock()
+                .expect("collection handles mutex poisoned");
+            handles.get(collection).cloned()
+        };
+        if let Some(handle) = handle {
+            handle.invalidate_search_cache();
+        }
     }
 
     fn maybe_trigger_segment_rollover(
@@ -1088,74 +759,6 @@ impl HannsDb {
             fs::create_dir_all(paths.segments_dir.join(segment_id))?;
         }
         set.save_to_path(&paths.segment_set)
-    }
-
-    fn query_documents_with_filter(
-        &self,
-        collection: &str,
-        query: &[f32],
-        top_k: usize,
-        filter: &str,
-    ) -> io::Result<Vec<DocumentHit>> {
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        let filter_expr = parse_filter(filter)?;
-        let paths = self.collection_paths(collection);
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let segment_paths = self.search_segment_paths(collection)?;
-
-        let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
-        for segment in segment_paths {
-            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
-            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-            if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "records and ids are not aligned",
-                ));
-            }
-
-            for (row_idx, vector) in records.chunks_exact(collection_meta.dimension).enumerate() {
-                if tombstone.is_deleted(row_idx) {
-                    continue;
-                }
-                let fields = &payloads[row_idx];
-                if !filter_expr.matches(fields) {
-                    continue;
-                }
-                let candidate = RankedDocumentHit {
-                    hit: DocumentHit {
-                        id: stored_ids[row_idx],
-                        distance: distance_by_metric(query, vector, &collection_meta.metric)?,
-                        fields: fields.clone(),
-                    },
-                };
-
-                if heap.len() < top_k {
-                    heap.push(candidate);
-                    continue;
-                }
-
-                if let Some(worst) = heap.peek() {
-                    if candidate.cmp(worst) == Ordering::Less {
-                        let _ = heap.pop();
-                        heap.push(candidate);
-                    }
-                }
-            }
-        }
-
-        let mut hits = heap.into_iter().map(|entry| entry.hit).collect::<Vec<_>>();
-        hits.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(hits)
     }
 
     fn replay_wal_if_needed(&mut self) -> io::Result<()> {
@@ -1231,12 +834,506 @@ impl HannsDb {
     }
 }
 
+impl CollectionHandle {
+    fn new(name: String, root: PathBuf) -> Self {
+        Self {
+            name,
+            root,
+            search_cache: Mutex::new(None),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn search(&self, query: &[f32], top_k: usize) -> io::Result<Vec<SearchHit>> {
+        self.search_with_ef(query, top_k, DEFAULT_EF_SEARCH)
+    }
+
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        _ef_search: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        #[cfg(feature = "knowhere-backend")]
+        let ef_search = _ef_search.max(1);
+        let mut cache = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        if cache.is_none() {
+            #[cfg(feature = "knowhere-backend")]
+            let state = if let Some(ann_state) = self.try_load_persisted_ann_state()? {
+                ann_state
+            } else {
+                self.load_search_state()?
+            };
+            #[cfg(not(feature = "knowhere-backend"))]
+            let state = self.load_search_state()?;
+            *cache = Some(state);
+        }
+
+        let state = cache
+            .as_ref()
+            .expect("search cache must contain requested collection");
+        #[cfg(feature = "knowhere-backend")]
+        if let Some(optimized_ann) = state.optimized_ann.as_ref() {
+            let optimized_snapshot = (
+                Arc::clone(&optimized_ann.backend),
+                Arc::clone(&optimized_ann.ann_external_ids),
+                optimized_ann.metric.clone(),
+            );
+            drop(cache);
+            return ann_search(
+                optimized_snapshot.0.as_ref(),
+                optimized_snapshot.1.as_slice(),
+                &optimized_snapshot.2,
+                query,
+                top_k,
+                ef_search,
+            );
+        }
+        let brute_force_snapshot = (
+            Arc::clone(&state.records),
+            Arc::clone(&state.external_ids),
+            Arc::clone(&state.tombstone),
+            state.dimension,
+            state.metric.clone(),
+        );
+        drop(cache);
+
+        let (records, external_ids, tombstone, dimension, metric) = brute_force_snapshot;
+
+        search_by_metric(
+            &records,
+            &external_ids,
+            dimension,
+            tombstone.as_ref(),
+            query,
+            top_k,
+            &metric,
+        )
+    }
+
+    pub fn optimize(&self) -> io::Result<()> {
+        let mut state = self.load_search_state()?;
+        #[cfg(feature = "knowhere-backend")]
+        {
+            let mut hnsw_bytes = None;
+            state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
+            if let Some(bytes) = hnsw_bytes {
+                let paths = self.collection_paths();
+                if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
+                    log::warn!("Failed to persist HNSW index: {e}");
+                } else {
+                    log::info!(
+                        "Persisted HNSW index ({} bytes) for collection '{}'",
+                        bytes.len(),
+                        self.name
+                    );
+                }
+            }
+        }
+        let mut cache = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        *cache = Some(state);
+        Ok(())
+    }
+
+    pub fn version_set(&self) -> io::Result<VersionSet> {
+        self.segment_manager().version_set()
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        let paths = self.collection_paths();
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
+        let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
+        let _ = load_wal_records(&wal_path(&self.root))?;
+        Ok(())
+    }
+
+    fn list_segments(&self) -> io::Result<Vec<CollectionSegmentInfo>> {
+        let paths = self.collection_paths();
+        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let manager = self.segment_manager();
+
+        manager
+            .segment_paths()?
+            .into_iter()
+            .map(|segment| {
+                let metadata = SegmentMetadata::load_from_path(&segment.metadata)?;
+                Ok(CollectionSegmentInfo {
+                    id: segment.segment_id.clone(),
+                    live_count: metadata.record_count.saturating_sub(metadata.deleted_count),
+                    dead_count: metadata.deleted_count,
+                    ann_ready: segment.ann_dir().exists(),
+                })
+            })
+            .collect()
+    }
+
+    fn query_documents(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&str>,
+    ) -> io::Result<Vec<DocumentHit>> {
+        match filter.map(str::trim) {
+            None | Some("") => {
+                let hits = self.search(query, top_k)?;
+                let documents = self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
+                Ok(hits
+                    .into_iter()
+                    .zip(documents)
+                    .map(|(hit, document)| DocumentHit {
+                        id: hit.id,
+                        distance: hit.distance,
+                        fields: document.fields,
+                    })
+                    .collect())
+            }
+            Some(filter) => self.query_documents_with_filter(query, top_k, filter),
+        }
+    }
+
+    fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let records = load_records_or_empty(&paths.records, collection_meta.dimension)?;
+        let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
+        let payloads = load_payloads_or_empty(&paths.payloads, stored_ids.len())?;
+        let tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
+
+        if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "records and ids are not aligned",
+            ));
+        }
+
+        let mut documents = Vec::with_capacity(external_ids.len());
+        for external_id in external_ids {
+            if let Some(row_idx) = latest_live_row_index(&stored_ids, &tombstone, *external_id) {
+                let start = row_idx * collection_meta.dimension;
+                let end = start + collection_meta.dimension;
+                documents.push(Document {
+                    id: *external_id,
+                    fields: payloads[row_idx].clone(),
+                    vector: records[start..end].to_vec(),
+                });
+            }
+        }
+
+        Ok(documents)
+    }
+
+    fn query_documents_with_filter(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: &str,
+    ) -> io::Result<Vec<DocumentHit>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let filter_expr = parse_filter(filter)?;
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let segment_paths = self.segment_manager().segment_paths()?;
+
+        let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
+        for segment in segment_paths {
+            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for (row_idx, vector) in records.chunks_exact(collection_meta.dimension).enumerate() {
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                let fields = &payloads[row_idx];
+                if !filter_expr.matches(fields) {
+                    continue;
+                }
+                let candidate = RankedDocumentHit {
+                    hit: DocumentHit {
+                        id: stored_ids[row_idx],
+                        distance: distance_by_metric(query, vector, &collection_meta.metric)?,
+                        fields: fields.clone(),
+                    },
+                };
+
+                if heap.len() < top_k {
+                    heap.push(candidate);
+                    continue;
+                }
+
+                if let Some(worst) = heap.peek() {
+                    if candidate.cmp(worst) == Ordering::Less {
+                        let _ = heap.pop();
+                        heap.push(candidate);
+                    }
+                }
+            }
+        }
+
+        let mut hits = heap.into_iter().map(|entry| entry.hit).collect::<Vec<_>>();
+        hits.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(hits)
+    }
+
+    fn collection_paths(&self) -> CollectionPaths {
+        collection_paths_for_root(&self.root, &self.name)
+    }
+
+    fn segment_manager(&self) -> SegmentManager {
+        SegmentManager::new(self.collection_paths().dir)
+    }
+
+    fn load_search_state(&self) -> io::Result<CachedSearchState> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let metric = collection_meta.metric.clone();
+        let segment_paths = self.segment_manager().segment_paths()?;
+
+        let mut records = Vec::new();
+        let mut external_ids = Vec::new();
+
+        for segment in segment_paths {
+            let segment_records =
+                load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            if segment_external_ids
+                .len()
+                .saturating_mul(collection_meta.dimension)
+                != segment_records.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for (row_idx, vector) in segment_records
+                .chunks_exact(collection_meta.dimension)
+                .enumerate()
+            {
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                records.extend_from_slice(vector);
+                external_ids.push(segment_external_ids[row_idx]);
+            }
+        }
+
+        #[cfg(feature = "knowhere-backend")]
+        let optimized_ann = {
+            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+            if hnsw_path.exists() {
+                match fs::read(&hnsw_path).and_then(|bytes| {
+                    KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
+                        .map_err(|e| io::Error::other(format!("{e:?}")))
+                }) {
+                    Ok(backend) => Some(OptimizedAnnState {
+                        backend: Arc::new(backend),
+                        ann_external_ids: Arc::new(external_ids.clone()),
+                        metric: metric.to_ascii_lowercase(),
+                    }),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to load persisted HNSW index from '{}': {e}",
+                            hnsw_path.display()
+                        );
+                        let metric_lc = metric.to_ascii_lowercase();
+                        match KnowhereHnswIndex::new(
+                            collection_meta.dimension,
+                            &metric_lc,
+                            collection_meta.hnsw_m,
+                            collection_meta.hnsw_ef_construction,
+                        ) {
+                            Ok(mut backend) => {
+                                match backend
+                                    .insert_flat_identity(&records, collection_meta.dimension)
+                                {
+                                    Ok(()) => {
+                                        match backend.serialize_to_bytes() {
+                                            Ok(rebuilt) => {
+                                                if let Err(write_err) =
+                                                    fs::write(&hnsw_path, &rebuilt)
+                                                {
+                                                    log::warn!(
+                                                        "Failed to rewrite rebuilt HNSW index to '{}': {write_err}",
+                                                        hnsw_path.display()
+                                                    );
+                                                } else {
+                                                    log::info!(
+                                                        "Rebuilt and rewrote HNSW index for '{}' ({} bytes)",
+                                                        self.name, rebuilt.len()
+                                                    );
+                                                }
+                                            }
+                                            Err(ser_err) => {
+                                                log::warn!(
+                                                    "Failed to serialize rebuilt HNSW index: {:?}",
+                                                    ser_err
+                                                );
+                                            }
+                                        }
+                                        Some(OptimizedAnnState {
+                                            backend: Arc::new(backend),
+                                            ann_external_ids: Arc::new(external_ids.clone()),
+                                            metric: metric_lc,
+                                        })
+                                    }
+                                    Err(rebuild_err) => {
+                                        log::warn!(
+                                            "Failed to rebuild HNSW index in-memory for '{}': {:?}",
+                                            self.name,
+                                            rebuild_err
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(create_err) => {
+                                log::warn!(
+                                    "Failed to create HNSW backend for rebuild on '{}': {:?}",
+                                    self.name,
+                                    create_err
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        Ok(CachedSearchState {
+            records: Arc::new(records),
+            external_ids: Arc::new(external_ids),
+            tombstone: Arc::new(TombstoneMask::new(0)),
+            dimension: collection_meta.dimension,
+            metric,
+            hnsw_m: collection_meta.hnsw_m,
+            hnsw_ef_construction: collection_meta.hnsw_ef_construction,
+            #[cfg(feature = "knowhere-backend")]
+            optimized_ann,
+        })
+    }
+
+    #[cfg(feature = "knowhere-backend")]
+    fn try_load_persisted_ann_state(&self) -> io::Result<Option<CachedSearchState>> {
+        let paths = self.collection_paths();
+        let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+        if !hnsw_path.exists() {
+            return Ok(None);
+        }
+
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let metric = collection_meta.metric.clone();
+        let metric_lc = metric.to_ascii_lowercase();
+        let segment_paths = self.segment_manager().segment_paths()?;
+
+        let mut live_external_ids = Vec::new();
+        for segment in segment_paths {
+            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+            for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
+                if !tombstone.is_deleted(row_idx) {
+                    live_external_ids.push(external_id);
+                }
+            }
+        }
+
+        match fs::read(&hnsw_path).and_then(|bytes| {
+            KnowhereHnswIndex::from_bytes(collection_meta.dimension, &bytes)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }) {
+            Ok(backend) => {
+                log::info!(
+                    "Loaded persisted HNSW index for '{}' from '{}'",
+                    self.name,
+                    hnsw_path.display()
+                );
+                let ann_external_ids = Arc::new(live_external_ids);
+                Ok(Some(CachedSearchState {
+                    records: Arc::new(Vec::new()),
+                    external_ids: Arc::clone(&ann_external_ids),
+                    tombstone: Arc::new(TombstoneMask::new(0)),
+                    dimension: collection_meta.dimension,
+                    metric,
+                    hnsw_m: collection_meta.hnsw_m,
+                    hnsw_ef_construction: collection_meta.hnsw_ef_construction,
+                    optimized_ann: Some(OptimizedAnnState {
+                        backend: Arc::new(backend),
+                        ann_external_ids,
+                        metric: metric_lc,
+                    }),
+                }))
+            }
+            Err(e) => {
+                log::warn!(
+                    "Fast persisted HNSW load failed for '{}' from '{}': {e}",
+                    self.name,
+                    hnsw_path.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn invalidate_search_cache(&self) {
+        let mut cache = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        *cache = None;
+    }
+}
+
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("manifest.json")
 }
 
 fn wal_path(root: &Path) -> PathBuf {
     root.join("wal.jsonl")
+}
+
+fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
+    let dir = root.join("collections").join(name);
+    CollectionPaths {
+        dir: dir.clone(),
+        collection_meta: dir.join("collection.json"),
+        segment_set: dir.join("segment_set.json"),
+        segments_dir: dir.join("segments"),
+        segment_meta: dir.join("segment.json"),
+        records: dir.join("records.bin"),
+        external_ids: dir.join("ids.bin"),
+        payloads: dir.join("payloads.jsonl"),
+        tombstones: dir.join("tombstones.json"),
+    }
 }
 
 struct CollectionPaths {
@@ -1249,34 +1346,6 @@ struct CollectionPaths {
     external_ids: PathBuf,
     payloads: PathBuf,
     tombstones: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct SegmentPaths {
-    records: PathBuf,
-    external_ids: PathBuf,
-    payloads: PathBuf,
-    tombstones: PathBuf,
-}
-
-impl SegmentPaths {
-    fn from_collection(paths: &CollectionPaths) -> Self {
-        Self {
-            records: paths.records.clone(),
-            external_ids: paths.external_ids.clone(),
-            payloads: paths.payloads.clone(),
-            tombstones: paths.tombstones.clone(),
-        }
-    }
-
-    fn from_segment_dir(segment_dir: PathBuf) -> Self {
-        Self {
-            records: segment_dir.join("records.bin"),
-            external_ids: segment_dir.join("ids.bin"),
-            payloads: segment_dir.join("payloads.jsonl"),
-            tombstones: segment_dir.join("tombstones.json"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
