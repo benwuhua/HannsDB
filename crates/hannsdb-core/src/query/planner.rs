@@ -1,0 +1,149 @@
+use std::io;
+
+use crate::catalog::CollectionMetadata;
+use crate::document::Document;
+
+use super::{parse_filter, FilterExpr, QueryContext, VectorQuery};
+
+#[derive(Debug, Clone)]
+pub(crate) struct QueryPlan {
+    pub(crate) top_k: usize,
+    pub(crate) filter: Option<FilterExpr>,
+    pub(crate) recall_sources: Vec<PlannedRecallSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedRecallSource {
+    pub(crate) kind: RecallSourceKind,
+    pub(crate) vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecallSourceKind {
+    ExplicitVector { field_name: String },
+    QueryById { id: i64, field_name: String },
+}
+
+pub(crate) struct QueryPlanner;
+
+impl QueryPlanner {
+    pub(crate) fn build(
+        collection: &CollectionMetadata,
+        context: &QueryContext,
+        query_by_id_documents: &[Document],
+    ) -> io::Result<QueryPlan> {
+        if context.group_by.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "group_by is not supported on the typed query path yet",
+            ));
+        }
+        if context.reranker.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "reranker is not supported on the typed query path yet",
+            ));
+        }
+
+        let filter = match context.filter.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(filter) => Some(parse_filter(filter)?),
+        };
+
+        let mut recall_sources = Vec::new();
+        for query in &context.queries {
+            validate_vector_query(collection, query)?;
+            recall_sources.push(PlannedRecallSource {
+                kind: RecallSourceKind::ExplicitVector {
+                    field_name: query.field_name.clone(),
+                },
+                vector: query.vector.clone(),
+            });
+        }
+
+        if let Some(query_by_id) = context.query_by_id.as_ref() {
+            if query_by_id.len() != query_by_id_documents.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "query_by_id resolved {} document(s) for {} requested id(s)",
+                        query_by_id_documents.len(),
+                        query_by_id.len()
+                    ),
+                ));
+            }
+
+            for (id, document) in query_by_id.iter().zip(query_by_id_documents) {
+                if document.vector.len() != collection.dimension {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "stored query_by_id vector dimension mismatch: expected {}, got {}",
+                            collection.dimension,
+                            document.vector.len()
+                        ),
+                    ));
+                }
+                recall_sources.push(PlannedRecallSource {
+                    kind: RecallSourceKind::QueryById {
+                        id: *id,
+                        field_name: collection.primary_vector.clone(),
+                    },
+                    vector: document.vector.clone(),
+                });
+            }
+        }
+
+        if recall_sources.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query context must include at least one recall source",
+            ));
+        }
+
+        Ok(QueryPlan {
+            top_k: context.top_k,
+            filter,
+            recall_sources,
+        })
+    }
+}
+
+fn validate_vector_query(collection: &CollectionMetadata, query: &VectorQuery) -> io::Result<()> {
+    let Some(vector_schema) = collection
+        .vectors
+        .iter()
+        .find(|vector| vector.name == query.field_name)
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query vector field '{}' is not defined in collection '{}'",
+                query.field_name, collection.name
+            ),
+        ));
+    };
+
+    if query.field_name != collection.primary_vector {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "typed query only supports the primary vector field '{}', got '{}'",
+                collection.primary_vector, query.field_name
+            ),
+        ));
+    }
+
+    if query.vector.len() != vector_schema.dimension {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query vector dimension mismatch: expected {}, got {}",
+                vector_schema.dimension,
+                query.vector.len()
+            ),
+        ));
+    }
+
+    Ok(())
+}

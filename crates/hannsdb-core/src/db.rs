@@ -6,14 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use hannsdb_index::adapter::{AdapterError, VectorIndexBackend};
-use hannsdb_index::descriptor::{
-    ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind,
-};
+use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind};
 use hannsdb_index::factory::DefaultIndexFactory;
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
-use crate::query::{distance_by_metric, parse_filter, search_by_metric, SearchHit};
+use crate::query::{
+    distance_by_metric, parse_filter, search_by_metric, QueryContext, QueryExecutor, QueryPlanner,
+    SearchHit,
+};
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
     load_records, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
@@ -795,6 +796,15 @@ impl HannsDb {
             .query_documents(query, top_k, filter)
     }
 
+    pub fn query_with_context(
+        &self,
+        collection: &str,
+        context: &QueryContext,
+    ) -> io::Result<Vec<DocumentHit>> {
+        self.open_collection_handle(collection)?
+            .query_with_context(context)
+    }
+
     fn collection_paths(&self, name: &str) -> CollectionPaths {
         collection_paths_for_root(&self.root, name)
     }
@@ -989,6 +999,17 @@ impl CollectionHandle {
             top_k,
             &metric,
         )
+    }
+
+    pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
+        let collection_meta =
+            CollectionMetadata::load_from_path(&self.collection_paths().collection_meta)?;
+        let query_by_id_documents = match context.query_by_id.as_ref() {
+            Some(query_by_id) => self.fetch_documents(query_by_id)?,
+            None => Vec::new(),
+        };
+        let plan = QueryPlanner::build(&collection_meta, context, &query_by_id_documents)?;
+        QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)
     }
 
     pub fn optimize(&self) -> io::Result<()> {
@@ -1277,72 +1298,73 @@ impl CollectionHandle {
 
         #[cfg(feature = "knowhere-backend")]
         {
-        let paths = self.collection_paths();
-        let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-        if !hnsw_path.exists() {
-            return Ok(None);
-        }
+            let paths = self.collection_paths();
+            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
+            if !hnsw_path.exists() {
+                return Ok(None);
+            }
 
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
-        let primary_index = resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
-        if primary_index.kind != VectorIndexKind::Hnsw {
-            return Ok(None);
-        }
-        let metric = collection_meta.metric.clone();
-        let metric_lc = primary_index
-            .metric
-            .clone()
-            .unwrap_or_else(|| metric.clone())
-            .to_ascii_lowercase();
-        let segment_paths = self.segment_manager.segment_paths()?;
+            let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+            let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+            let primary_index =
+                resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
+            if primary_index.kind != VectorIndexKind::Hnsw {
+                return Ok(None);
+            }
+            let metric = collection_meta.metric.clone();
+            let metric_lc = primary_index
+                .metric
+                .clone()
+                .unwrap_or_else(|| metric.clone())
+                .to_ascii_lowercase();
+            let segment_paths = self.segment_manager.segment_paths()?;
 
-        let mut live_external_ids = Vec::new();
-        for segment in segment_paths {
-            let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-            for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
-                if !tombstone.is_deleted(row_idx) {
-                    live_external_ids.push(external_id);
+            let mut live_external_ids = Vec::new();
+            for segment in segment_paths {
+                let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+                for (row_idx, external_id) in segment_external_ids.into_iter().enumerate() {
+                    if !tombstone.is_deleted(row_idx) {
+                        live_external_ids.push(external_id);
+                    }
                 }
             }
-        }
 
-        match fs::read(&hnsw_path).and_then(|bytes| {
-            DefaultIndexFactory::default()
-                .create_vector_index(collection_meta.dimension, &primary_index, Some(&bytes))
-                .map_err(adapter_error_to_io)
-        }) {
-            Ok(backend) => {
-                log::info!(
-                    "Loaded persisted HNSW index for '{}' from '{}'",
-                    self.name,
-                    hnsw_path.display()
-                );
-                let ann_external_ids = Arc::new(live_external_ids);
-                Ok(Some(CachedSearchState {
-                    records: Arc::new(Vec::new()),
-                    external_ids: Arc::clone(&ann_external_ids),
-                    tombstone: Arc::new(TombstoneMask::new(0)),
-                    dimension: collection_meta.dimension,
-                    metric,
-                    primary_index,
-                    optimized_ann: Some(OptimizedAnnState {
-                        backend: Arc::from(backend),
-                        ann_external_ids,
-                        metric: metric_lc,
-                    }),
-                }))
+            match fs::read(&hnsw_path).and_then(|bytes| {
+                DefaultIndexFactory::default()
+                    .create_vector_index(collection_meta.dimension, &primary_index, Some(&bytes))
+                    .map_err(adapter_error_to_io)
+            }) {
+                Ok(backend) => {
+                    log::info!(
+                        "Loaded persisted HNSW index for '{}' from '{}'",
+                        self.name,
+                        hnsw_path.display()
+                    );
+                    let ann_external_ids = Arc::new(live_external_ids);
+                    Ok(Some(CachedSearchState {
+                        records: Arc::new(Vec::new()),
+                        external_ids: Arc::clone(&ann_external_ids),
+                        tombstone: Arc::new(TombstoneMask::new(0)),
+                        dimension: collection_meta.dimension,
+                        metric,
+                        primary_index,
+                        optimized_ann: Some(OptimizedAnnState {
+                            backend: Arc::from(backend),
+                            ann_external_ids,
+                            metric: metric_lc,
+                        }),
+                    }))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Fast persisted HNSW load failed for '{}' from '{}': {e}",
+                        self.name,
+                        hnsw_path.display()
+                    );
+                    Ok(None)
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    "Fast persisted HNSW load failed for '{}' from '{}': {e}",
-                    self.name,
-                    hnsw_path.display()
-                );
-                Ok(None)
-            }
-        }
         }
     }
 
