@@ -35,6 +35,7 @@ fn rewrite_collection_to_two_segment_layout(
     collection: &str,
     dimension: usize,
     second_segment_documents: &[Document],
+    deleted_second_segment_rows: &[usize],
 ) {
     let collection_dir = root.join("collections").join(collection);
     let segments_dir = collection_dir.join("segments");
@@ -68,14 +69,23 @@ fn rewrite_collection_to_two_segment_layout(
     let _ = append_record_ids(&seg2_dir.join("ids.bin"), &ids).expect("append ids");
     let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &payloads).expect("append payloads");
 
-    let seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    for row_idx in deleted_second_segment_rows {
+        let marked = seg2_tombstone.mark_deleted(*row_idx);
+        assert!(marked, "row index must be valid in seg-0002 tombstone");
+    }
     seg2_tombstone
         .save_to_path(&seg2_dir.join("tombstones.json"))
         .expect("save seg-0002 tombstones");
 
-    SegmentMetadata::new("seg-0002", dimension, second_segment_documents.len(), 0)
-        .save_to_path(&seg2_dir.join("segment.json"))
-        .expect("save seg-0002 metadata");
+    SegmentMetadata::new(
+        "seg-0002",
+        dimension,
+        second_segment_documents.len(),
+        seg2_tombstone.deleted_count(),
+    )
+    .save_to_path(&seg2_dir.join("segment.json"))
+    .expect("save seg-0002 metadata");
 
     SegmentSet {
         active_segment_id: "seg-0002".to_string(),
@@ -329,6 +339,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
             [("version".to_string(), FieldValue::String("new".to_string()))],
             vec![5.0_f32, 5.0],
         )],
+        &[],
     );
 
     let hits = db
@@ -359,6 +370,75 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
         hits[1].distance > hits[0].distance,
         "newer row should shadow the old one even if it is farther away"
     );
+}
+
+#[test]
+fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segment_row() {
+    let root = unique_temp_dir("hannsdb_typed_query_tombstoned_shadowing");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("version", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                7,
+                [("version".to_string(), FieldValue::String("old".to_string()))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                8,
+                [(
+                    "version".to_string(),
+                    FieldValue::String("stable".to_string()),
+                )],
+                vec![0.1_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert seg-0001 docs");
+
+    rewrite_collection_to_two_segment_layout(
+        &root,
+        "docs",
+        2,
+        &[Document::new(
+            7,
+            [(
+                "version".to_string(),
+                FieldValue::String("new-deleted".to_string()),
+            )],
+            vec![0.05_f32, 0.0],
+        )],
+        &[0],
+    );
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("query with tombstoned shadowed duplicate ids");
+
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![8]);
 }
 
 #[test]

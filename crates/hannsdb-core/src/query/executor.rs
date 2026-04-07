@@ -39,11 +39,11 @@ impl QueryExecutor {
             }
 
             for row_idx in (0..external_ids.len()).rev() {
-                if tombstone.is_deleted(row_idx) {
-                    continue;
-                }
                 let id = external_ids[row_idx];
                 if !shadowed_ids.insert(id) {
+                    continue;
+                }
+                if tombstone.is_deleted(row_idx) {
                     continue;
                 }
 
