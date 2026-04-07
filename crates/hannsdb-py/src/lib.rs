@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
 use pyo3::types::{PyAny, PyBool, PyDict};
 
-use hannsdb_core::catalog::CollectionMetadata;
+use hannsdb_core::catalog::{CollectionMetadata, IndexCatalog};
 use hannsdb_core::document::{
     CollectionSchema as CoreCollectionSchema, Document as CoreDocument, FieldType as CoreFieldType,
     FieldValue, ScalarFieldSchema as CoreScalarFieldSchema,
@@ -313,8 +313,65 @@ fn collection_metadata_from_root(
         &root
             .join("collections")
             .join(collection_name)
-            .join("collection.json"),
+        .join("collection.json"),
     )
+}
+
+fn json_string(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn metric_json(value: Option<MetricType>) -> String {
+    match value {
+        Some(metric) => json_string(metric_type_name(metric)),
+        None => "null".to_string(),
+    }
+}
+
+fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>) -> String {
+    let (kind, metric, params) = match index_param {
+        Some(IndexParam::Hnsw(params)) => (
+            "hnsw",
+            metric_json(params.metric_type),
+            format!(
+                r#"{{"m":{},"ef_construction":{}}}"#,
+                params.m, params.ef_construction
+            ),
+        ),
+        Some(IndexParam::Ivf(params)) => (
+            "ivf",
+            metric_json(params.metric_type),
+            format!(r#"{{"nlist":{}}}"#, params.nlist),
+        ),
+        None => ("flat", "null".to_string(), "{}".to_string()),
+    };
+
+    format!(
+        r#"{{"vector_indexes":[{{"field_name":{},"kind":{},"metric":{},"params":{}}}],"scalar_indexes":[]}}"#,
+        json_string(field_name),
+        json_string(kind),
+        metric,
+        params
+    )
+}
+
+fn scalar_index_catalog_json(field_name: &str) -> String {
+    format!(
+        r#"{{"vector_indexes":[],"scalar_indexes":[{{"field_name":{},"kind":"inverted","params":{{}}}}]}}"#,
+        json_string(field_name)
+    )
+}
+
+fn load_catalog_from_json(
+    collection_dir: &std::path::Path,
+    filename: &str,
+    json: String,
+) -> std::io::Result<IndexCatalog> {
+    let temp_path = collection_dir.join(filename);
+    std::fs::write(&temp_path, json)?;
+    let catalog = IndexCatalog::load_from_path(&temp_path);
+    let _ = std::fs::remove_file(&temp_path);
+    catalog
 }
 
 pub fn create_and_open(
@@ -444,6 +501,120 @@ impl Collection {
             deleted_count: info.deleted_count,
             live_count: info.live_count,
         })
+    }
+
+    pub fn create_vector_index(
+        &self,
+        field_name: &str,
+        index_param: Option<&IndexParam>,
+    ) -> std::io::Result<()> {
+        let collection_dir = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name);
+        let catalog_path = collection_dir.join("indexes.json");
+        let mut catalog = IndexCatalog::load_from_path(&catalog_path)?;
+        catalog
+            .vector_indexes
+            .retain(|descriptor| descriptor.field_name != field_name);
+        let created = load_catalog_from_json(
+            &collection_dir,
+            "indexes-vector-index.tmp",
+            vector_index_catalog_json(field_name, index_param),
+        )?;
+        catalog.vector_indexes.extend(created.vector_indexes);
+        catalog.save_to_path(&catalog_path)
+    }
+
+    pub fn drop_vector_index(&self, field_name: &str) -> std::io::Result<()> {
+        let collection_dir = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name);
+        let catalog_path = collection_dir.join("indexes.json");
+        let mut catalog = IndexCatalog::load_from_path(&catalog_path)?;
+        if !catalog
+            .vector_indexes
+            .iter()
+            .any(|descriptor| descriptor.field_name == field_name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "vector index descriptor not found for field '{}' in '{}'",
+                    field_name, self.collection_name
+                ),
+            ));
+        }
+        catalog
+            .vector_indexes
+            .retain(|descriptor| descriptor.field_name != field_name);
+        catalog.save_to_path(&catalog_path)
+    }
+
+    pub fn list_vector_indexes(&self) -> std::io::Result<Vec<String>> {
+        let catalog_path = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name)
+            .join("indexes.json");
+        Ok(IndexCatalog::load_from_path(&catalog_path)?
+            .vector_indexes
+            .into_iter()
+            .map(|descriptor| descriptor.field_name)
+            .collect())
+    }
+
+    pub fn create_scalar_index(&self, field_name: &str) -> std::io::Result<()> {
+        let collection_dir = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name);
+        let catalog_path = collection_dir.join("indexes.json");
+        let mut catalog = IndexCatalog::load_from_path(&catalog_path)?;
+        catalog
+            .scalar_indexes
+            .retain(|descriptor| descriptor.field_name != field_name);
+        let created = load_catalog_from_json(
+            &collection_dir,
+            "indexes-scalar-index.tmp",
+            scalar_index_catalog_json(field_name),
+        )?;
+        catalog.scalar_indexes.extend(created.scalar_indexes);
+        catalog.save_to_path(&catalog_path)
+    }
+
+    pub fn drop_scalar_index(&self, field_name: &str) -> std::io::Result<()> {
+        let catalog_path = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name)
+            .join("indexes.json");
+        let mut catalog = IndexCatalog::load_from_path(&catalog_path)?;
+        if !catalog
+            .scalar_indexes
+            .iter()
+            .any(|descriptor| descriptor.field_name == field_name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "scalar index descriptor not found for field '{}' in '{}'",
+                    field_name, self.collection_name
+                ),
+            ));
+        }
+        catalog
+            .scalar_indexes
+            .retain(|descriptor| descriptor.field_name != field_name);
+        catalog.save_to_path(&catalog_path)
+    }
+
+    pub fn list_scalar_indexes(&self) -> std::io::Result<Vec<String>> {
+        let catalog_path = std::path::Path::new(&self.path)
+            .join("collections")
+            .join(&self.collection_name)
+            .join("indexes.json");
+        Ok(IndexCatalog::load_from_path(&catalog_path)?
+            .scalar_indexes
+            .into_iter()
+            .map(|descriptor| descriptor.field_name)
+            .collect())
     }
 
     pub fn query(
@@ -1330,6 +1501,67 @@ impl PyCollection {
             .ok_or_else(|| PyRuntimeError::new_err("collection already destroyed"))?
             .destroy()
             .map_err(io_to_py_err)
+    }
+
+    #[pyo3(signature = (field_name, index_param=None))]
+    fn create_vector_index(
+        &self,
+        py: Python<'_>,
+        field_name: String,
+        index_param: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let index_param = match index_param {
+            Some(param) => {
+                let bound = param.bind(py);
+                if bound.is_instance_of::<PyHnswIndexParam>() {
+                    Some(IndexParam::Hnsw(
+                        bound
+                            .extract::<PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyIVFIndexParam>() {
+                    Some(IndexParam::Ivf(
+                        bound.extract::<PyRef<'_, PyIVFIndexParam>>()?.inner.clone(),
+                    ))
+                } else {
+                    return Err(PyValueError::new_err(
+                        "index_param must be HnswIndexParam or IVFIndexParam",
+                    ));
+                }
+            }
+            None => None,
+        };
+
+        self.inner_ref()?
+            .create_vector_index(&field_name, index_param.as_ref())
+            .map_err(io_to_py_err)
+    }
+
+    fn drop_vector_index(&self, field_name: String) -> PyResult<()> {
+        self.inner_ref()?
+            .drop_vector_index(&field_name)
+            .map_err(io_to_py_err)
+    }
+
+    fn list_vector_indexes(&self) -> PyResult<Vec<String>> {
+        self.inner_ref()?.list_vector_indexes().map_err(io_to_py_err)
+    }
+
+    fn create_scalar_index(&self, field_name: String) -> PyResult<()> {
+        self.inner_ref()?
+            .create_scalar_index(&field_name)
+            .map_err(io_to_py_err)
+    }
+
+    fn drop_scalar_index(&self, field_name: String) -> PyResult<()> {
+        self.inner_ref()?
+            .drop_scalar_index(&field_name)
+            .map_err(io_to_py_err)
+    }
+
+    fn list_scalar_indexes(&self) -> PyResult<Vec<String>> {
+        self.inner_ref()?.list_scalar_indexes().map_err(io_to_py_err)
     }
 }
 

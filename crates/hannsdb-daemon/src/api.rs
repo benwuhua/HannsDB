@@ -140,3 +140,41 @@ pub struct CollectionInfoResponse {
     pub deleted_count: usize,
     pub live_count: usize,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct VectorIndexRequest {
+    pub field_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub metric: Option<String>,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScalarIndexRequest {
+    pub field_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateIndexResponse {
+    pub field_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DropIndexResponse {
+    pub dropped: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VectorIndexesResponse {
+    pub vector_indexes: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScalarIndexesResponse {
+    pub scalar_indexes: Vec<Value>,
+}

@@ -6,18 +6,19 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{Document, FieldValue};
 
 use crate::api::{
     CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
-    CreateCollectionResponse, DeleteRecordsRequest, DeleteRecordsResponse, DropCollectionResponse,
-    ErrorResponse, FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse,
-    FlushCollectionResponse, HealthResponse, InsertRecordsRequest, InsertRecordsResponse,
-    ListCollectionsResponse, SearchHitResponse, SearchRequest, SearchResponse, SegmentsResponse,
-    UpsertRecordsResponse,
+    CreateCollectionResponse, CreateIndexResponse, DeleteRecordsRequest, DeleteRecordsResponse,
+    DropCollectionResponse, DropIndexResponse, ErrorResponse, FetchRecordResponse,
+    FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse, HealthResponse,
+    InsertRecordsRequest, InsertRecordsResponse, ListCollectionsResponse, ScalarIndexesResponse,
+    ScalarIndexRequest, SearchHitResponse, SearchRequest, SearchResponse, SegmentsResponse,
+    UpsertRecordsResponse, VectorIndexesResponse, VectorIndexRequest,
 };
 
 #[derive(Clone)]
@@ -67,6 +68,22 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
             post(fetch_records),
         )
         .route("/collections/:collection/search", post(search_records))
+        .route(
+            "/collections/:collection/indexes/vector",
+            get(list_vector_indexes).post(create_vector_index),
+        )
+        .route(
+            "/collections/:collection/indexes/vector/:field_name",
+            delete(drop_vector_index),
+        )
+        .route(
+            "/collections/:collection/indexes/scalar",
+            get(list_scalar_indexes).post(create_scalar_index),
+        )
+        .route(
+            "/collections/:collection/indexes/scalar/:field_name",
+            delete(drop_scalar_index),
+        )
         .with_state(state))
 }
 
@@ -614,6 +631,249 @@ async fn search_records(
             .into_response(),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
             StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_vector_index(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(request): Json<VectorIndexRequest>,
+) -> Response {
+    let descriptor = serde_json::json!({
+        "field_name": request.field_name,
+        "kind": request.kind,
+        "metric": request.metric,
+        "params": request.params,
+    });
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .create_vector_index(&collection, serde_json::from_value(descriptor).expect("descriptor"));
+
+    match result {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(CreateIndexResponse {
+                field_name: request.field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_vector_indexes(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .list_vector_indexes(&collection);
+
+    match result {
+        Ok(vector_indexes) => (
+            StatusCode::OK,
+            Json(VectorIndexesResponse {
+                vector_indexes: vector_indexes
+                    .into_iter()
+                    .map(|descriptor| serde_json::to_value(descriptor).expect("descriptor json"))
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn drop_vector_index(
+    State(state): State<DaemonState>,
+    AxumPath((collection, field_name)): AxumPath<(String, String)>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .drop_vector_index(&collection, &field_name);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DropIndexResponse {
+                dropped: field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn create_scalar_index(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(request): Json<ScalarIndexRequest>,
+) -> Response {
+    let descriptor = serde_json::json!({
+        "field_name": request.field_name,
+        "kind": request.kind,
+        "params": request.params,
+    });
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .create_scalar_index(&collection, serde_json::from_value(descriptor).expect("descriptor"));
+
+    match result {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(CreateIndexResponse {
+                field_name: request.field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_scalar_indexes(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .list_scalar_indexes(&collection);
+
+    match result {
+        Ok(scalar_indexes) => (
+            StatusCode::OK,
+            Json(ScalarIndexesResponse {
+                scalar_indexes: scalar_indexes
+                    .into_iter()
+                    .map(|descriptor| serde_json::to_value(descriptor).expect("descriptor json"))
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn drop_scalar_index(
+    State(state): State<DaemonState>,
+    AxumPath((collection, field_name)): AxumPath<(String, String)>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .drop_scalar_index(&collection, &field_name);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DropIndexResponse {
+                dropped: field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: error.to_string(),
             }),

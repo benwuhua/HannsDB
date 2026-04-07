@@ -253,6 +253,162 @@ async fn collections_list_and_drop_flow_works() {
 }
 
 #[tokio::test]
+async fn index_ddl_routes_create_list_and_drop_indexes() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create_collection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create_collection.status(), StatusCode::CREATED);
+
+    let collection_meta_path = tempdir
+        .path()
+        .join("collections")
+        .join("docs")
+        .join("collection.json");
+    let collection_meta = serde_json::json!({
+        "format_version": 1,
+        "name": "docs",
+        "primary_vector": "title",
+        "fields": [
+            {
+                "name": "session_id",
+                "data_type": "String",
+                "nullable": false,
+                "array": false
+            }
+        ],
+        "vectors": [
+            {
+                "name": "title",
+                "data_type": "VectorFp32",
+                "dimension": 2
+            }
+        ]
+    });
+    fs::write(
+        &collection_meta_path,
+        serde_json::to_vec_pretty(&collection_meta).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    let create_vector = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/vector")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"title","kind":"ivf","metric":"l2","params":{"nlist":8}}"#,
+                ))
+                .expect("build request"),
+    )
+        .await
+        .expect("send vector index request");
+    let create_vector_status = create_vector.status();
+    if !create_vector_status.is_success() {
+        let body = to_bytes(create_vector.into_body(), usize::MAX)
+            .await
+            .expect("read create vector body");
+        panic!(
+            "vector index create failed: status={} body={}",
+            create_vector_status,
+            std::str::from_utf8(&body).expect("utf8 body")
+        );
+    }
+
+    let create_scalar = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/scalar")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"session_id","kind":"inverted","params":{"tokenizer":"keyword"}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send scalar index request");
+    assert!(create_scalar.status().is_success());
+
+    let vector_indexes = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/indexes/vector")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send vector list request");
+    assert_eq!(vector_indexes.status(), StatusCode::OK);
+    let vector_body = to_bytes(vector_indexes.into_body(), usize::MAX)
+        .await
+        .expect("read vector body");
+    let vector_json: Value = serde_json::from_slice(&vector_body).expect("parse vector json");
+    assert_eq!(vector_json["vector_indexes"][0]["field_name"], "title");
+    assert_eq!(vector_json["vector_indexes"][0]["kind"], "ivf");
+
+    let scalar_indexes = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/indexes/scalar")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send scalar list request");
+    assert_eq!(scalar_indexes.status(), StatusCode::OK);
+    let scalar_body = to_bytes(scalar_indexes.into_body(), usize::MAX)
+        .await
+        .expect("read scalar body");
+    let scalar_json: Value = serde_json::from_slice(&scalar_body).expect("parse scalar json");
+    assert_eq!(scalar_json["scalar_indexes"][0]["field_name"], "session_id");
+    assert_eq!(scalar_json["scalar_indexes"][0]["kind"], "inverted");
+
+    let drop_vector = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/indexes/vector/title")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send vector drop request");
+    assert!(drop_vector.status().is_success());
+
+    let drop_scalar = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/indexes/scalar/session_id")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send scalar drop request");
+    assert!(drop_scalar.status().is_success());
+}
+
+#[tokio::test]
 async fn drop_missing_collection_returns_not_found() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

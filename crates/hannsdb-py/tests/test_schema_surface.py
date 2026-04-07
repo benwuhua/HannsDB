@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import hannsdb
 
@@ -87,5 +88,40 @@ def test_create_and_open_persists_richer_schema(tmp_path):
         "m": 32,
         "ef_construction": 128,
     }
+
+    collection.destroy()
+
+
+def test_collection_index_ddl_surface_persists_and_lists_indexes(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+
+    collection.create_vector_index(
+        "title",
+        hannsdb.IVFIndexParam(metric_type="l2", nlist=8),
+    )
+    collection.create_scalar_index("session_id")
+
+    assert collection.list_vector_indexes() == ["title"]
+    assert collection.list_scalar_indexes() == ["session_id"]
+
+    indexes_path = (
+        Path(collection.path)
+        / "collections"
+        / collection.collection_name
+        / "indexes.json"
+    )
+    catalog = json.loads(indexes_path.read_text())
+    assert catalog["vector_indexes"][0]["field_name"] == "title"
+    assert catalog["vector_indexes"][0]["kind"] == "ivf"
+    assert catalog["vector_indexes"][0]["metric"] == "l2"
+    assert catalog["vector_indexes"][0]["params"] == {"nlist": 8}
+    assert catalog["scalar_indexes"][0]["field_name"] == "session_id"
+    assert catalog["scalar_indexes"][0]["kind"] == "inverted"
+
+    collection.drop_vector_index("title")
+    collection.drop_scalar_index("session_id")
+
+    assert collection.list_vector_indexes() == []
+    assert collection.list_scalar_indexes() == []
 
     collection.destroy()
