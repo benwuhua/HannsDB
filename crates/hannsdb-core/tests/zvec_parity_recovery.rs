@@ -188,6 +188,11 @@ fn zvec_parity_recovery_reopen_reads_multi_segment_version_metadata_through_hand
         version_set.all_segment_ids(),
         vec!["seg-0002".to_string(), "seg-0001".to_string()]
     );
+
+    fs::remove_file(root.join("collections").join("docs").join("segment_set.json"))
+        .expect("remove segment_set after handle open");
+    let cached_version_set = handle.version_set().expect("load cached version set");
+    assert_eq!(cached_version_set, version_set);
 }
 
 #[test]

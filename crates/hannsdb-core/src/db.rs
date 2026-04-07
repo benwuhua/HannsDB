@@ -72,9 +72,15 @@ struct OptimizedAnnState {
     metric: String,
 }
 
+#[derive(Debug, Default)]
+struct IndexRegistry;
+
 pub struct CollectionHandle {
     name: String,
     root: PathBuf,
+    segment_manager: SegmentManager,
+    version_set: RwLock<VersionSet>,
+    index_registry: Arc<IndexRegistry>,
     search_cache: Mutex<Option<CachedSearchState>>,
 }
 
@@ -119,7 +125,15 @@ impl HannsDb {
 
         let paths = self.collection_paths(name);
         let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let handle = Arc::new(CollectionHandle::new(name.to_string(), self.root.clone()));
+        let segment_manager = SegmentManager::new(paths.dir.clone());
+        let version_set = segment_manager.version_set()?;
+        let handle = Arc::new(CollectionHandle::new(
+            name.to_string(),
+            self.root.clone(),
+            segment_manager,
+            version_set,
+            Arc::new(IndexRegistry),
+        ));
         handles.insert(name.to_string(), Arc::clone(&handle));
         Ok(handle)
     }
@@ -740,6 +754,7 @@ impl HannsDb {
             handles.get(collection).cloned()
         };
         if let Some(handle) = handle {
+            let _ = handle.refresh_version_set();
             handle.invalidate_search_cache();
         }
     }
@@ -851,10 +866,19 @@ impl HannsDb {
 }
 
 impl CollectionHandle {
-    fn new(name: String, root: PathBuf) -> Self {
+    fn new(
+        name: String,
+        root: PathBuf,
+        segment_manager: SegmentManager,
+        version_set: VersionSet,
+        index_registry: Arc<IndexRegistry>,
+    ) -> Self {
         Self {
             name,
             root,
+            segment_manager,
+            version_set: RwLock::new(version_set),
+            index_registry,
             search_cache: Mutex::new(None),
         }
     }
@@ -934,6 +958,7 @@ impl CollectionHandle {
     }
 
     pub fn optimize(&self) -> io::Result<()> {
+        let _index_registry = Arc::clone(&self.index_registry);
         let state = self.load_search_state()?;
         #[cfg(feature = "knowhere-backend")]
         {
@@ -961,7 +986,11 @@ impl CollectionHandle {
     }
 
     pub fn version_set(&self) -> io::Result<VersionSet> {
-        self.segment_manager().version_set()
+        Ok(self
+            .version_set
+            .read()
+            .expect("version_set rwlock poisoned")
+            .clone())
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -976,9 +1005,7 @@ impl CollectionHandle {
     fn list_segments(&self) -> io::Result<Vec<CollectionSegmentInfo>> {
         let paths = self.collection_paths();
         let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let manager = self.segment_manager();
-
-        manager
+        self.segment_manager
             .segment_paths()?
             .into_iter()
             .map(|segment| {
@@ -1060,7 +1087,7 @@ impl CollectionHandle {
         let filter_expr = parse_filter(filter)?;
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let segment_paths = self.segment_manager().segment_paths()?;
+        let segment_paths = self.segment_manager.segment_paths()?;
 
         let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
         for segment in segment_paths {
@@ -1119,15 +1146,11 @@ impl CollectionHandle {
         collection_paths_for_root(&self.root, &self.name)
     }
 
-    fn segment_manager(&self) -> SegmentManager {
-        SegmentManager::new(self.collection_paths().dir)
-    }
-
     fn load_search_state(&self) -> io::Result<CachedSearchState> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let metric = collection_meta.metric.clone();
-        let segment_paths = self.segment_manager().segment_paths()?;
+        let segment_paths = self.segment_manager.segment_paths()?;
 
         let mut records = Vec::new();
         let mut external_ids = Vec::new();
@@ -1270,7 +1293,7 @@ impl CollectionHandle {
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let metric = collection_meta.metric.clone();
         let metric_lc = metric.to_ascii_lowercase();
-        let segment_paths = self.segment_manager().segment_paths()?;
+        let segment_paths = self.segment_manager.segment_paths()?;
 
         let mut live_external_ids = Vec::new();
         for segment in segment_paths {
@@ -1326,6 +1349,16 @@ impl CollectionHandle {
             .lock()
             .expect("search cache mutex poisoned");
         *cache = None;
+    }
+
+    fn refresh_version_set(&self) -> io::Result<()> {
+        let version_set = self.segment_manager.version_set()?;
+        let mut snapshot = self
+            .version_set
+            .write()
+            .expect("version_set rwlock poisoned");
+        *snapshot = version_set;
+        Ok(())
     }
 }
 
