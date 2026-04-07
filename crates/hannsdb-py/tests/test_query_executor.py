@@ -55,6 +55,16 @@ def test_query_context_accepts_queries_shape():
     assert context.queries
 
 
+def test_query_context_normalizes_scalar_output_fields_and_query_by_id():
+    context = hannsdb.QueryContext(
+        output_fields="group",
+        query_by_id=2,
+    )
+
+    assert context.output_fields == ["group"]
+    assert context.query_by_id == [2]
+
+
 def test_query_executor_factory_exposes_create_method():
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -110,6 +120,42 @@ def test_query_executor_supports_group_by(tmp_path):
     hits = executor.execute(collection, context)
 
     assert [hit.fields["group"] for hit in hits] == [1, 2]
+
+
+def test_query_executor_rejects_core_unsupported_query_shape_as_not_implemented(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(
+                field_name="dense",
+                vector=[0.0, 0.0],
+                param=hannsdb.HnswQueryParam(ef=64, is_using_refiner=False),
+            ),
+        ],
+        query_by_id=2,
+    )
+
+    with pytest.raises(NotImplementedError, match="unsupported"):
+        executor.execute(collection, context)
+
+
+def test_query_executor_rejects_include_vector_as_not_implemented(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=1,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        ],
+        include_vector=True,
+    )
+
+    with pytest.raises(NotImplementedError, match="include_vector"):
+        executor.execute(collection, context)
 
 
 def test_query_executor_still_rejects_reranker(tmp_path):

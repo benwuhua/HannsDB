@@ -34,8 +34,13 @@ class QueryContext:
             if isinstance(self.query_by_id, str):
                 self.query_by_id = [self.query_by_id]
             else:
-                self.query_by_id = list(self.query_by_id)
-        if self.output_fields is not None and not isinstance(self.output_fields, list):
+                try:
+                    self.query_by_id = list(self.query_by_id)
+                except TypeError:
+                    self.query_by_id = [self.query_by_id]
+        if self.output_fields is not None and isinstance(self.output_fields, str):
+            self.output_fields = [self.output_fields]
+        elif self.output_fields is not None and not isinstance(self.output_fields, list):
             self.output_fields = list(self.output_fields)
 
 

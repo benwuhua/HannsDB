@@ -309,15 +309,15 @@ fn py_query_context_to_core(
     let output_fields = context.getattr("output_fields")?.extract::<Option<Vec<String>>>()?;
     let include_vector = context.getattr("include_vector")?.extract::<bool>()?;
     if include_vector {
-        return Err(PyValueError::new_err(
-            "include_vector is not supported on the Python facade yet",
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "unsupported: include_vector is not supported on the Python facade yet",
         ));
     }
 
     let reranker = context.getattr("reranker")?;
     if !reranker.is_none() {
-        return Err(PyValueError::new_err(
-            "reranker is not supported on the Python facade yet",
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "unsupported: reranker is not supported on the Python facade yet",
         ));
     }
 
@@ -746,6 +746,12 @@ fn io_to_py_err(error: std::io::Error) -> PyErr {
             PyValueError::new_err(error.to_string())
         }
         std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(error.to_string()),
+        std::io::ErrorKind::Unsupported => {
+            pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "unsupported: {}",
+                error
+            ))
+        }
         _ => PyRuntimeError::new_err(error.to_string()),
     }
 }
