@@ -4,6 +4,8 @@ pub struct QueryContext {
     pub queries: Vec<VectorQuery>,
     pub query_by_id: Option<Vec<i64>>,
     pub filter: Option<String>,
+    pub output_fields: Option<Vec<String>>,
+    pub include_vector: bool,
     pub group_by: Option<QueryGroupBy>,
     pub reranker: Option<QueryReranker>,
 }
@@ -15,6 +17,8 @@ impl Default for QueryContext {
             queries: Vec::new(),
             query_by_id: None,
             filter: None,
+            output_fields: None,
+            include_vector: false,
             group_by: None,
             reranker: None,
         }

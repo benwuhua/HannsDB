@@ -17,13 +17,22 @@ pub(crate) struct LegacySingleVectorPlan {
     pub(crate) filter: Option<String>,
     pub(crate) vector: Vec<f32>,
     pub(crate) ef_search: Option<usize>,
+    pub(crate) output_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct BruteForceQueryPlan {
     pub(crate) top_k: usize,
     pub(crate) filter: Option<FilterExpr>,
+    pub(crate) mode: BruteForceExecutionMode,
     pub(crate) recall_sources: Vec<PlannedRecallSource>,
+    pub(crate) output_fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BruteForceExecutionMode {
+    Recall,
+    FilterOnlyScan,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +55,12 @@ impl QueryPlanner {
         context: &QueryContext,
         query_by_id_documents: &[Document],
     ) -> io::Result<QueryPlan> {
+        if context.include_vector {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "include_vector is not supported on the typed query path yet",
+            ));
+        }
         if context.group_by.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -102,6 +117,7 @@ impl QueryPlanner {
                 filter,
                 vector: query.vector.clone(),
                 ef_search: query.param.as_ref().and_then(|param| param.ef_search),
+                output_fields: context.output_fields.clone(),
             }));
         }
 
@@ -151,17 +167,25 @@ impl QueryPlanner {
             }
         }
 
-        if recall_sources.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "query context must include at least one recall source",
-            ));
-        }
+        let mode = if recall_sources.is_empty() {
+            if filter.is_some() {
+                BruteForceExecutionMode::FilterOnlyScan
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "query context must include at least one recall source or a filter",
+                ));
+            }
+        } else {
+            BruteForceExecutionMode::Recall
+        };
 
         Ok(QueryPlan::BruteForce(BruteForceQueryPlan {
             top_k: context.top_k,
             filter,
+            mode,
             recall_sources,
+            output_fields: context.output_fields.clone(),
         }))
     }
 }

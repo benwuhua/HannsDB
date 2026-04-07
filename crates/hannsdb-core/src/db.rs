@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1010,14 +1010,21 @@ impl CollectionHandle {
         };
         let plan = QueryPlanner::build(&collection_meta, context, &query_by_id_documents)?;
         match plan {
-            QueryPlan::LegacySingleVector(plan) => self.query_documents_with_ef(
-                &plan.vector,
-                plan.top_k,
-                plan.filter.as_deref(),
-                plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
-            ),
+            QueryPlan::LegacySingleVector(plan) => {
+                let mut hits = self.query_documents_with_ef(
+                    &plan.vector,
+                    plan.top_k,
+                    plan.filter.as_deref(),
+                    plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
+                )?;
+                project_document_hits(&mut hits, plan.output_fields.as_deref());
+                Ok(hits)
+            }
             QueryPlan::BruteForce(plan) => {
-                QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)
+                let mut hits =
+                    QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)?;
+                project_document_hits(&mut hits, plan.output_fields.as_deref());
+                Ok(hits)
             }
         }
     }
@@ -1359,6 +1366,17 @@ impl CollectionHandle {
             .expect("version_set rwlock poisoned");
         *snapshot = version_set;
         Ok(())
+    }
+}
+
+fn project_document_hits(hits: &mut [DocumentHit], output_fields: Option<&[String]>) {
+    let Some(output_fields) = output_fields else {
+        return;
+    };
+    let requested = output_fields.iter().cloned().collect::<BTreeSet<_>>();
+    for hit in hits {
+        hit.fields
+            .retain(|field_name, _| requested.contains(field_name));
     }
 }
 

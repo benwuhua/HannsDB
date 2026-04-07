@@ -134,6 +134,8 @@ fn main() {
         queries: vec![query],
         query_by_id: Some(vec![11, 22]),
         filter: Some("group == 1".to_string()),
+        output_fields: Some(vec!["group".to_string()]),
+        include_vector: false,
         group_by: None,
         reranker: None,
     };
@@ -213,6 +215,8 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
                 }],
                 query_by_id: Some(vec![2]),
                 filter: Some("group == 1".to_string()),
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -255,6 +259,8 @@ fn zvec_parity_query_context_rejects_group_by_until_supported() {
                 }],
                 query_by_id: None,
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: Some(QueryGroupBy {
                     field_name: "group".to_string(),
                 }),
@@ -286,6 +292,8 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
                 }],
                 query_by_id: None,
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: Some(QueryReranker {
                     model: "cross-encoder".to_string(),
@@ -354,6 +362,8 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
                 }],
                 query_by_id: None,
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -431,6 +441,8 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
                 }],
                 query_by_id: None,
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -496,6 +508,8 @@ fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombsto
                 queries: Vec::new(),
                 query_by_id: Some(vec![7]),
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -541,6 +555,8 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
                 }],
                 query_by_id: None,
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -586,6 +602,8 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
                 }],
                 query_by_id: Some(vec![7]),
                 filter: None,
+                output_fields: None,
+                include_vector: false,
                 group_by: None,
                 reranker: None,
             },
@@ -594,4 +612,228 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
 
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("ef_search"));
+}
+
+#[test]
+fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_k() {
+    let root = unique_temp_dir("hannsdb_typed_query_filter_only");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("version", FieldType::String),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                1,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("seg1".to_string()),
+                    ),
+                ],
+                vec![1.0_f32, 1.0],
+            ),
+            Document::new(
+                2,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("version".to_string(), FieldValue::String("old".to_string())),
+                ],
+                vec![2.0_f32, 2.0],
+            ),
+            Document::new(
+                4,
+                [
+                    ("group".to_string(), FieldValue::Int64(2)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("other-group".to_string()),
+                    ),
+                ],
+                vec![4.0_f32, 4.0],
+            ),
+        ],
+    )
+    .expect("insert seg-0001 docs");
+
+    rewrite_collection_to_two_segment_layout(
+        &root,
+        "docs",
+        2,
+        &[
+            Document::new(
+                2,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("version".to_string(), FieldValue::String("new".to_string())),
+                ],
+                vec![20.0_f32, 20.0],
+            ),
+            Document::new(
+                3,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("deleted".to_string()),
+                    ),
+                ],
+                vec![30.0_f32, 30.0],
+            ),
+            Document::new(
+                5,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("fresh".to_string()),
+                    ),
+                ],
+                vec![50.0_f32, 50.0],
+            ),
+        ],
+        &[1],
+    );
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: Vec::new(),
+                query_by_id: None,
+                filter: Some("group == 1".to_string()),
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("filter-only query should scan live documents");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 0.0]
+    );
+    assert_eq!(
+        hits[1].fields.get("version"),
+        Some(&FieldValue::String("new".to_string()))
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
+    let root = unique_temp_dir("hannsdb_typed_query_output_fields");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("color", FieldType::String),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                1,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("color".to_string(), FieldValue::String("red".to_string())),
+                ],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                2,
+                [
+                    ("group".to_string(), FieldValue::Int64(2)),
+                    ("color".to_string(), FieldValue::String("blue".to_string())),
+                ],
+                vec![1.0_f32, 1.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: Some(vec!["color".to_string()]),
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("typed query with output field projection");
+
+    assert_eq!(
+        hits[0].fields,
+        [("color".to_string(), FieldValue::String("red".to_string()),)]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        hits[1].fields,
+        [("color".to_string(), FieldValue::String("blue".to_string()),)]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_include_vector_until_supported() {
+    let root = unique_temp_dir("hannsdb_typed_query_include_vector");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: true,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("include_vector should be rejected until the result type carries vectors");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("include_vector"));
 }

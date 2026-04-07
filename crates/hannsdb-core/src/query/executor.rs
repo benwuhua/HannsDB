@@ -8,7 +8,7 @@ use crate::db::DocumentHit;
 use crate::document::FieldValue;
 use crate::segment::{load_payloads, load_record_ids, load_records, SegmentManager, TombstoneMask};
 
-use super::planner::BruteForceQueryPlan;
+use super::planner::{BruteForceExecutionMode, BruteForceQueryPlan};
 use super::search::distance_by_metric;
 
 pub(crate) struct QueryExecutor;
@@ -60,7 +60,12 @@ impl QueryExecutor {
 
                 let candidate = DocumentHit {
                     id,
-                    distance: best_distance(plan, vector, &collection.metric)?,
+                    distance: match plan.mode {
+                        BruteForceExecutionMode::Recall => {
+                            best_distance(plan, vector, &collection.metric)?
+                        }
+                        BruteForceExecutionMode::FilterOnlyScan => 0.0,
+                    },
                     fields: fields.clone(),
                 };
                 insert_best_hit(&mut best_hits, candidate);
