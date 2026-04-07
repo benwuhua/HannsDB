@@ -8,18 +8,19 @@ fn stored_schema_value() -> Value {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("collection.json");
     let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
         fields: vec![
             ScalarFieldSchema::new("session_id", FieldType::String),
             ScalarFieldSchema::new("tags", FieldType::String).with_flags(true, true),
             ScalarFieldSchema::new("created_at", FieldType::Int64),
         ],
         vectors: vec![
+            VectorFieldSchema::new("title", 384),
             VectorFieldSchema::new("dense", 384).with_index_param(VectorIndexSchema::hnsw(
                 Some("cosine"),
                 32,
                 128,
             )),
-            VectorFieldSchema::new("title", 384),
         ],
     };
     let metadata = CollectionMetadata::new_with_schema("docs", schema);
@@ -39,10 +40,11 @@ fn zvec_parity_schema_round_trips_multiple_vector_fields() {
         .expect("schema should expose vector metadata");
 
     assert_eq!(vectors.len(), 2);
-    assert_eq!(vectors[0]["name"], "dense");
+    assert_eq!(actual["primary_vector"], "dense");
+    assert_eq!(vectors[0]["name"], "title");
     assert_eq!(vectors[0]["data_type"], "VectorFp32");
     assert_eq!(vectors[0]["dimension"], 384);
-    assert_eq!(vectors[1]["name"], "title");
+    assert_eq!(vectors[1]["name"], "dense");
     assert_eq!(vectors[1]["data_type"], "VectorFp32");
     assert_eq!(vectors[1]["dimension"], 384);
 }
@@ -54,11 +56,15 @@ fn zvec_parity_schema_round_trips_vector_index_metadata() {
         .get("vectors")
         .cloned()
         .expect("schema should expose vector metadata");
-    let first_vector = vectors
+    let dense_vector = vectors
         .as_array()
-        .and_then(|entries| entries.first())
-        .expect("expected at least one vector entry");
-    let index_param = first_vector
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("name") == Some(&Value::String("dense".to_string())))
+        })
+        .expect("expected dense vector entry");
+    let index_param = dense_vector
         .get("index_param")
         .cloned()
         .expect("vector should expose index metadata");
@@ -127,6 +133,7 @@ fn zvec_parity_schema_migrates_legacy_single_vector_metadata_into_field_registri
     let loaded = CollectionMetadata::load_from_path(&path).expect("load collection metadata");
     let schema = loaded.schema();
 
+    assert_eq!(schema.primary_vector, "dense");
     assert_eq!(
         schema.fields,
         vec![ScalarFieldSchema::new("session_id", FieldType::String)]
@@ -162,4 +169,5 @@ fn zvec_parity_schema_legacy_constructor_maps_to_single_primary_vector_registry(
             ))
         ]
     );
+    assert_eq!(schema.primary_vector, "dense");
 }

@@ -4,6 +4,12 @@ import hannsdb
 
 
 def build_schema():
+    title = hannsdb.VectorSchema(
+        name="title",
+        data_type="vector_fp32",
+        dimension=384,
+        index_param=hannsdb.IVFIndexParam(metric_type="l2", nlist=1024),
+    )
     dense = hannsdb.VectorSchema(
         name="dense",
         data_type="vector_fp32",
@@ -14,29 +20,32 @@ def build_schema():
             ef_construction=128,
         ),
     )
-    title = hannsdb.VectorSchema(
-        name="title",
-        data_type="vector_fp32",
-        dimension=384,
-        index_param=hannsdb.IVFIndexParam(metric_type="l2", nlist=1024),
-    )
     return hannsdb.CollectionSchema(
         name="docs",
+        primary_vector="dense",
         fields=[
             hannsdb.FieldSchema(name="session_id", data_type="string"),
-            hannsdb.FieldSchema(name="tags", data_type="string"),
+            hannsdb.FieldSchema(
+                name="tags",
+                data_type="string",
+                nullable=True,
+                array=True,
+            ),
         ],
-        vectors=[dense, title],
+        vectors=[title, dense],
     )
 
 
 def test_collection_schema_vectors_property_surface():
     schema = build_schema()
 
+    assert schema.primary_vector == "dense"
     vectors = schema.vectors
-    assert [vector.name for vector in vectors] == ["dense", "title"]
+    assert [vector.name for vector in vectors] == ["title", "dense"]
     assert vectors[0].dimension == 384
     assert vectors[1].dimension == 384
+    assert schema.fields[1].nullable is True
+    assert schema.fields[1].array is True
 
 
 def test_create_and_open_persists_richer_schema(tmp_path):
@@ -50,17 +59,20 @@ def test_create_and_open_persists_richer_schema(tmp_path):
         ).read_text()
     )
 
-    assert [vector["name"] for vector in metadata["vectors"]] == ["dense", "title"]
+    assert metadata["primary_vector"] == "dense"
+    assert [vector["name"] for vector in metadata["vectors"]] == ["title", "dense"]
+    assert metadata["fields"][1]["nullable"] is True
+    assert metadata["fields"][1]["array"] is True
     assert metadata["vectors"][0]["index_param"] == {
+        "kind": "ivf",
+        "metric": "l2",
+        "nlist": 1024,
+    }
+    assert metadata["vectors"][1]["index_param"] == {
         "kind": "hnsw",
         "metric": "cosine",
         "m": 32,
         "ef_construction": 128,
-    }
-    assert metadata["vectors"][1]["index_param"] == {
-        "kind": "ivf",
-        "metric": "l2",
-        "nlist": 1024,
     }
 
     collection.destroy()

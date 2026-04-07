@@ -5,8 +5,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    default_hnsw_ef_construction, default_hnsw_m, CollectionSchema, ScalarFieldSchema,
-    VectorFieldSchema, VectorIndexSchema,
+    default_hnsw_ef_construction, default_hnsw_m, default_primary_vector_name, CollectionSchema,
+    ScalarFieldSchema, VectorFieldSchema, VectorIndexSchema,
 };
 
 use super::CATALOG_FORMAT_VERSION;
@@ -36,6 +36,7 @@ impl CollectionMetadata {
         Self::from_schema_parts(
             CATALOG_FORMAT_VERSION,
             name.into(),
+            schema.primary_vector,
             schema.fields,
             schema.vectors,
         )
@@ -43,6 +44,7 @@ impl CollectionMetadata {
 
     pub fn schema(&self) -> CollectionSchema {
         CollectionSchema {
+            primary_vector: self.primary_vector.clone(),
             fields: self.fields.clone(),
             vectors: self.vectors.clone(),
         }
@@ -52,6 +54,7 @@ impl CollectionMetadata {
         let persisted = PersistedCollectionMetadata {
             format_version: self.format_version,
             name: self.name.clone(),
+            primary_vector: Some(self.primary_vector.clone()),
             fields: self.fields.clone(),
             vectors: self.vectors.clone(),
         };
@@ -67,6 +70,13 @@ impl CollectionMetadata {
             PersistedCollectionMetadataCompat::Current(current) => Self::from_schema_parts(
                 current.format_version,
                 current.name,
+                current.primary_vector.unwrap_or_else(|| {
+                    current
+                        .vectors
+                        .first()
+                        .map(|vector| vector.name.clone())
+                        .unwrap_or_else(default_primary_vector_name)
+                }),
                 current.fields,
                 current.vectors,
             ),
@@ -82,7 +92,13 @@ impl CollectionMetadata {
                             )),
                     );
                 }
-                Self::from_schema_parts(legacy.format_version, legacy.name, legacy.fields, vectors)
+                Self::from_schema_parts(
+                    legacy.format_version,
+                    legacy.name,
+                    legacy.primary_vector,
+                    legacy.fields,
+                    vectors,
+                )
             }
         };
         if metadata.format_version != CATALOG_FORMAT_VERSION {
@@ -100,21 +116,17 @@ impl CollectionMetadata {
     fn from_schema_parts(
         format_version: u32,
         name: String,
+        primary_vector: String,
         fields: Vec<ScalarFieldSchema>,
         vectors: Vec<VectorFieldSchema>,
     ) -> Self {
-        let primary_vector = vectors
-            .first()
-            .map(|vector| vector.name.clone())
-            .unwrap_or_else(default_primary_vector_name);
-        let dimension = vectors.first().map_or(0, |vector| vector.dimension);
-        let metric = vectors
-            .first()
+        let primary_vector_schema = vectors.iter().find(|vector| vector.name == primary_vector);
+        let dimension = primary_vector_schema.map_or(0, |vector| vector.dimension);
+        let metric = primary_vector_schema
             .and_then(VectorFieldSchema::metric)
             .unwrap_or("l2")
             .to_string();
-        let (hnsw_m, hnsw_ef_construction) = vectors
-            .first()
+        let (hnsw_m, hnsw_ef_construction) = primary_vector_schema
             .and_then(VectorFieldSchema::hnsw_settings)
             .unwrap_or((default_hnsw_m(), default_hnsw_ef_construction()));
         Self {
@@ -135,6 +147,8 @@ impl CollectionMetadata {
 struct PersistedCollectionMetadata {
     pub format_version: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_vector: Option<String>,
     #[serde(default)]
     pub fields: Vec<ScalarFieldSchema>,
     pub vectors: Vec<VectorFieldSchema>,
@@ -165,8 +179,4 @@ struct LegacyCollectionMetadata {
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
-}
-
-fn default_primary_vector_name() -> String {
-    "vector".to_string()
 }

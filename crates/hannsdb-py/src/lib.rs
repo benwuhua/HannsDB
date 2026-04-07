@@ -100,6 +100,8 @@ pub struct HnswQueryParam {
 pub struct FieldSchema {
     pub name: String,
     pub data_type: DataType,
+    pub nullable: bool,
+    pub array: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,7 @@ pub struct VectorSchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionSchema {
     pub name: String,
+    pub primary_vector: String,
     pub fields: Vec<FieldSchema>,
     pub vectors: Vec<VectorSchema>,
 }
@@ -167,26 +170,50 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             "CollectionSchema requires at least one vector schema",
         ));
     }
+    let primary_vector = schema
+        .vectors
+        .iter()
+        .find(|vector| vector.name == schema.primary_vector)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "primary vector '{}' is not defined in vectors",
+                    schema.primary_vector
+                ),
+            )
+        })?;
+    if matches!(
+        primary_vector.index_param.as_ref(),
+        Some(IndexParam::Ivf(_))
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "primary vector '{}' must use hnsw or no index_param for the current runtime",
+                schema.primary_vector
+            ),
+        ));
+    }
 
     let fields = schema
         .fields
         .iter()
         .map(|field| {
-            Ok(CoreScalarFieldSchema::new(
-                field.name.clone(),
-                match field.data_type {
-                    DataType::String => CoreFieldType::String,
-                    DataType::Int64 => CoreFieldType::Int64,
-                    DataType::Float64 => CoreFieldType::Float64,
-                    DataType::Bool => CoreFieldType::Bool,
-                    DataType::VectorFp32 => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("field '{}' cannot use vector_fp32", field.name),
-                        ))
-                    }
-                },
-            ))
+            let data_type = match field.data_type {
+                DataType::String => CoreFieldType::String,
+                DataType::Int64 => CoreFieldType::Int64,
+                DataType::Float64 => CoreFieldType::Float64,
+                DataType::Bool => CoreFieldType::Bool,
+                DataType::VectorFp32 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("field '{}' cannot use vector_fp32", field.name),
+                    ))
+                }
+            };
+            Ok(CoreScalarFieldSchema::new(field.name.clone(), data_type)
+                .with_flags(field.nullable, field.array))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
@@ -223,7 +250,11 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
-    Ok(CoreCollectionSchema { fields, vectors })
+    Ok(CoreCollectionSchema {
+        primary_vector: schema.primary_vector.clone(),
+        fields,
+        vectors,
+    })
 }
 
 fn parse_doc_id(id: &str) -> std::io::Result<i64> {
@@ -814,11 +845,14 @@ struct PyFieldSchema {
 #[pymethods]
 impl PyFieldSchema {
     #[new]
-    fn new(name: String, data_type: String) -> PyResult<Self> {
+    #[pyo3(signature = (name, data_type, nullable=false, array=false))]
+    fn new(name: String, data_type: String, nullable: bool, array: bool) -> PyResult<Self> {
         Ok(Self {
             inner: FieldSchema {
                 name,
                 data_type: parse_data_type(&data_type)?,
+                nullable,
+                array,
             },
         })
     }
@@ -837,6 +871,16 @@ impl PyFieldSchema {
             DataType::Bool => "bool",
             DataType::VectorFp32 => "vector_fp32",
         }
+    }
+
+    #[getter]
+    fn nullable(&self) -> bool {
+        self.inner.nullable
+    }
+
+    #[getter]
+    fn array(&self) -> bool {
+        self.inner.array
     }
 }
 
@@ -924,10 +968,11 @@ struct PyCollectionSchema {
 #[pymethods]
 impl PyCollectionSchema {
     #[new]
-    #[pyo3(signature = (name, vector_schema=None, fields=None, vectors=None))]
+    #[pyo3(signature = (name, primary_vector=None, vector_schema=None, fields=None, vectors=None))]
     fn new(
         py: Python<'_>,
         name: String,
+        primary_vector: Option<String>,
         vector_schema: Option<Py<PyVectorSchema>>,
         fields: Option<Vec<Py<PyFieldSchema>>>,
         vectors: Option<Vec<Py<PyVectorSchema>>>,
@@ -948,6 +993,12 @@ impl PyCollectionSchema {
                 "CollectionSchema requires at least one vector schema",
             ));
         }
+        let primary_vector = primary_vector.unwrap_or_else(|| {
+            inner_vectors
+                .first()
+                .map(|vector| vector.name.clone())
+                .unwrap_or_else(|| "vector".to_string())
+        });
         let inner_fields = fields
             .unwrap_or_default()
             .into_iter()
@@ -956,6 +1007,7 @@ impl PyCollectionSchema {
         Ok(Self {
             inner: CollectionSchema {
                 name,
+                primary_vector,
                 fields: inner_fields,
                 vectors: inner_vectors,
             },
@@ -965,6 +1017,11 @@ impl PyCollectionSchema {
     #[getter]
     fn name(&self) -> String {
         self.inner.name.clone()
+    }
+
+    #[getter]
+    fn primary_vector(&self) -> String {
+        self.inner.primary_vector.clone()
     }
 
     #[getter]
@@ -1348,10 +1405,19 @@ mod tests {
 
     use crate::{
         create_and_open, init, open, CollectionOption, CollectionSchema, DataType, Doc,
-        FieldSchema, HnswIndexParam, HnswQueryParam, LogLevel, MetricType, OptimizeOption,
-        QuantizeType, VectorQuery, VectorSchema,
+        FieldSchema, HnswIndexParam, HnswQueryParam, IndexParam, LogLevel, MetricType,
+        OptimizeOption, QuantizeType, VectorQuery, VectorSchema,
     };
     use hannsdb_core::document::FieldValue;
+
+    fn hnsw_index_param(metric_type: MetricType) -> IndexParam {
+        IndexParam::Hnsw(HnswIndexParam {
+            metric_type: Some(metric_type),
+            m: 16,
+            ef_construction: 64,
+            quantize_type: QuantizeType::Undefined,
+        })
+    }
 
     fn doc(
         id: &str,
@@ -1384,18 +1450,16 @@ mod tests {
             name: "dense".to_string(),
             data_type: DataType::VectorFp32,
             dimension: 4,
-            index_param: Some(HnswIndexParam {
-                metric_type: Some(MetricType::L2),
-                m: 16,
-                ef_construction: 64,
-                quantize_type: QuantizeType::Undefined,
-            }),
+            index_param: Some(hnsw_index_param(MetricType::L2)),
         };
         let schema = CollectionSchema {
             name: "bench".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![FieldSchema {
                 name: "id".to_string(),
                 data_type: DataType::Int64,
+                nullable: false,
+                array: false,
             }],
             vectors: vec![vec_schema],
         };
@@ -1435,6 +1499,7 @@ mod tests {
         };
         let schema = CollectionSchema {
             name: "bench".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![],
             vectors: vec![VectorSchema {
                 name: "dense".to_string(),
@@ -1463,20 +1528,18 @@ mod tests {
 
         let schema = CollectionSchema {
             name: "bench_col".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![FieldSchema {
                 name: "id".to_string(),
                 data_type: DataType::Int64,
+                nullable: false,
+                array: false,
             }],
             vectors: vec![VectorSchema {
                 name: "dense".to_string(),
                 data_type: DataType::VectorFp32,
                 dimension: 2,
-                index_param: Some(HnswIndexParam {
-                    metric_type: Some(MetricType::L2),
-                    m: 16,
-                    ef_construction: 64,
-                    quantize_type: QuantizeType::Undefined,
-                }),
+                index_param: Some(hnsw_index_param(MetricType::L2)),
             }],
         };
         let option = CollectionOption::default();
@@ -1557,17 +1620,13 @@ mod tests {
         let db_path = temp.path().to_string_lossy().to_string();
         let schema = CollectionSchema {
             name: "metric_col".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![],
             vectors: vec![VectorSchema {
                 name: "dense".to_string(),
                 data_type: DataType::VectorFp32,
                 dimension: 2,
-                index_param: Some(HnswIndexParam {
-                    metric_type: Some(MetricType::Ip),
-                    m: 16,
-                    ef_construction: 64,
-                    quantize_type: QuantizeType::Undefined,
-                }),
+                index_param: Some(hnsw_index_param(MetricType::Ip)),
             }],
         };
 
@@ -1591,30 +1650,32 @@ mod tests {
         let db_path = temp.path().to_string_lossy().to_string();
         let schema = CollectionSchema {
             name: "agent_docs".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![
                 FieldSchema {
                     name: "session_id".to_string(),
                     data_type: DataType::String,
+                    nullable: false,
+                    array: false,
                 },
                 FieldSchema {
                     name: "turn".to_string(),
                     data_type: DataType::Int64,
+                    nullable: false,
+                    array: false,
                 },
                 FieldSchema {
                     name: "active".to_string(),
                     data_type: DataType::Bool,
+                    nullable: false,
+                    array: false,
                 },
             ],
             vectors: vec![VectorSchema {
                 name: "dense".to_string(),
                 data_type: DataType::VectorFp32,
                 dimension: 2,
-                index_param: Some(HnswIndexParam {
-                    metric_type: Some(MetricType::L2),
-                    m: 16,
-                    ef_construction: 64,
-                    quantize_type: QuantizeType::Undefined,
-                }),
+                index_param: Some(hnsw_index_param(MetricType::L2)),
             }],
         };
 
@@ -1724,20 +1785,18 @@ mod tests {
         let db_path = temp.path().to_string_lossy().to_string();
         let schema = CollectionSchema {
             name: "agent_docs".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![FieldSchema {
                 name: "session_id".to_string(),
                 data_type: DataType::String,
+                nullable: false,
+                array: false,
             }],
             vectors: vec![VectorSchema {
                 name: "dense".to_string(),
                 data_type: DataType::VectorFp32,
                 dimension: 2,
-                index_param: Some(HnswIndexParam {
-                    metric_type: Some(MetricType::L2),
-                    m: 16,
-                    ef_construction: 64,
-                    quantize_type: QuantizeType::Undefined,
-                }),
+                index_param: Some(hnsw_index_param(MetricType::L2)),
             }],
         };
 
@@ -1776,11 +1835,12 @@ mod tests {
     }
 
     #[test]
-    fn create_and_open_rejects_multiple_vectors_for_v1() {
+    fn create_and_open_accepts_metadata_only_secondary_vectors() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().to_string_lossy().to_string();
         let schema = CollectionSchema {
             name: "multi_vec".to_string(),
+            primary_vector: "dense".to_string(),
             fields: vec![],
             vectors: vec![
                 VectorSchema {
@@ -1798,8 +1858,84 @@ mod tests {
             ],
         };
 
+        let collection =
+            create_and_open(db_path, schema, Some(CollectionOption::default())).expect("create");
+        assert_eq!(collection.primary_vector_name, "dense");
+
+        let metadata = hannsdb_core::catalog::CollectionMetadata::load_from_path(
+            &temp
+                .path()
+                .join("collections")
+                .join("multi_vec")
+                .join("collection.json"),
+        )
+        .expect("load collection metadata");
+        assert_eq!(metadata.primary_vector, "dense");
+        assert_eq!(metadata.vectors.len(), 2);
+    }
+
+    #[test]
+    fn core_schema_from_schema_keeps_explicit_primary_vector_when_not_first() {
+        let schema = CollectionSchema {
+            name: "primary_by_name".to_string(),
+            primary_vector: "dense".to_string(),
+            fields: vec![FieldSchema {
+                name: "tags".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+                array: true,
+            }],
+            vectors: vec![
+                VectorSchema {
+                    name: "title".to_string(),
+                    data_type: DataType::VectorFp32,
+                    dimension: 2,
+                    index_param: None,
+                },
+                VectorSchema {
+                    name: "dense".to_string(),
+                    data_type: DataType::VectorFp32,
+                    dimension: 2,
+                    index_param: Some(hnsw_index_param(MetricType::L2)),
+                },
+            ],
+        };
+
+        let core_schema = super::core_schema_from_schema(&schema).expect("schema conversion");
+        assert_eq!(core_schema.primary_vector, "dense");
+        assert!(core_schema.fields[0].nullable);
+        assert!(core_schema.fields[0].array);
+    }
+
+    #[test]
+    fn create_and_open_rejects_primary_ivf_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().to_string_lossy().to_string();
+        let schema = CollectionSchema {
+            name: "primary_ivf".to_string(),
+            primary_vector: "dense".to_string(),
+            fields: vec![],
+            vectors: vec![
+                VectorSchema {
+                    name: "dense".to_string(),
+                    data_type: DataType::VectorFp32,
+                    dimension: 2,
+                    index_param: Some(IndexParam::Ivf(crate::IvfIndexParam {
+                        metric_type: Some(MetricType::L2),
+                        nlist: 1024,
+                    })),
+                },
+                VectorSchema {
+                    name: "title".to_string(),
+                    data_type: DataType::VectorFp32,
+                    dimension: 2,
+                    index_param: None,
+                },
+            ],
+        };
+
         let result = create_and_open(db_path, schema, Some(CollectionOption::default()));
-        assert!(result.is_err(), "v1 should reject multiple vector schemas");
+        assert!(result.is_err(), "primary IVF must be rejected");
         assert_eq!(
             result.err().expect("result is err").kind(),
             ErrorKind::InvalidInput

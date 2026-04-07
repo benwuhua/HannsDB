@@ -11,7 +11,7 @@ use hannsdb_index::adapter::{AdapterError, HnswBackend};
 use hannsdb_index::hnsw::{InMemoryHnswIndex, KnowhereHnswIndex};
 
 use crate::catalog::{CollectionMetadata, ManifestMetadata};
-use crate::document::{CollectionSchema, Document, FieldValue};
+use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
 use crate::query::{distance_by_metric, parse_filter, search_by_metric, SearchHit};
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
@@ -117,6 +117,27 @@ impl HannsDb {
         schema: &CollectionSchema,
         log_wal: bool,
     ) -> io::Result<()> {
+        let primary_vector = schema.primary_vector().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "collection primary vector '{}' is not defined in schema vectors",
+                    schema.primary_vector_name()
+                ),
+            )
+        })?;
+        if matches!(
+            primary_vector.index_param.as_ref(),
+            Some(VectorIndexSchema::Ivf { .. })
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "primary vector '{}' must use hnsw or no index_param for the current runtime",
+                    schema.primary_vector_name()
+                ),
+            ));
+        }
         let dimension = schema.dimension();
         if dimension == 0 {
             return Err(io::Error::new(

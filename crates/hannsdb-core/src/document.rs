@@ -133,6 +133,8 @@ impl VectorFieldSchema {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSchema {
+    #[serde(default = "default_primary_vector_name")]
+    pub primary_vector: String,
     #[serde(default)]
     pub fields: Vec<ScalarFieldSchema>,
     pub vectors: Vec<VectorFieldSchema>,
@@ -145,8 +147,10 @@ impl CollectionSchema {
         metric: impl Into<String>,
         fields: Vec<ScalarFieldSchema>,
     ) -> Self {
+        let primary_vector = primary_vector.into();
         let metric = metric.into();
         Self {
+            primary_vector: primary_vector.clone(),
             fields,
             vectors: vec![
                 VectorFieldSchema::new(primary_vector, dimension).with_index_param(
@@ -160,14 +164,19 @@ impl CollectionSchema {
         }
     }
 
+    pub fn with_primary_vector(mut self, primary_vector: impl Into<String>) -> Self {
+        self.primary_vector = primary_vector.into();
+        self
+    }
+
     pub fn primary_vector(&self) -> Option<&VectorFieldSchema> {
-        self.vectors.first()
+        self.vectors
+            .iter()
+            .find(|vector| vector.name == self.primary_vector)
     }
 
     pub fn primary_vector_name(&self) -> &str {
-        self.primary_vector()
-            .map(|vector| vector.name.as_str())
-            .unwrap_or("vector")
+        self.primary_vector.as_str()
     }
 
     pub fn dimension(&self) -> usize {
@@ -199,6 +208,10 @@ pub fn default_hnsw_m() -> usize {
 
 pub fn default_hnsw_ef_construction() -> usize {
     128
+}
+
+pub fn default_primary_vector_name() -> String {
+    "vector".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
