@@ -16,6 +16,7 @@ use hannsdb_core::document::{
     FieldValue, ScalarFieldSchema as CoreScalarFieldSchema,
     VectorFieldSchema as CoreVectorFieldSchema, VectorIndexSchema as CoreVectorIndexSchema,
 };
+#[cfg(feature = "python-binding")]
 use hannsdb_core::query::{
     QueryContext as CoreQueryContext, QueryGroupBy as CoreQueryGroupBy,
     VectorQuery as CoreVectorQuery, VectorQueryParam as CoreVectorQueryParam,
@@ -284,14 +285,16 @@ fn parse_query_ids(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<
 fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery> {
     let field_name = query.getattr("field_name")?.extract::<String>()?;
     let vector = query.getattr("vector")?.extract::<Vec<f32>>()?;
-    let param = query.getattr("param")?;
-    let param = if param.is_none() {
-        None
-    } else {
-        Some(HnswQueryParam {
+    let param = match query.getattr("param") {
+        Ok(param) if !param.is_none() => Some(HnswQueryParam {
             ef: param.getattr("ef")?.extract::<usize>()?,
-            is_using_refiner: false,
-        })
+            is_using_refiner: param
+                .getattr("is_using_refiner")
+                .ok()
+                .and_then(|value| value.extract::<bool>().ok())
+                .unwrap_or(false),
+        }),
+        _ => None,
     };
 
     Ok(VectorQuery {

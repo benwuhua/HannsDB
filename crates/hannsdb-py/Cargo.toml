@@ -6,18 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["python-binding"]
-python-binding = ["dep:pyo3", "dep:numpy"]
+default = []
+python-binding = ["dep:pyo3", "dep:numpy", "python-extension-module"]
+python-extension-module = ["pyo3/extension-module"]
 knowhere-backend = ["hannsdb-core/knowhere-backend"]
 
 [lib]
 name = "_native"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 hannsdb-core = { path = "../hannsdb-core" }
-pyo3 = { version = "0.23", features = ["abi3-py39", "auto-initialize", "extension-module"], optional = true }
+pyo3 = { version = "0.23", features = ["abi3-py39"], optional = true }
 numpy = { version = "0.23", optional = true }
 
 [dev-dependencies]

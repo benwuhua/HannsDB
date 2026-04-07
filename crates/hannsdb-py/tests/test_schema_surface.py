@@ -67,6 +67,12 @@ def test_vector_query_is_a_pure_python_dataclass_and_flattens_numpy_arrays():
     assert query.vector == [1.0, 2.0, 3.0, 4.0]
 
 
+@pytest.mark.parametrize("value", [1.23, {1, 2}, frozenset({1, 2})])
+def test_vector_query_rejects_scalar_and_set_like_inputs(value):
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.VectorQuery(field_name="dense", vector=value, param=None)
+
+
 def test_create_and_open_accepts_primary_ivf_index(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",

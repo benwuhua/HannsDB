@@ -7,22 +7,12 @@ from ...extension.rerank_function import ReRanker
 
 
 def _flatten_vector(value: Any):
-    if isinstance(value, (str, bytes, bytearray, dict)):
-        raise TypeError("vector must be a sequence of numbers")
-
     if isinstance(value, (list, tuple)):
         for item in value:
             yield from _flatten_vector(item)
         return
 
-    try:
-        iterator = iter(value)
-    except TypeError:
-        yield value
-        return
-
-    for item in iterator:
-        yield from _flatten_vector(item)
+    yield value
 
 
 def _normalize_vector(vector: Any) -> list[float]:
@@ -34,7 +24,11 @@ def _normalize_vector(vector: Any) -> list[float]:
     if np is not None and isinstance(vector, np.ndarray):
         return [float(item) for item in np.asarray(vector).reshape(-1).tolist()]
 
-    return [float(item) for item in _flatten_vector(vector)]
+    if isinstance(vector, (str, bytes, bytearray, dict, set, frozenset)):
+        raise TypeError("vector must be a list, tuple, or numpy.ndarray of numbers")
+    if isinstance(vector, list) or isinstance(vector, tuple):
+        return [float(item) for item in _flatten_vector(vector)]
+    raise TypeError("vector must be a list, tuple, or numpy.ndarray of numbers")
 
 
 @dataclass
