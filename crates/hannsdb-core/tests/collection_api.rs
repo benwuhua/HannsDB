@@ -1231,3 +1231,25 @@ fn collection_api_ignores_persisted_hnsw_blob_when_rebuild_is_required() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 11);
 }
+
+#[test]
+fn collection_api_rejects_invalid_schema_primary_vector_index_config() {
+    let root = unique_temp_dir("hannsdb_collection_api_reject_invalid_schema_primary_index");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2).with_index_param(VectorIndexSchema::Hnsw {
+                metric: Some("bogus".to_string()),
+                m: 16,
+                ef_construction: 64,
+            }),
+        ],
+    };
+
+    let err = db
+        .create_collection_with_schema("docs", &schema)
+        .expect_err("invalid schema-defined primary index config should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}

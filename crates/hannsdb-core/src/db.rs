@@ -172,6 +172,7 @@ impl HannsDb {
                 ),
             )
         })?;
+        validate_schema_primary_vector_descriptor(schema)?;
         let dimension = schema.dimension();
         if dimension == 0 {
             return Err(io::Error::new(
@@ -1821,6 +1822,49 @@ fn invalidate_persisted_hnsw_blob(collection_dir: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::Result<()> {
+    let primary_vector = schema.primary_vector().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "collection primary vector '{}' is not defined in schema vectors",
+                schema.primary_vector_name()
+            ),
+        )
+    })?;
+    let descriptor = match primary_vector.index_param.as_ref() {
+        Some(VectorIndexSchema::Ivf { metric, nlist }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Ivf,
+            metric: metric.clone(),
+            params: serde_json::json!({ "nlist": nlist }),
+        },
+        Some(VectorIndexSchema::Hnsw {
+            metric,
+            m,
+            ef_construction,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Hnsw,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction
+            }),
+        },
+        None => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some(schema.metric().to_string()),
+            params: serde_json::json!({
+                "m": schema.hnsw_m(),
+                "ef_construction": schema.hnsw_ef_construction()
+            }),
+        },
+    };
+    validate_vector_index_descriptor(primary_vector.dimension, &descriptor)
 }
 
 fn resolve_primary_vector_descriptor(
