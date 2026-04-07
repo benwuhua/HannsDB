@@ -74,6 +74,14 @@ impl QueryExecutor {
 
         let mut hits = best_hits.into_values().collect::<Vec<_>>();
         hits.sort_by(compare_hits);
+        if let Some(group_by) = plan.group_by.as_ref() {
+            return Ok(collapse_hits_by_group(
+                hits,
+                &group_by.field_name,
+                plan.top_k,
+            ));
+        }
+
         if hits.len() > plan.top_k {
             hits.truncate(plan.top_k);
         }
@@ -116,6 +124,47 @@ fn compare_hits(left: &DocumentHit, right: &DocumentHit) -> Ordering {
     left.distance
         .total_cmp(&right.distance)
         .then_with(|| left.id.cmp(&right.id))
+}
+
+fn collapse_hits_by_group(
+    hits: Vec<DocumentHit>,
+    field_name: &str,
+    top_k: usize,
+) -> Vec<DocumentHit> {
+    let mut grouped_hits = Vec::new();
+    let mut seen_groups = HashSet::new();
+    for hit in hits {
+        let Some(value) = hit.fields.get(field_name) else {
+            continue;
+        };
+        let group_key = GroupByValueKey::from_field_value(value);
+        if seen_groups.insert(group_key) {
+            grouped_hits.push(hit);
+            if grouped_hits.len() == top_k {
+                break;
+            }
+        }
+    }
+    grouped_hits
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GroupByValueKey {
+    String(String),
+    Int64(i64),
+    Float64(u64),
+    Bool(bool),
+}
+
+impl GroupByValueKey {
+    fn from_field_value(value: &FieldValue) -> Self {
+        match value {
+            FieldValue::String(value) => Self::String(value.clone()),
+            FieldValue::Int64(value) => Self::Int64(*value),
+            FieldValue::Float64(value) => Self::Float64(value.to_bits()),
+            FieldValue::Bool(value) => Self::Bool(*value),
+        }
+    }
 }
 
 fn load_records_or_empty(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {

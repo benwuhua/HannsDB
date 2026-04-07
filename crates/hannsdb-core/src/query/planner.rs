@@ -3,7 +3,7 @@ use std::io;
 use crate::catalog::CollectionMetadata;
 use crate::document::Document;
 
-use super::{parse_filter, FilterExpr, QueryContext, VectorQuery};
+use super::{parse_filter, FilterExpr, QueryContext, QueryGroupBy, VectorQuery};
 
 #[derive(Debug, Clone)]
 pub(crate) enum QueryPlan {
@@ -26,6 +26,7 @@ pub(crate) struct BruteForceQueryPlan {
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) mode: BruteForceExecutionMode,
     pub(crate) recall_sources: Vec<PlannedRecallSource>,
+    pub(crate) group_by: Option<PlannedGroupBy>,
     pub(crate) output_fields: Option<Vec<String>>,
 }
 
@@ -39,6 +40,11 @@ pub(crate) enum BruteForceExecutionMode {
 pub(crate) struct PlannedRecallSource {
     pub(crate) kind: RecallSourceKind,
     pub(crate) vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedGroupBy {
+    pub(crate) field_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,12 +65,6 @@ impl QueryPlanner {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "include_vector is not supported on the typed query path yet",
-            ));
-        }
-        if context.group_by.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "group_by is not supported on the typed query path yet",
             ));
         }
         if context.reranker.is_some() {
@@ -88,8 +88,10 @@ impl QueryPlanner {
                 .and_then(|param| param.ef_search)
                 .is_some()
         });
-        let is_single_vector_fast_path =
-            context.queries.len() == 1 && context.query_by_id.is_none() && filter.is_none();
+        let is_single_vector_fast_path = context.group_by.is_none()
+            && context.queries.len() == 1
+            && context.query_by_id.is_none()
+            && filter.is_none();
         if uses_ef_search && !is_single_vector_fast_path {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -180,11 +182,18 @@ impl QueryPlanner {
             BruteForceExecutionMode::Recall
         };
 
+        let group_by = context
+            .group_by
+            .as_ref()
+            .map(|group_by| validate_group_by(collection, group_by, mode))
+            .transpose()?;
+
         Ok(QueryPlan::BruteForce(BruteForceQueryPlan {
             top_k: context.top_k,
             filter,
             mode,
             recall_sources,
+            group_by,
             output_fields: context.output_fields.clone(),
         }))
     }
@@ -243,4 +252,66 @@ fn validate_vector_query(
     }
 
     Ok(())
+}
+
+fn validate_group_by(
+    collection: &CollectionMetadata,
+    group_by: &QueryGroupBy,
+    mode: BruteForceExecutionMode,
+) -> io::Result<PlannedGroupBy> {
+    if mode == BruteForceExecutionMode::FilterOnlyScan {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "group_by requires at least one recall source on the typed query path",
+        ));
+    }
+
+    let field_name = group_by.field_name.trim();
+    if field_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "group_by field name must not be empty",
+        ));
+    }
+
+    if let Some(field) = collection
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)
+    {
+        if field.array || field.data_type == crate::document::FieldType::VectorFp32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "group_by field '{}' must reference a scalar field in collection '{}'",
+                    field_name, collection.name
+                ),
+            ));
+        }
+        return Ok(PlannedGroupBy {
+            field_name: field_name.to_string(),
+        });
+    }
+
+    if collection
+        .vectors
+        .iter()
+        .any(|vector| vector.name == field_name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "group_by field '{}' must reference a scalar field, not a vector field",
+                field_name
+            ),
+        ));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "group_by field '{}' is not defined in collection '{}'",
+            field_name, collection.name
+        ),
+    ))
 }

@@ -241,17 +241,54 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_group_by_until_supported() {
-    let root = unique_temp_dir("hannsdb_typed_query_group_by");
+fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
+    let root = unique_temp_dir("hannsdb_typed_query_group_by_recall");
     let mut db = HannsDb::open(&root).expect("open db");
-    db.create_collection("docs", 2, "l2")
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                10,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                11,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.1_f32, 0.0],
+            ),
+            Document::new(
+                20,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.05_f32, 0.0],
+            ),
+            Document::new(
+                21,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.2_f32, 0.0],
+            ),
+            Document::new(
+                30,
+                [("group".to_string(), FieldValue::Int64(3))],
+                vec![0.15_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
 
-    let err = db
+    let hits = db
         .query_with_context(
             "docs",
             &QueryContext {
-                top_k: 3,
+                top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
                     vector: vec![0.0_f32, 0.0],
@@ -267,7 +304,115 @@ fn zvec_parity_query_context_rejects_group_by_until_supported() {
                 reranker: None,
             },
         )
-        .expect_err("group_by should be rejected in the first slice");
+        .expect("group_by should keep the best hit from each group");
+
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![10, 20]);
+    assert_eq!(hits.len(), 2, "top_k should cap the number of groups");
+    assert_eq!(hits[0].fields.get("group"), Some(&FieldValue::Int64(1)));
+    assert_eq!(hits[1].fields.get("group"), Some(&FieldValue::Int64(2)));
+    assert!(
+        hits[0].distance < hits[1].distance,
+        "winning groups should preserve the original ranking order"
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
+    let root = unique_temp_dir("hannsdb_typed_query_group_by_invalid_field");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let missing_field_err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: Some(QueryGroupBy {
+                    field_name: "missing".to_string(),
+                }),
+                reranker: None,
+            },
+        )
+        .expect_err("group_by should reject an undefined field");
+
+    assert_eq!(missing_field_err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(missing_field_err.to_string().contains("group_by"));
+    assert!(missing_field_err.to_string().contains("missing"));
+
+    let vector_field_err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: Some(QueryGroupBy {
+                    field_name: "vector".to_string(),
+                }),
+                reranker: None,
+            },
+        )
+        .expect_err("group_by should reject vector fields");
+
+    assert_eq!(vector_field_err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(vector_field_err.to_string().contains("group_by"));
+    assert!(vector_field_err.to_string().contains("vector"));
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
+    let root = unique_temp_dir("hannsdb_typed_query_group_by_filter_only");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: Vec::new(),
+                query_by_id: None,
+                filter: Some("group == 1".to_string()),
+                output_fields: None,
+                include_vector: false,
+                group_by: Some(QueryGroupBy {
+                    field_name: "group".to_string(),
+                }),
+                reranker: None,
+            },
+        )
+        .expect_err("filter-only group_by should remain unsupported in this slice");
 
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("group_by"));
