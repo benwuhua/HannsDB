@@ -318,6 +318,128 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
 }
 
 #[test]
+fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
+    let root = unique_temp_dir("hannsdb_typed_query_group_by_missing_field");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(1, [], vec![0.0_f32, 0.0]),
+            Document::new(
+                2,
+                [("group".to_string(), FieldValue::Int64(7))],
+                vec![0.05_f32, 0.0],
+            ),
+            Document::new(
+                3,
+                [("group".to_string(), FieldValue::Int64(7))],
+                vec![0.10_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: Some(QueryGroupBy {
+                    field_name: "group".to_string(),
+                }),
+                reranker: None,
+            },
+        )
+        .expect("group_by should retain the top-ranked hit with a missing group field");
+
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![1, 2]);
+    assert_eq!(
+        hits[0].fields.get("group"),
+        None,
+        "missing grouped field should survive as its own group"
+    );
+    assert_eq!(hits[1].fields.get("group"), Some(&FieldValue::Int64(7)));
+}
+
+#[test]
+fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
+    let root = unique_temp_dir("hannsdb_typed_query_group_by_float_canonical");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("score", FieldType::Float64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                10,
+                [("score".to_string(), FieldValue::Float64(-0.0))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                11,
+                [("score".to_string(), FieldValue::Float64(0.0))],
+                vec![0.05_f32, 0.0],
+            ),
+            Document::new(
+                30,
+                [("score".to_string(), FieldValue::Float64(1.0))],
+                vec![0.10_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: Some(QueryGroupBy {
+                    field_name: "score".to_string(),
+                }),
+                reranker: None,
+            },
+        )
+        .expect("group_by should canonicalize float group keys");
+
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![10, 30]);
+}
+
+#[test]
 fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_invalid_field");
     let mut db = HannsDb::open(&root).expect("open db");

@@ -134,10 +134,11 @@ fn collapse_hits_by_group(
     let mut grouped_hits = Vec::new();
     let mut seen_groups = HashSet::new();
     for hit in hits {
-        let Some(value) = hit.fields.get(field_name) else {
-            continue;
-        };
-        let group_key = GroupByValueKey::from_field_value(value);
+        let group_key = hit
+            .fields
+            .get(field_name)
+            .map(GroupByValueKey::from_field_value)
+            .unwrap_or(GroupByValueKey::Missing);
         if seen_groups.insert(group_key) {
             grouped_hits.push(hit);
             if grouped_hits.len() == top_k {
@@ -150,9 +151,10 @@ fn collapse_hits_by_group(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GroupByValueKey {
+    Missing,
     String(String),
     Int64(i64),
-    Float64(u64),
+    Float64(FloatGroupKey),
     Bool(bool),
 }
 
@@ -161,8 +163,27 @@ impl GroupByValueKey {
         match value {
             FieldValue::String(value) => Self::String(value.clone()),
             FieldValue::Int64(value) => Self::Int64(*value),
-            FieldValue::Float64(value) => Self::Float64(value.to_bits()),
+            FieldValue::Float64(value) => Self::Float64(FloatGroupKey::new(*value)),
             FieldValue::Bool(value) => Self::Bool(*value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FloatGroupKey {
+    Nan,
+    Zero,
+    Exact(u64),
+}
+
+impl FloatGroupKey {
+    fn new(value: f64) -> Self {
+        if value.is_nan() {
+            Self::Nan
+        } else if value == 0.0 {
+            Self::Zero
+        } else {
+            Self::Exact(value.to_bits())
         }
     }
 }
