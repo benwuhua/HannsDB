@@ -256,10 +256,7 @@ fn parse_doc_id(id: &str) -> std::io::Result<i64> {
 }
 
 #[cfg(feature = "python-binding")]
-fn parse_query_ids(
-    py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-) -> PyResult<Option<Vec<i64>>> {
+fn parse_query_ids(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<i64>>> {
     if value.is_none() {
         return Ok(None);
     }
@@ -293,20 +290,28 @@ fn py_query_context_to_core(
     let query_objects: Vec<Py<PyAny>> = queries.extract()?;
     let mut core_queries = Vec::with_capacity(query_objects.len());
     for query_object in query_objects {
-        let py_query = query_object.bind(py).extract::<PyRef<'_, PyVectorQuery>>()?;
+        let py_query = query_object
+            .bind(py)
+            .extract::<PyRef<'_, PyVectorQuery>>()?;
         core_queries.push(CoreVectorQuery {
             field_name: py_query.inner.field_name.clone(),
             vector: py_query.inner.vector.clone(),
-            param: py_query.inner.param.as_ref().map(|param| CoreVectorQueryParam {
-                ef_search: Some(param.ef),
-            }),
+            param: py_query
+                .inner
+                .param
+                .as_ref()
+                .map(|param| CoreVectorQueryParam {
+                    ef_search: Some(param.ef),
+                }),
         });
     }
 
     let query_by_id_attr = context.getattr("query_by_id")?;
     let query_by_id = parse_query_ids(py, &query_by_id_attr)?;
     let filter = context.getattr("filter")?.extract::<Option<String>>()?;
-    let output_fields = context.getattr("output_fields")?.extract::<Option<Vec<String>>>()?;
+    let output_fields = context
+        .getattr("output_fields")?
+        .extract::<Option<Vec<String>>>()?;
     let include_vector = context.getattr("include_vector")?.extract::<bool>()?;
     if include_vector {
         return Err(pyo3::exceptions::PyNotImplementedError::new_err(
@@ -391,7 +396,7 @@ fn collection_metadata_from_root(
         &root
             .join("collections")
             .join(collection_name)
-        .join("collection.json"),
+            .join("collection.json"),
     )
 }
 
@@ -596,7 +601,8 @@ impl Collection {
                 "vector index descriptor is missing",
             )
         })?;
-        self.db.create_vector_index(&self.collection_name, descriptor)
+        self.db
+            .create_vector_index(&self.collection_name, descriptor)
     }
 
     pub fn drop_vector_index(&self, field_name: &str) -> std::io::Result<()> {
@@ -622,7 +628,8 @@ impl Collection {
                 "scalar index descriptor is missing",
             )
         })?;
-        self.db.create_scalar_index(&self.collection_name, descriptor)
+        self.db
+            .create_scalar_index(&self.collection_name, descriptor)
     }
 
     pub fn drop_scalar_index(&self, field_name: &str) -> std::io::Result<()> {
@@ -709,11 +716,7 @@ impl Collection {
     }
 
     #[cfg(feature = "python-binding")]
-    pub fn query_context(
-        &self,
-        py: Python<'_>,
-        context: &Bound<'_, PyAny>,
-    ) -> PyResult<Vec<Doc>> {
+    pub fn query_context(&self, py: Python<'_>, context: &Bound<'_, PyAny>) -> PyResult<Vec<Doc>> {
         let core_context = py_query_context_to_core(py, context)?;
         let hits = self
             .db
@@ -747,10 +750,7 @@ fn io_to_py_err(error: std::io::Error) -> PyErr {
         }
         std::io::ErrorKind::NotFound => PyFileNotFoundError::new_err(error.to_string()),
         std::io::ErrorKind::Unsupported => {
-            pyo3::exceptions::PyNotImplementedError::new_err(format!(
-                "unsupported: {}",
-                error
-            ))
+            pyo3::exceptions::PyNotImplementedError::new_err(format!("unsupported: {}", error))
         }
         _ => PyRuntimeError::new_err(error.to_string()),
     }
@@ -1489,6 +1489,9 @@ impl PyCollection {
         filter: Option<String>,
     ) -> PyResult<Vec<Py<PyDoc>>> {
         let borrowed = vectors.borrow(py);
+        let vectors = borrowed.inner.clone();
+        drop(borrowed);
+        let inner = self.inner_ref()?;
         let empty_output_fields = output_fields
             .as_ref()
             .is_some_and(|fields| fields.is_empty());
@@ -1497,9 +1500,8 @@ impl PyCollection {
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
         if empty_output_fields && !has_filter {
-            let hits = self
-                .inner_ref()?
-                .query_ids_scores(topk, &borrowed.inner)
+            let hits = py
+                .allow_threads(|| inner.query_ids_scores(topk, &vectors))
                 .map_err(io_to_py_err)?;
             return hits
                 .into_iter()
@@ -1519,10 +1521,8 @@ impl PyCollection {
                 .collect();
         }
 
-        let vectors = borrowed.inner.clone();
-        let docs = self
-            .inner_ref()?
-            .query(output_fields, topk, filter.as_deref(), vectors)
+        let docs = py
+            .allow_threads(|| inner.query(output_fields, topk, filter.as_deref(), vectors))
             .map_err(io_to_py_err)?;
         docs.into_iter()
             .map(|doc| Py::new(py, PyDoc { inner: doc }))
@@ -1530,15 +1530,32 @@ impl PyCollection {
     }
 
     #[pyo3(signature = (context))]
-    fn query_context(
-        &self,
-        py: Python<'_>,
-        context: Bound<'_, PyAny>,
-    ) -> PyResult<Vec<Py<PyDoc>>> {
-        let docs = self.inner_ref()?.query_context(py, &context)?;
-        docs.into_iter()
-            .map(|doc| Py::new(py, PyDoc { inner: doc }))
-            .collect()
+    fn query_context(&self, py: Python<'_>, context: Bound<'_, PyAny>) -> PyResult<Vec<Py<PyDoc>>> {
+        let core_context = py_query_context_to_core(py, &context)?;
+        let inner = self.inner_ref()?;
+        let docs = py
+            .allow_threads(|| {
+                inner
+                    .db
+                    .query_with_context(&inner.collection_name, &core_context)
+            })
+            .map_err(io_to_py_err)?;
+        Ok(docs
+            .into_iter()
+            .map(|hit| {
+                Py::new(
+                    py,
+                    PyDoc {
+                        inner: Doc {
+                            id: hit.id.to_string(),
+                            score: Some(hit.distance),
+                            fields: hit.fields,
+                            vectors: BTreeMap::new(),
+                        },
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?)
     }
 
     #[pyo3(signature = (field_name, vector, topk, ef=32))]
@@ -1632,7 +1649,9 @@ impl PyCollection {
     }
 
     fn list_vector_indexes(&self) -> PyResult<Vec<String>> {
-        self.inner_ref()?.list_vector_indexes().map_err(io_to_py_err)
+        self.inner_ref()?
+            .list_vector_indexes()
+            .map_err(io_to_py_err)
     }
 
     fn create_scalar_index(&self, field_name: String) -> PyResult<()> {
@@ -1648,7 +1667,9 @@ impl PyCollection {
     }
 
     fn list_scalar_indexes(&self) -> PyResult<Vec<String>> {
-        self.inner_ref()?.list_scalar_indexes().map_err(io_to_py_err)
+        self.inner_ref()?
+            .list_scalar_indexes()
+            .map_err(io_to_py_err)
     }
 }
 

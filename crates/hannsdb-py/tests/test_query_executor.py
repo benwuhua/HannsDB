@@ -1,3 +1,7 @@
+import threading
+import time
+import math
+
 import hannsdb
 import pytest
 
@@ -52,6 +56,49 @@ class RecordingReranker(hannsdb.ReRanker):
         self.seen_keys.append(tuple(query_results.keys()))
         first_key = next(iter(query_results))
         return list(query_results[first_key])[: self.topn]
+
+
+class InstrumentedCollection:
+    def __init__(self, collection, delays=None, barrier=None, fail_key=None):
+        self.collection = collection
+        self.delays = delays or {}
+        self.barrier = barrier
+        self.fail_key = fail_key
+        self.active = 0
+        self.max_active = 0
+        self.seen_keys = []
+        self._lock = threading.Lock()
+
+    def query_context(self, context):
+        query = context.queries[0]
+        key = tuple(query.vector)
+
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.seen_keys.append(key)
+
+        try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=1)
+
+            delay = self.delays.get(key, 0.0)
+            if delay:
+                time.sleep(delay)
+
+            if self.fail_key is not None and self._matches_key(key, self.fail_key):
+                raise RuntimeError(f"forced failure for {key}")
+
+            return self.collection.query_context(context)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+    @staticmethod
+    def _matches_key(left, right):
+        if len(left) != len(right):
+            return False
+        return all(math.isclose(lhs, rhs, rel_tol=0.0, abs_tol=1e-8) for lhs, rhs in zip(left, right))
 
 
 def test_query_context_accepts_queries_shape():
@@ -144,9 +191,19 @@ def test_query_executor_supports_group_by(tmp_path):
     assert [hit.fields["group"] for hit in hits] == [1, 2]
 
 
-def test_query_executor_supports_builtin_rrf_reranker(tmp_path):
+def test_query_executor_supports_builtin_rrf_reranker(tmp_path, monkeypatch):
     collection, schema = build_collection(tmp_path)
+    proxy = InstrumentedCollection(
+        collection,
+        delays={
+            (0.0, 0.0): 0.05,
+            (0.2, 0.0): 0.0,
+        },
+    )
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    monkeypatch.delenv("ZVEC_QUERY_CONCURRENCY", raising=False)
+    monkeypatch.delenv("HANNSDB_QUERY_CONCURRENCY", raising=False)
 
     context = hannsdb.QueryContext(
         top_k=2,
@@ -158,12 +215,13 @@ def test_query_executor_supports_builtin_rrf_reranker(tmp_path):
         output_fields=["group"],
     )
 
-    hits = executor.execute(collection, context)
+    hits = executor.execute(proxy, context)
 
     # `top_k` is the per-query fan-out depth on the reranker path; `topn`
     # controls the final fused result size.
     assert [hit.id for hit in hits] == ["2", "1", "3"]
     assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+    assert proxy.max_active == 1
 
 
 def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
@@ -184,6 +242,63 @@ def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labe
 
     assert reranker.seen_keys == [("dense", "dense#2")]
     assert [hit.id for hit in hits] == ["1", "2"]
+
+
+def test_query_executor_reranker_fanout_can_run_concurrently_when_enabled(
+    tmp_path, monkeypatch
+):
+    collection, schema = build_collection(tmp_path)
+    proxy = InstrumentedCollection(
+        collection,
+        delays={
+            (0.0, 0.0): 0.05,
+            (0.2, 0.0): 0.0,
+        },
+    )
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+    reranker = RecordingReranker()
+
+    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=reranker,
+    )
+
+    hits = executor.execute(proxy, context)
+
+    assert proxy.max_active >= 2
+    assert reranker.seen_keys == [("dense", "dense#2")]
+    assert [hit.id for hit in hits] == ["1", "2"]
+
+
+def test_query_executor_propagates_errors_from_concurrent_fanout(
+    tmp_path, monkeypatch
+):
+    collection, schema = build_collection(tmp_path)
+    proxy = InstrumentedCollection(
+        collection,
+        fail_key=(0.2, 0.0),
+    )
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=RecordingReranker(),
+    )
+
+    with pytest.raises(RuntimeError, match="forced failure"):
+        executor.execute(proxy, context)
 
 
 def test_query_executor_rejects_core_unsupported_query_shape_as_not_implemented(tmp_path):
