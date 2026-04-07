@@ -837,3 +837,111 @@ fn zvec_parity_query_context_rejects_include_vector_until_supported() {
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("include_vector"));
 }
+
+#[test]
+fn zvec_parity_query_context_rejects_include_vector_before_query_by_id_resolution() {
+    let root = unique_temp_dir("hannsdb_typed_query_include_vector_query_by_id_guard");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert_documents("docs", &[Document::new(7, [], vec![0.0_f32, 0.0])])
+        .expect("insert documents");
+
+    fs::remove_file(
+        root.join("collections")
+            .join("docs")
+            .join("tombstones.json"),
+    )
+    .expect("remove tombstones to prove query_by_id resolution is not reached");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: Vec::new(),
+                query_by_id: Some(vec![7]),
+                filter: Some("1 == 1".to_string()),
+                output_fields: None,
+                include_vector: true,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("include_vector should fail before query_by_id resolution touches storage");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("include_vector"));
+}
+
+#[test]
+fn zvec_parity_filter_only_query_projects_output_fields() {
+    let root = unique_temp_dir("hannsdb_typed_query_filter_only_output_fields");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("color", FieldType::String),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                1,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("color".to_string(), FieldValue::String("red".to_string())),
+                ],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                2,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("color".to_string(), FieldValue::String("blue".to_string())),
+                ],
+                vec![1.0_f32, 1.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: Vec::new(),
+                query_by_id: None,
+                filter: Some("group == 1".to_string()),
+                output_fields: Some(vec!["color".to_string()]),
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("filter-only query with output field projection");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        hits[0].fields,
+        [("color".to_string(), FieldValue::String("red".to_string())),]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        hits[1].fields,
+        [("color".to_string(), FieldValue::String("blue".to_string())),]
+            .into_iter()
+            .collect()
+    );
+}

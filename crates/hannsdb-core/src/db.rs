@@ -1002,6 +1002,12 @@ impl CollectionHandle {
     }
 
     pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
+        if context.include_vector {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "include_vector is not supported on the typed query path yet",
+            ));
+        }
         let collection_meta =
             CollectionMetadata::load_from_path(&self.collection_paths().collection_meta)?;
         let query_by_id_documents = match context.query_by_id.as_ref() {
