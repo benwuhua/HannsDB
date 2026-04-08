@@ -605,6 +605,68 @@ def test_real_collection_query_context_rejects_group_by_with_reranker(tmp_path):
         collection.destroy()
 
 
+def test_real_collection_query_rejects_group_by_with_reranker_legacy_kwargs(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vector=[0.0, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="2",
+                vector=[0.1, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="3",
+                vector=[0.2, 0.0],
+                field_name="dense",
+                fields={"group": 2},
+                score=0.0,
+            ),
+        ]
+    )
+
+    try:
+        with pytest.raises(NotImplementedError) as exc_info:
+            collection.query(
+                vectors=hannsdb.VectorQuery(
+                    field_name="dense",
+                    vector=[0.0, 0.0],
+                    param=None,
+                ),
+                output_fields=[],
+                topk=2,
+                filter="",
+                group_by=hannsdb.QueryGroupBy(field_name="group"),
+                reranker=hannsdb.RrfReRanker(topn=2),
+            )
+        assert str(exc_info.value) == (
+            "group_by is not supported by the Python facade yet"
+        )
+        assert "unsupported:" not in str(exc_info.value)
+    finally:
+        collection.destroy()
+
+
 def test_real_collection_query_context_rejects_query_by_id_with_reranker(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -657,6 +719,68 @@ def test_real_collection_query_context_rejects_query_by_id_with_reranker(tmp_pat
     try:
         with pytest.raises(NotImplementedError, match="query_by_id"):
             collection.query(context)
+    finally:
+        collection.destroy()
+
+
+def test_real_collection_query_rejects_query_by_id_with_reranker_legacy_kwargs(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vector=[0.0, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="2",
+                vector=[0.1, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="3",
+                vector=[0.2, 0.0],
+                field_name="dense",
+                fields={"group": 2},
+                score=0.0,
+            ),
+        ]
+    )
+
+    try:
+        with pytest.raises(NotImplementedError) as exc_info:
+            collection.query(
+                vectors=hannsdb.VectorQuery(
+                    field_name="dense",
+                    vector=[0.0, 0.0],
+                    param=None,
+                ),
+                output_fields=[],
+                topk=2,
+                filter="",
+                query_by_id=["1"],
+                reranker=hannsdb.RrfReRanker(topn=2),
+            )
+        assert str(exc_info.value) == (
+            "query_by_id is not supported by the Python facade yet"
+        )
+        assert "unsupported:" not in str(exc_info.value)
     finally:
         collection.destroy()
 
