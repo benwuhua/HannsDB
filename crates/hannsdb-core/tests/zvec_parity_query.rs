@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+    VectorIndexSchema,
 };
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
@@ -308,6 +310,197 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
     assert_eq!(
         hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
         vec![0.0, 0.2, 1.0]
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_bruteforce_path() {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_vector_metric");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(
+        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+            Some("cosine"),
+            16,
+            128,
+        )),
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.9_f32, 0.1])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![10.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![1.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("secondary vector typed query");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert!((hits[0].distance - 0.0).abs() < 1e-6);
+    assert!((hits[1].distance - 0.006116271).abs() < 1e-6);
+}
+
+#[test]
+fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_bruteforce_path() {
+    let root = unique_temp_dir("hannsdb_typed_query_query_by_id_field_metric");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(
+        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+            Some("cosine"),
+            16,
+            128,
+        )),
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.9_f32, 0.1])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![10.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0],
+                [("title".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![],
+                query_by_id: Some(vec![3]),
+                query_by_id_field_name: Some("title".to_string()),
+                filter: Some("group == 1".to_string()),
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("query_by_id typed query");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+    assert!((hits[0].distance - 0.0).abs() < 1e-6);
+    assert!((hits[1].distance - 0.006116271).abs() < 1e-6);
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_mixed_metric_typed_recall_sources() {
+    let root = unique_temp_dir("hannsdb_typed_query_mixed_metric_recall");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(
+        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+            Some("cosine"),
+            16,
+            128,
+        )),
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![
+                    VectorQuery {
+                        field_name: "dense".to_string(),
+                        vector: vec![1.0_f32, 0.0],
+                        param: None,
+                    },
+                    VectorQuery {
+                        field_name: "title".to_string(),
+                        vector: vec![1.0_f32, 0.0],
+                        param: None,
+                    },
+                ],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("mixed metric typed recall should be rejected");
+
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(
+        err.to_string().contains("mixed metrics"),
+        "unexpected error message: {err}"
     );
 }
 
@@ -1600,7 +1793,10 @@ fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_n
         )
         .expect("query should default query_by_id to primary vector recall");
 
-    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![7, 9, 8]);
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![7, 9, 8]
+    );
     assert_eq!(hits[0].distance, 0.0);
     assert_eq!(hits[0].fields.get("group"), Some(&FieldValue::Int64(1)));
 }
@@ -1658,7 +1854,10 @@ fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configur
         )
         .expect("query should recall from secondary vector");
 
-    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![7, 8]);
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![7, 8]
+    );
     assert_eq!(hits[0].distance, 0.0);
     assert!(hits[1].distance > hits[0].distance);
 }
@@ -1794,7 +1993,10 @@ fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_
         )
         .expect("query_by_id_field_name should be ignored when query_by_id is absent");
 
-    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
     assert_eq!(
         hits.iter()
             .map(|hit| hit.fields.get("group"))

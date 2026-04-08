@@ -40,6 +40,7 @@ pub(crate) enum BruteForceExecutionMode {
 pub(crate) struct PlannedRecallSource {
     pub(crate) kind: RecallSourceKind,
     pub(crate) vector: Vec<f32>,
+    pub(crate) metric: String,
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +123,13 @@ impl QueryPlanner {
 
         let mut recall_sources = Vec::new();
         for query in &context.queries {
-            validate_vector_query(collection, query, false, false)?;
+            let metric = validate_vector_query(collection, query, false, false)?;
             recall_sources.push(PlannedRecallSource {
                 kind: RecallSourceKind::ExplicitVector {
                     field_name: query.field_name.clone(),
                 },
                 vector: query.vector.clone(),
+                metric,
             });
         }
 
@@ -173,8 +175,11 @@ impl QueryPlanner {
                 let vector = if query_by_id_field_name == collection.primary_vector {
                     document.vector.as_slice()
                 } else {
-                    document.vectors.get(&query_by_id_field_name).map(Vec::as_slice).ok_or_else(
-                        || {
+                    document
+                        .vectors
+                        .get(&query_by_id_field_name)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
@@ -182,8 +187,7 @@ impl QueryPlanner {
                                     id, query_by_id_field_name
                                 ),
                             )
-                        },
-                    )?
+                        })?
                 };
                 if vector.len() != query_by_id_vector_schema.dimension {
                     return Err(io::Error::new(
@@ -202,8 +206,19 @@ impl QueryPlanner {
                         field_name: query_by_id_field_name.clone(),
                     },
                     vector: vector.to_vec(),
+                    metric: resolve_vector_metric(collection, query_by_id_vector_schema)?,
                 });
             }
+        }
+
+        if let Some(metric) = mixed_metric_error(&recall_sources) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "mixed metrics are not supported on the typed brute-force path yet: {}",
+                    metric
+                ),
+            ));
         }
 
         let mode = if recall_sources.is_empty() {
@@ -241,7 +256,7 @@ fn validate_vector_query(
     query: &VectorQuery,
     allow_ef_search: bool,
     require_primary: bool,
-) -> io::Result<()> {
+) -> io::Result<String> {
     if !allow_ef_search
         && query
             .param
@@ -289,7 +304,34 @@ fn validate_vector_query(
         ));
     }
 
-    Ok(())
+    resolve_vector_metric(collection, vector_schema)
+}
+
+fn resolve_vector_metric(
+    collection: &CollectionMetadata,
+    vector_schema: &crate::document::VectorFieldSchema,
+) -> io::Result<String> {
+    Ok(vector_schema
+        .metric()
+        .unwrap_or(collection.metric.as_str())
+        .to_ascii_lowercase())
+}
+
+fn mixed_metric_error(recall_sources: &[PlannedRecallSource]) -> Option<String> {
+    let first = recall_sources.first()?.metric.to_ascii_lowercase();
+    let mut distinct = vec![first.clone()];
+    for source in &recall_sources[1..] {
+        let metric = source.metric.to_ascii_lowercase();
+        if !distinct.iter().any(|existing| existing == &metric) {
+            distinct.push(metric);
+        }
+    }
+
+    if distinct.len() > 1 {
+        Some(distinct.join(", "))
+    } else {
+        None
+    }
 }
 
 fn validate_group_by(

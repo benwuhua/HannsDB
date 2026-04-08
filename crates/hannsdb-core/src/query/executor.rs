@@ -79,7 +79,6 @@ impl QueryExecutor {
                         vector,
                         vectors.as_deref(),
                         row_idx,
-                        &collection.metric,
                         &collection.primary_vector,
                     )?,
                     BruteForceExecutionMode::FilterOnlyScan => Some(0.0),
@@ -119,7 +118,6 @@ fn best_distance(
     primary_vector: &[f32],
     secondary_vectors: Option<&[BTreeMap<String, Vec<f32>>]>,
     row_idx: usize,
-    metric: &str,
     primary_vector_name: &str,
 ) -> io::Result<Option<f32>> {
     let mut best = None;
@@ -139,7 +137,7 @@ fn best_distance(
         let Some(candidate_vector) = candidate_vector else {
             continue;
         };
-        let distance = distance_by_metric(&source.vector, candidate_vector, metric)?;
+        let distance = distance_by_metric(&source.vector, candidate_vector, &source.metric)?;
         match best {
             Some(current) if distance >= current => {}
             _ => best = Some(distance),
