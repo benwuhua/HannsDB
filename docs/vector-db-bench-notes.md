@@ -118,6 +118,20 @@ Source: [`logs/vectordb_bench.log`](/Users/ryan/Code/HannsDB/logs/vectordb_bench
     - `search_layer_idx_*` and `distance_to_idx_cosine_dispatch`
 - Current conclusion:
   - the search-side brute-force bottleneck has been removed from the critical path for this case
+
+## 10) 2026-04-08 parity smoke entrypoint and current gate coverage
+
+- New smoke entrypoint:
+  - `scripts/run_zvec_parity_smoke.sh`
+- Gate coverage chained by that script:
+  - Rust: `zvec_parity_schema`, `zvec_parity_query`, `http_smoke`
+  - Python: `tests/test_typing_surface.py`, `tests/test_schema_surface.py`, `tests/test_collection_parity.py`, `tests/test_collection_facade.py`, `tests/test_query_executor.py`, `tests/test_collection_concurrency.py`
+- Latest local verification on `2026-04-08`:
+  - Rust targeted gates passed
+  - daemon `http_smoke` passed
+  - Python passed with `78 passed, 4 skipped`
+- Benchmark notes path printed by the smoke script:
+  - `docs/vector-db-bench-notes.md`
   - the new benchmark blocker is knowhere-backed HNSW build cost during optimize on the `50K / 1536 / cosine` dataset
 
 ## 10) Standalone optimize benchmark entry (no external dataset download)

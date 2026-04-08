@@ -23,6 +23,8 @@
 - [x] Minimal daemon routes
 - [x] HannsDB client integration in `VectorDBBench`
 - [x] Tiny benchmark smoke path
+- [x] Parity smoke entrypoint for the current targeted gates
+  - 2026-04-08: `scripts/run_zvec_parity_smoke.sh` now chains `zvec_parity_schema`, `zvec_parity_query`, `http_smoke`, and the current Python facade/query/concurrency smoke set.
 - [x] Standalone optimize benchmark entry
 - [x] Release-profile optimize benchmark proxy at real target scale (`50K / 1536 / cosine`)
 - [x] First evidence-backed `knowhere-rs` HNSW hotpath improvement on near-target cosine build
@@ -194,6 +196,7 @@
 - [x] Keep ANN index as derived acceleration state, not the only truth.
 - [x] Execute the detailed parity slice plan in `docs/superpowers/plans/2026-03-20-hannsdb-zvec-parity-v1.md`.
 - 2026-03-20 update: the first parity tranche is now implemented in core/Python/daemon for one-primary-vector collections with typed scalar payloads, `upsert`, `fetch`, correct filtered query, daemon `search.output_fields`, and an explicit daemon `/stats` alias.
+- 2026-04-08 update: the Python parity slice now includes `hannsdb.typing` public wrappers, the schema/metadata bridge preserves `QuantizeType`, and the Python concurrency gate covers single-vector `insert`, `upsert`, `fetch`, and `query` on the current supported surface.
 
 **Exit criteria:**
 - HannsDB has a clear agent-facing data model, not only benchmark-facing inserts and queries.
