@@ -226,6 +226,28 @@ fn single_vector_document_reopen_rebuilds_truncated_vectors_sidecar() {
 }
 
 #[test]
+fn legacy_insert_reopen_rebuilds_truncated_vectors_sidecar() {
+    let root = unique_temp_dir("hannsdb_legacy_insert_truncated_vectors");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert("docs", &[21], &[0.7, 0.8])
+        .expect("legacy insert");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::write(collection_dir.join("vectors.jsonl"), b"").expect("truncate vectors sidecar");
+
+    let reopened = HannsDb::open(&root).expect("reopen should replay wal");
+    let replayed = reopened
+        .fetch_documents("docs", &[21])
+        .expect("fetch replayed doc");
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].vector, vec![0.7, 0.8]);
+    assert!(replayed[0].vectors.is_empty());
+}
+
+#[test]
 fn multi_vector_document_legacy_insert_keeps_vectors_sidecar_aligned() {
     let root = unique_temp_dir("hannsdb_multi_vector_document_legacy_insert_alignment");
     let mut db = HannsDb::open(&root).expect("open db");

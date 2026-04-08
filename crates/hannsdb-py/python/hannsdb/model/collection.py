@@ -82,7 +82,7 @@ def _wrap_doc(item):
         return Doc._from_native(item)
     if hasattr(item, "id") and hasattr(item, "fields"):
         vectors = getattr(item, "vectors", None)
-        if vectors:
+        if vectors is not None:
             return Doc(
                 id=getattr(item, "id"),
                 score=getattr(item, "score", None),

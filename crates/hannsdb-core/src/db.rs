@@ -1535,6 +1535,7 @@ impl WalReplayPlan {
                 } if !ids.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
                         plan.requires_data_files = true;
+                        plan.requires_vector_sidecar = true;
                     }
                 }
                 WalRecord::InsertDocuments {

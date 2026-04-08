@@ -102,6 +102,26 @@ def test_wrap_doc_preserves_legacy_doc_like_vector_and_field_name():
     assert wrapped.field("session_id") == "abc"
 
 
+def test_wrap_doc_preserves_field_name_for_empty_vectors_mapping():
+    wrapped = hannsdb.model.collection._wrap_doc(
+        type(
+            "LegacyDocLike",
+            (),
+            {
+                "id": "1",
+                "score": 0.1,
+                "fields": {"session_id": "abc"},
+                "vectors": {},
+                "field_name": "z_primary",
+            },
+        )()
+    )
+
+    assert wrapped.field_name == "z_primary"
+    assert wrapped.vectors == {}
+    assert wrapped.field("session_id") == "abc"
+
+
 def test_real_collection_supports_multi_vector_doc_writes_and_round_trip(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
