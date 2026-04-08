@@ -287,6 +287,91 @@ fn collection_api_multi_segment_read_paths_use_segment_aware_loading() {
 }
 
 #[test]
+fn collection_api_delete_uses_segment_aware_runtime_layout() {
+    let root = unique_temp_dir("hannsdb_collection_api_segment_aware_delete");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let first_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![1.0_f32, 1.0],
+        ),
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(3))],
+            vec![2.0_f32, 2.0],
+        ),
+        Document::new(
+            40,
+            vec![("group".to_string(), FieldValue::Int64(4))],
+            vec![3.0_f32, 3.0],
+        ),
+    ];
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let second_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(5))],
+            vec![0.1_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(6))],
+            vec![0.2_f32, 0.0],
+        ),
+    ];
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[1]);
+
+    let deleted = db.delete("docs", &[10, 20]).expect("delete ids");
+    assert_eq!(deleted, 1);
+
+    let info = db.get_collection_info("docs").expect("collection info");
+    assert_eq!(info.record_count, 6);
+    assert_eq!(info.deleted_count, 2);
+    assert_eq!(info.live_count, 4);
+
+    let seg1_tombstones = TombstoneMask::load_from_path(
+        &root
+            .join("collections")
+            .join("docs")
+            .join("segments")
+            .join("seg-0001")
+            .join("tombstones.json"),
+    )
+    .expect("load seg-0001 tombstones");
+    let seg2_tombstones = TombstoneMask::load_from_path(
+        &root
+            .join("collections")
+            .join("docs")
+            .join("segments")
+            .join("seg-0002")
+            .join("tombstones.json"),
+    )
+    .expect("load seg-0002 tombstones");
+
+    assert!(!seg1_tombstones.is_deleted(0), "older shadowed row 10 must stay live");
+    assert!(!seg1_tombstones.is_deleted(1), "older shadowed row 20 must stay live");
+    assert!(seg2_tombstones.is_deleted(0), "newest visible row 10 must be deleted");
+    assert!(seg2_tombstones.is_deleted(1), "newer tombstoned row 20 must stay deleted");
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20, 30, 40])
+        .expect("fetch after delete");
+    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![30, 40]);
+}
+
+#[test]
 fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layout() {
     let root = unique_temp_dir("hannsdb_collection_api_rollover_guard");
     let mut db = HannsDb::open(&root).expect("open db");

@@ -6,6 +6,9 @@ use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
 };
+use hannsdb_core::segment::{
+    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+};
 use hannsdb_core::wal::{append_wal_record, load_wal_records, WalRecord};
 
 fn sample_schema() -> CollectionSchema {
@@ -59,6 +62,81 @@ fn custom_document(
 
 fn collection_dir(root: &Path, name: &str) -> std::path::PathBuf {
     root.join("collections").join(name)
+}
+
+fn rewrite_collection_to_two_segment_layout(
+    root: &Path,
+    collection: &str,
+    dimension: usize,
+    second_segment_documents: &[Document],
+    deleted_second_segment_rows: &[usize],
+) {
+    let collection_dir = collection_dir(root, collection);
+    let segments_dir = collection_dir.join("segments");
+    let seg1_dir = segments_dir.join("seg-0001");
+    let seg2_dir = segments_dir.join("seg-0002");
+    fs::create_dir_all(&seg1_dir).expect("create seg-0001 dir");
+    fs::create_dir_all(&seg2_dir).expect("create seg-0002 dir");
+
+    for file in [
+        "segment.json",
+        "records.bin",
+        "ids.bin",
+        "payloads.jsonl",
+        "vectors.jsonl",
+        "tombstones.json",
+    ] {
+        let source = collection_dir.join(file);
+        if source.exists() {
+            fs::rename(source, seg1_dir.join(file)).expect("move seg-0001 file");
+        }
+    }
+
+    let mut second_ids = Vec::with_capacity(second_segment_documents.len());
+    let mut second_vectors = Vec::with_capacity(second_segment_documents.len() * dimension);
+    let mut second_payloads = Vec::with_capacity(second_segment_documents.len());
+    for document in second_segment_documents {
+        second_ids.push(document.id);
+        second_vectors.extend_from_slice(&document.vector);
+        second_payloads.push(document.fields.clone());
+    }
+
+    let inserted = append_records(&seg2_dir.join("records.bin"), dimension, &second_vectors)
+        .expect("append seg-0002 records");
+    assert_eq!(inserted, second_segment_documents.len());
+    let _ = append_record_ids(&seg2_dir.join("ids.bin"), &second_ids).expect("append seg-0002 ids");
+    let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &second_payloads)
+        .expect("append seg-0002 payloads");
+    let _ = hannsdb_core::segment::append_vectors(
+        &seg2_dir.join("vectors.jsonl"),
+        &vec![BTreeMap::new(); second_segment_documents.len()],
+    )
+    .expect("append seg-0002 vectors");
+
+    let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    for row_idx in deleted_second_segment_rows {
+        let marked = seg2_tombstone.mark_deleted(*row_idx);
+        assert!(marked, "row index must be valid in seg-0002 tombstone");
+    }
+    seg2_tombstone
+        .save_to_path(&seg2_dir.join("tombstones.json"))
+        .expect("save seg-0002 tombstones");
+
+    SegmentMetadata::new(
+        "seg-0002",
+        dimension,
+        second_segment_documents.len(),
+        seg2_tombstone.deleted_count(),
+    )
+    .save_to_path(&seg2_dir.join("segment.json"))
+    .expect("save seg-0002 metadata");
+
+    SegmentSet {
+        active_segment_id: "seg-0002".to_string(),
+        immutable_segment_ids: vec!["seg-0001".to_string()],
+    }
+    .save_to_path(&collection_dir.join("segment_set.json"))
+    .expect("save segment_set metadata");
 }
 
 #[test]
@@ -229,6 +307,52 @@ fn wal_recovery_open_replays_logged_operations_into_missing_storage() {
         Some(&FieldValue::String("s1".to_string()))
     );
     assert_eq!(fetched[0].vector, vec![0.1, 0.2]);
+}
+
+#[test]
+fn wal_recovery_replays_segment_aware_delete_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+
+    let inserted_docs = vec![
+        custom_document(10, "s1", 1, true, vec![0.1, 0.2]),
+        custom_document(20, "s1", 2, true, vec![0.2, 0.3]),
+        custom_document(30, "s1", 3, true, vec![0.3, 0.4]),
+        custom_document(40, "s1", 4, true, vec![0.4, 0.5]),
+    ];
+    db.insert_documents("docs", &inserted_docs)
+        .expect("insert docs");
+
+    let second_segment_docs = vec![
+        custom_document(10, "s2", 5, false, vec![0.9, 0.8]),
+        custom_document(20, "s2", 6, false, vec![0.8, 0.7]),
+    ];
+    rewrite_collection_to_two_segment_layout(root, "docs", 2, &second_segment_docs, &[1]);
+
+    let deleted = db.delete("docs", &[10, 20]).expect("delete ids");
+    assert_eq!(deleted, 1);
+    drop(db);
+
+    let active_segment_dir = collection_dir(root, "docs").join("segments").join("seg-0002");
+    fs::remove_file(active_segment_dir.join("tombstones.json")).expect("remove active tombstones");
+
+    let reopened = HannsDb::open(root).expect("reopen should replay wal");
+    let info = reopened
+        .get_collection_info("docs")
+        .expect("collection info after replay");
+    assert_eq!(info.record_count, 4);
+    assert_eq!(info.deleted_count, 2);
+    assert_eq!(info.live_count, 2);
+
+    let replayed = reopened
+        .fetch_documents("docs", &[10, 20, 30, 40])
+        .expect("fetch after replay");
+    let replayed_ids = replayed.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(replayed_ids, vec![30, 40]);
 }
 
 #[test]

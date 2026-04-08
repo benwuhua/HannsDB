@@ -757,9 +757,7 @@ impl HannsDb {
         log_wal: bool,
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
-        let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
-        let stored_ids = load_record_ids_or_empty(&paths.external_ids)?;
+        let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
 
         if log_wal {
             append_wal_record(
@@ -772,18 +770,44 @@ impl HannsDb {
         }
 
         let mut newly_deleted = 0usize;
-        for (row_idx, stored_id) in stored_ids.iter().enumerate() {
-            if external_ids.contains(stored_id)
-                && row_idx < segment_meta.record_count
-                && tombstone.mark_deleted(row_idx)
-            {
-                newly_deleted += 1;
+        let mut remaining_ids = external_ids.iter().copied().collect::<HashSet<_>>();
+
+        for segment in segment_paths {
+            if remaining_ids.is_empty() {
+                break;
+            }
+
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            if stored_ids.is_empty() {
+                continue;
+            }
+
+            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+            let mut segment_changed = false;
+            let ids_to_check = remaining_ids.iter().copied().collect::<Vec<_>>();
+
+            for external_id in ids_to_check {
+                let Some(row_idx) = latest_row_index_for_id(&stored_ids, external_id) else {
+                    continue;
+                };
+                remaining_ids.remove(&external_id);
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                if tombstone.mark_deleted(row_idx) {
+                    newly_deleted += 1;
+                    segment_changed = true;
+                }
+            }
+
+            if segment_changed {
+                segment_meta.deleted_count = tombstone.deleted_count();
+                segment_meta.save_to_path(&segment.metadata)?;
+                tombstone.save_to_path(&segment.tombstones)?;
             }
         }
 
-        segment_meta.deleted_count = tombstone.deleted_count();
-        segment_meta.save_to_path(&paths.segment_meta)?;
-        tombstone.save_to_path(&paths.tombstones)?;
         self.invalidate_search_cache(collection);
         Ok(newly_deleted)
     }
