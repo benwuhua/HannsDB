@@ -51,29 +51,9 @@ def test_doc_normalizes_numpy_vectors_and_replace():
     assert replaced.vector("dense") == [1.0, 2.0]
 
 
-def test_doc_multi_vector_survives_collection_insert_bridge(monkeypatch):
+def test_real_collection_rejects_multi_vector_doc_writes(tmp_path):
     schema = build_schema()
-    calls = []
-
-    class FakeCore:
-        path = "/tmp/hannsdb"
-        collection_name = "docs"
-
-        def insert(self, docs):
-            calls.append(docs)
-            return len(docs)
-
-        def upsert(self, docs):
-            calls.append(docs)
-            return len(docs)
-
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
     doc = hannsdb.Doc(
         id="1",
         score=0.1,
@@ -85,16 +65,52 @@ def test_doc_multi_vector_survives_collection_insert_bridge(monkeypatch):
         "dense": [1.0, 2.0],
         "sparse": [3.0, 4.0],
     }
+
+    with pytest.raises(
+        NotImplementedError,
+        match="multi-vector document writes are not supported yet",
+    ):
+        collection.insert([doc])
+
+    with pytest.raises(
+        NotImplementedError,
+        match="multi-vector document writes are not supported yet",
+    ):
+        collection.upsert([doc])
+
+    collection.destroy()
+
+
+def test_real_collection_insert_and_upsert_accept_single_vector_docs(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    doc = hannsdb.Doc(
+        id="1",
+        vector=[1.0, 2.0],
+        field_name="dense",
+        fields={"session_id": "abc"},
+        score=0.1,
+    )
+
     assert collection.insert([doc]) == 1
     assert collection.upsert([doc]) == 1
-    assert calls[0][0].vectors == {
-        "dense": [1.0, 2.0],
-        "sparse": [3.0, 4.0],
-    }
-    assert calls[1][0].vectors == {
-        "dense": [1.0, 2.0],
-        "sparse": [3.0, 4.0],
-    }
+    fetched = collection.fetch(["1"])
+
+    assert fetched[0].vector("dense") == [1.0, 2.0]
+    assert fetched[0].field("session_id") == "abc"
+
+    collection.destroy()
 
 
 def test_collection_insert_and_upsert_accept_pure_and_native_docs(monkeypatch):
