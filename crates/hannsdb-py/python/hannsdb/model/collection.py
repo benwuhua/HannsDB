@@ -68,6 +68,15 @@ def _coerce_docs_to_native(docs):
     return [_coerce_doc_to_native(doc) for doc in list(docs)]
 
 
+def _coerce_docs_input(docs):
+    native_doc_type = getattr(_native_module, "Doc", None)
+    if isinstance(docs, Doc) or (
+        native_doc_type is not None and isinstance(docs, native_doc_type)
+    ):
+        return [docs]
+    return list(docs)
+
+
 def _wrap_doc_result(result):
     if isinstance(result, (list, tuple)):
         return [_wrap_doc(item) for item in result]
@@ -105,6 +114,28 @@ def _wrap_doc(item):
             fields=getattr(item, "fields", None),
         )
     return item
+
+
+def _merged_update_doc(current, patch):
+    merged_fields = current.fields
+    merged_fields.update(patch.fields)
+
+    merged_vectors = current.vectors
+    merged_vectors.update(patch.vectors)
+
+    field_name = current.field_name
+    if merged_vectors and field_name not in merged_vectors:
+        if patch.field_name in merged_vectors:
+            field_name = patch.field_name
+        else:
+            field_name = next(iter(merged_vectors))
+
+    return Doc(
+        id=current.id,
+        fields=merged_fields,
+        vectors=merged_vectors,
+        field_name=field_name,
+    )
 
 
 def _build_query_context(
@@ -344,6 +375,25 @@ class Collection:
         docs = list(docs)
         with self._core_lock:
             return self._core.upsert(_coerce_docs_to_native(docs))
+
+    def update(self, docs):
+        patches = [_wrap_doc(doc) for doc in _coerce_docs_input(docs)]
+        ids = [doc.id for doc in patches]
+        with self._core_lock:
+            fetched_docs = _wrap_doc_result(self._core.fetch(ids))
+            current_docs = {doc.id: doc for doc in fetched_docs}
+
+            for doc_id in ids:
+                if doc_id not in current_docs:
+                    raise KeyError(doc_id)
+
+            merged_docs = []
+            for patch in patches:
+                merged = _merged_update_doc(current_docs[patch.id], patch)
+                current_docs[patch.id] = merged
+                merged_docs.append(merged)
+
+            return self._core.upsert(_coerce_docs_to_native(merged_docs))
 
     def fetch(self, ids):
         with self._core_lock:

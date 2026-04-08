@@ -248,6 +248,100 @@ def test_real_collection_fetch_preserves_primary_field_name_for_legacy_replace(t
     collection.destroy()
 
 
+def build_update_parity_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="session_id", data_type="string"),
+            hannsdb.FieldSchema(name="tag", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="sparse",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                fields={"session_id": "abc", "tag": "draft"},
+                vectors={
+                    "dense": [1.0, 2.0],
+                    "sparse": [3.0, 4.0],
+                },
+            )
+        ]
+    )
+    return collection
+
+
+def test_real_collection_update_partial_scalar_preserves_vectors_and_other_fields(
+    tmp_path,
+):
+    collection = build_update_parity_collection(tmp_path)
+
+    assert collection.update([hannsdb.Doc(id="1", fields={"tag": "published"})]) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field("session_id") == "abc"
+    assert fetched.field("tag") == "published"
+    assert fetched.vector("dense") == [1.0, 2.0]
+    assert fetched.vector("sparse") == [3.0, 4.0]
+
+    collection.destroy()
+
+
+def test_real_collection_update_partial_vector_preserves_other_vectors_and_fields(
+    tmp_path,
+):
+    collection = build_update_parity_collection(tmp_path)
+
+    assert collection.update(
+        [hannsdb.Doc(id="1", vectors={"dense": [9.0, 8.0]})]
+    ) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field("session_id") == "abc"
+    assert fetched.field("tag") == "draft"
+    assert fetched.vector("dense") == [9.0, 8.0]
+    assert fetched.vector("sparse") == [3.0, 4.0]
+
+    collection.destroy()
+
+
+def test_real_collection_update_accepts_single_doc_input(tmp_path):
+    collection = build_update_parity_collection(tmp_path)
+
+    assert collection.update(hannsdb.Doc(id="1", fields={"tag": "published"})) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field("tag") == "published"
+    assert fetched.field("session_id") == "abc"
+    assert fetched.vector("dense") == [1.0, 2.0]
+    assert fetched.vector("sparse") == [3.0, 4.0]
+
+    collection.destroy()
+
+
+def test_real_collection_update_raises_key_error_for_missing_id(tmp_path):
+    collection = build_update_parity_collection(tmp_path)
+
+    with pytest.raises(KeyError, match="999"):
+        collection.update([hannsdb.Doc(id="999", fields={"tag": "published"})])
+
+    collection.destroy()
+
+
 def build_multi_vector_collection(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
