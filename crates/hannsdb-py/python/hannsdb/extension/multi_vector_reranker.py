@@ -46,10 +46,12 @@ class WeightedReRanker(ReRanker):
         self,
         topn: int = 10,
         metric: MetricType | str = MetricType.L2,
+        metrics: dict[str, MetricType | str] | None = None,
         weights: dict[str, Real] | None = None,
     ) -> None:
         super().__init__(topn=topn)
         self._metric = self._normalize_metric(metric)
+        self._metrics = self._normalize_metrics(metrics)
         self._weights = self._normalize_weights(weights)
 
     @staticmethod
@@ -75,20 +77,50 @@ class WeightedReRanker(ReRanker):
             normalized[field_name] = float(weight)
         return normalized
 
+    @staticmethod
+    def _normalize_metrics(
+        metrics: dict[str, MetricType | str] | None,
+    ) -> dict[str, MetricType]:
+        if metrics is None:
+            return {}
+        if not isinstance(metrics, dict):
+            raise TypeError("metrics must be a dict[str, metric] or None")
+
+        normalized: dict[str, MetricType] = {}
+        for field_name, metric in metrics.items():
+            if not isinstance(field_name, str):
+                raise TypeError("metrics keys must be strings")
+            normalized[field_name] = WeightedReRanker._normalize_metric(metric)
+        return normalized
+
     @property
     def metric(self) -> MetricType:
         return self._metric
 
     @property
+    def metrics(self) -> dict[str, MetricType]:
+        return dict(self._metrics)
+
+    @property
     def weights(self) -> dict[str, float]:
         return dict(self._weights)
 
-    def _normalize_score(self, score: float) -> float:
-        if self.metric == MetricType.L2:
+    @staticmethod
+    def _resolve_field_key(field_name: str, mapping: dict[str, object]) -> str | None:
+        if field_name in mapping:
+            return field_name
+        base_field_name, separator, suffix = field_name.rpartition("#")
+        if separator and suffix.isdigit() and base_field_name in mapping:
+            return base_field_name
+        return None
+
+    @staticmethod
+    def _normalize_score(score: float, metric: MetricType) -> float:
+        if metric == MetricType.L2:
             return 1.0 - 2.0 * math.atan(score) / math.pi
-        if self.metric == MetricType.Ip:
+        if metric == MetricType.Ip:
             return 0.5 - math.atan(score) / math.pi
-        if self.metric == MetricType.Cosine:
+        if metric == MetricType.Cosine:
             return 1.0 - score / 2.0
         raise ValueError("unsupported metric")
 
@@ -97,9 +129,12 @@ class WeightedReRanker(ReRanker):
         documents: dict[str, Doc] = {}
 
         for field_name, query_result in query_results.items():
-            field_weight = self._weights.get(field_name, 1.0)
+            metric_key = self._resolve_field_key(field_name, self._metrics)
+            field_metric = self._metrics.get(metric_key, self._metric)
+            weight_key = self._resolve_field_key(field_name, self._weights)
+            field_weight = self._weights.get(weight_key, 1.0)
             for doc in query_result:
-                normalized_score = self._normalize_score(doc.score)
+                normalized_score = self._normalize_score(doc.score, field_metric)
                 scores[doc.id] += normalized_score * field_weight
                 documents.setdefault(doc.id, doc)
 

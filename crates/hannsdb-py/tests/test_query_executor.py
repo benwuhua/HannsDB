@@ -287,6 +287,39 @@ def test_weighted_reranker_combines_normalized_scores_by_field_weight():
     assert hits[2].score == pytest.approx(normalize_l2(0.1))
 
 
+def test_weighted_reranker_uses_per_field_metrics_for_mixed_metric_results():
+    reranker = hannsdb.WeightedReRanker(
+        metric="l2",
+        metrics={"dense": "ip", "title": "cosine"},
+    )
+
+    query_results = {
+        "dense": [hannsdb.Doc(id="a", score=-10.0)],
+        "title": [hannsdb.Doc(id="a", score=1.0)],
+    }
+
+    hits = reranker.rerank(query_results)
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert hits[0].score == pytest.approx(
+        (0.5 - math.atan(-10.0) / math.pi) + (1.0 - 1.0 / 2.0)
+    )
+
+
+def test_weighted_reranker_applies_base_field_weight_to_duplicate_keys():
+    reranker = hannsdb.WeightedReRanker(weights={"dense": 10.0})
+
+    query_results = {
+        "dense": [hannsdb.Doc(id="a", score=0.0)],
+        "dense#2": [hannsdb.Doc(id="a", score=0.0)],
+    }
+
+    hits = reranker.rerank(query_results)
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert hits[0].score == pytest.approx(20.0)
+
+
 def test_weighted_reranker_orders_ip_scores_with_distance_convention():
     reranker = hannsdb.WeightedReRanker(metric=hannsdb.MetricType.Ip)
 
@@ -477,6 +510,34 @@ def test_query_executor_supports_weighted_reranker(tmp_path):
 
     assert [hit.id for hit in hits] == ["2", "3", "1"]
     assert [hit.fields["group"] for hit in hits] == [1, 2, 1]
+
+
+def test_query_executor_supports_weighted_reranker_with_duplicate_field_keys(
+    tmp_path,
+):
+    _, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    class StubCollection:
+        def query_context(self, context):
+            key = tuple(context.queries[0].vector)
+            if key in {(0.0, 0.0), (0.2, 0.0)}:
+                return [hannsdb.Doc(id="a", score=0.0)]
+            raise AssertionError(f"unexpected query vector: {key!r}")
+
+    context = hannsdb.QueryContext(
+        top_k=1,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=hannsdb.WeightedReRanker(weights={"dense": 10.0}),
+    )
+
+    hits = executor.execute(StubCollection(), context)
+
+    assert [hit.id for hit in hits] == ["a"]
+    assert hits[0].score == pytest.approx(20.0)
 
 
 def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
