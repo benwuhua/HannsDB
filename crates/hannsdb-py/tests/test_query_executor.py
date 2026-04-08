@@ -309,6 +309,23 @@ def test_weighted_reranker_accepts_string_metric_name():
     assert reranker.metric is hannsdb.MetricType.Cosine
 
 
+def test_weighted_reranker_rerank_uses_cosine_normalization():
+    reranker = hannsdb.WeightedReRanker(metric="cosine")
+
+    query_results = {
+        "dense": [
+            hannsdb.Doc(id="good", score=0.0),
+            hannsdb.Doc(id="bad", score=1.0),
+        ]
+    }
+
+    hits = reranker.rerank(query_results)
+
+    assert [hit.id for hit in hits] == ["good", "bad"]
+    assert hits[0].score == pytest.approx(1.0)
+    assert hits[1].score == pytest.approx(0.5)
+
+
 def test_query_executor_factory_exposes_create_method():
     schema = hannsdb.CollectionSchema(
         name="docs",
