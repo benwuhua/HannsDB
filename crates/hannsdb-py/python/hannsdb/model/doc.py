@@ -5,20 +5,36 @@ from .. import _native as _native_module
 __all__ = ["Doc"]
 
 
+def _flatten_vector(value):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _flatten_vector(item)
+        return
+
+    yield value
+
+
 def _normalize_vector(value):
-    if value is None:
-        return None
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        value = tolist()
-    if isinstance(value, list):
-        return list(value)
-    if isinstance(value, tuple):
-        return list(value)
+    error_message = "vector must be a list, tuple, or numpy.ndarray of numbers"
     try:
-        return list(value)
-    except TypeError:
-        return [value]
+        import numpy as np
+    except Exception:  # pragma: no cover - numpy is optional at runtime
+        np = None
+
+    if np is not None and isinstance(value, np.ndarray):
+        try:
+            return [float(item) for item in np.asarray(value).reshape(-1).tolist()]
+        except (TypeError, ValueError) as error:
+            raise TypeError(error_message) from error
+
+    if isinstance(value, (str, bytes, bytearray, dict, set, frozenset)):
+        raise TypeError(error_message)
+    if isinstance(value, list) or isinstance(value, tuple):
+        try:
+            return [float(item) for item in _flatten_vector(value)]
+        except (TypeError, ValueError) as error:
+            raise TypeError(error_message) from error
+    raise TypeError(error_message)
 
 
 def _normalize_fields(fields):

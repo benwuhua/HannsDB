@@ -75,11 +75,28 @@ def _wrap_doc(item):
     if native_doc_type is not None and isinstance(item, native_doc_type):
         return Doc._from_native(item)
     if hasattr(item, "id") and hasattr(item, "fields"):
+        vectors = getattr(item, "vectors", None)
+        if vectors:
+            return Doc(
+                id=getattr(item, "id"),
+                score=getattr(item, "score", None),
+                fields=getattr(item, "fields", None),
+                vectors=vectors,
+                field_name=getattr(item, "field_name", "dense"),
+            )
+        vector = getattr(item, "vector", None)
+        if vector is not None and hasattr(item, "field_name"):
+            return Doc(
+                id=getattr(item, "id"),
+                score=getattr(item, "score", None),
+                fields=getattr(item, "fields", None),
+                vector=vector,
+                field_name=getattr(item, "field_name"),
+            )
         return Doc(
             id=getattr(item, "id"),
             score=getattr(item, "score", None),
             fields=getattr(item, "fields", None),
-            vectors=getattr(item, "vectors", None),
         )
     return item
 

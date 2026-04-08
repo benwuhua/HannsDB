@@ -51,6 +51,57 @@ def test_doc_normalizes_numpy_vectors_and_replace():
     assert replaced.vector("dense") == [1.0, 2.0]
 
 
+@pytest.mark.parametrize(
+    "bad_vector",
+    [
+        "abc",
+        b"abc",
+        bytearray(b"abc"),
+        {"x": 1},
+        {1, 2},
+        frozenset({1, 2}),
+        1,
+    ],
+)
+def test_doc_rejects_malformed_vectors_early(bad_vector):
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.Doc(id="1", vector=bad_vector, field_name="dense")
+
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.Doc(id="1", vectors={"dense": bad_vector})
+
+
+def test_doc_rejects_none_inside_vector():
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.Doc(id="1", vector=[1.0, None], field_name="dense")
+
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.Doc(id="1", vectors={"dense": [1.0, None]})
+
+    with pytest.raises(TypeError, match="vector must be"):
+        hannsdb.Doc(id="1", vectors={"dense": None})
+
+
+def test_wrap_doc_preserves_legacy_doc_like_vector_and_field_name():
+    wrapped = hannsdb.model.collection._wrap_doc(
+        type(
+            "LegacyDocLike",
+            (),
+            {
+                "id": "1",
+                "score": 0.1,
+                "fields": {"session_id": "abc"},
+                "vector": [0.1, 0.2],
+                "field_name": "dense",
+            },
+        )()
+    )
+
+    assert wrapped.field_name == "dense"
+    assert wrapped.vector("dense") == [0.1, 0.2]
+    assert wrapped.field("session_id") == "abc"
+
+
 def test_real_collection_rejects_multi_vector_doc_writes(tmp_path):
     schema = build_schema()
     collection = hannsdb.create_and_open(str(tmp_path), schema)
@@ -154,7 +205,7 @@ def test_collection_insert_and_upsert_accept_pure_and_native_docs(monkeypatch):
     assert [call[0] for call in calls] == ["insert", "upsert"]
     assert all(doc.__class__ is hannsdb._native.Doc for doc in calls[0][1])
     assert calls[0][1][0].id == "1"
-    assert calls[0][1][0].vectors == {"dense": [0.1, 0.2]}
+    assert calls[0][1][0].vectors["dense"] == pytest.approx([0.1, 0.2], rel=1e-6)
     assert calls[0][1][1].fields == {"session_id": "def"}
 
 
