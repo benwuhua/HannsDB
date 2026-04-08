@@ -1017,7 +1017,7 @@ impl CollectionHandle {
         let field_name = self.collection_primary_vector_name()?;
         let mut state = self.load_search_state_for_field(&field_name)?;
         let mut hnsw_bytes = None;
-        state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
+        state.optimized_ann = Some(build_optimized_ann_state(&state, Some(&mut hnsw_bytes))?);
         #[cfg(feature = "knowhere-backend")]
         {
             let paths = self.collection_paths();
@@ -1587,8 +1587,7 @@ fn attach_lazy_optimized_ann_for_secondary_field(state: &mut CachedSearchState) 
         return Ok(());
     }
 
-    let mut index_bytes = None;
-    state.optimized_ann = Some(build_optimized_ann_state(state, &mut index_bytes)?);
+    state.optimized_ann = Some(build_optimized_ann_state(state, None)?);
     Ok(())
 }
 
@@ -2415,7 +2414,7 @@ fn resolve_primary_vector_descriptor(
 
 fn build_optimized_ann_state(
     state: &CachedSearchState,
-    index_bytes_out: &mut Option<Vec<u8>>,
+    index_bytes_out: Option<&mut Option<Vec<u8>>>,
 ) -> io::Result<OptimizedAnnState> {
     let metric = state
         .descriptor
@@ -2453,7 +2452,9 @@ fn build_optimized_ann_state(
             .insert_flat_identity(&flat_vectors, state.dimension)
             .map_err(adapter_error_to_io)?;
     }
-    *index_bytes_out = backend.serialize_to_bytes().map_err(adapter_error_to_io)?;
+    if let Some(index_bytes_out) = index_bytes_out {
+        *index_bytes_out = backend.serialize_to_bytes().map_err(adapter_error_to_io)?;
+    }
 
     Ok(OptimizedAnnState {
         backend: Arc::from(backend),
@@ -2527,7 +2528,7 @@ mod tests {
     #[test]
     fn secondary_indexed_field_fast_path_warms_cache_with_lazy_optimized_ann() {
         let tempdir = tempdir().expect("tempdir");
-        let db = seeded_db_with_secondary_indexed_collection(tempdir.path());
+        let db = seeded_db_with_secondary_hnsw_indexed_collection(tempdir.path());
         let handle = db
             .open_collection_handle("docs")
             .expect("open collection handle");
@@ -2555,7 +2556,7 @@ mod tests {
     #[test]
     fn primary_plain_search_keeps_cached_state_unoptimized_without_optimize() {
         let tempdir = tempdir().expect("tempdir");
-        let db = seeded_db_with_secondary_indexed_collection(tempdir.path());
+        let db = seeded_db_with_secondary_hnsw_indexed_collection(tempdir.path());
         let handle = db
             .open_collection_handle("docs")
             .expect("open collection handle");
@@ -2577,16 +2578,83 @@ mod tests {
         );
     }
 
-    fn seeded_db_with_secondary_indexed_collection(root: &Path) -> HannsDb {
+    #[test]
+    fn secondary_ivf_indexed_field_fast_path_warms_cache_with_lazy_optimized_ann() {
+        let tempdir = tempdir().expect("tempdir");
+        let db = seeded_db_with_secondary_ivf_indexed_collection(tempdir.path());
+        let handle = db
+            .open_collection_handle("docs")
+            .expect("open collection handle");
+
+        let hits = handle
+            .search_field_with_ef_internal("title", &[0.0_f32, 0.0], 3, 64)
+            .expect("search secondary ivf vector field");
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+
+        let cache = handle
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        let state = cache.get("title").expect("cached secondary search state");
+        assert!(
+            state.optimized_ann.is_some(),
+            "secondary IVF fast path should warm an in-memory ANN runtime"
+        );
+    }
+
+    #[test]
+    fn build_optimized_ann_state_skips_serialization_when_bytes_not_requested() {
+        let tempdir = tempdir().expect("tempdir");
+        let db = seeded_db_with_secondary_hnsw_indexed_collection(tempdir.path());
+        let handle = db
+            .open_collection_handle("docs")
+            .expect("open collection handle");
+        let state = handle
+            .load_search_state_for_field("title")
+            .expect("load secondary state");
+
+        let optimized = build_optimized_ann_state(&state, None)
+            .expect("build optimized ann state without requesting serialized bytes");
+
+        let hits = ann_search(
+            optimized.backend.as_ref(),
+            optimized.ann_external_ids.as_slice(),
+            &optimized.metric,
+            &[0.0_f32, 0.0],
+            3,
+            64,
+        )
+        .expect("ann search");
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+    }
+
+    fn seeded_db_with_secondary_hnsw_indexed_collection(root: &Path) -> HannsDb {
+        seeded_db_with_secondary_indexed_collection(
+            root,
+            VectorIndexSchema::hnsw(Some("l2"), 16, 128),
+        )
+    }
+
+    fn seeded_db_with_secondary_ivf_indexed_collection(root: &Path) -> HannsDb {
+        seeded_db_with_secondary_indexed_collection(root, VectorIndexSchema::ivf(Some("l2"), 8))
+    }
+
+    fn seeded_db_with_secondary_indexed_collection(
+        root: &Path,
+        secondary_index: VectorIndexSchema,
+    ) -> HannsDb {
         let mut db = HannsDb::open(root).expect("open db");
         let mut schema = CollectionSchema::new("dense", 2, "l2", Vec::new());
-        schema.vectors.push(
-            VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
-                Some("l2"),
-                16,
-                128,
-            )),
-        );
+        schema
+            .vectors
+            .push(VectorFieldSchema::new("title", 2).with_index_param(secondary_index));
         db.create_collection_with_schema("docs", &schema)
             .expect("create collection");
         db.insert_documents(
