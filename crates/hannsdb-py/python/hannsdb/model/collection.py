@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -275,6 +276,7 @@ def _schema_from_collection_metadata(path: Path) -> CollectionSchema:
 class Collection:
     def __init__(self, core_collection, schema: CollectionSchema | None = None):
         self._core = core_collection
+        self._core_lock = threading.RLock()
         self._schema = _coerce_collection_schema(schema) if schema is not None else None
         self._querier = _build_query_executor(self._schema) if self._schema is not None else None
 
@@ -286,6 +288,7 @@ class Collection:
             raise ValueError("Collection is None")
         inst = cls.__new__(cls)
         inst._core = core_collection
+        inst._core_lock = threading.RLock()
         if schema is None:
             metadata_path = (
                 Path(core_collection.path)
@@ -350,34 +353,42 @@ class Collection:
         return _wrap_doc_result(self._querier.execute(self, query_context))
 
     def query_context(self, context):
-        return _wrap_doc_result(self._core.query_context(context))
+        with self._core_lock:
+            return _wrap_doc_result(self._core.query_context(context))
 
     def insert(self, docs):
         docs = list(docs)
         _raise_if_multi_vector_write_unsupported(self._core, docs)
-        return self._core.insert(_coerce_docs_to_native(docs))
+        with self._core_lock:
+            return self._core.insert(_coerce_docs_to_native(docs))
 
     def upsert(self, docs):
         docs = list(docs)
         _raise_if_multi_vector_write_unsupported(self._core, docs)
-        return self._core.upsert(_coerce_docs_to_native(docs))
+        with self._core_lock:
+            return self._core.upsert(_coerce_docs_to_native(docs))
 
     def fetch(self, ids):
-        return _wrap_doc_result(self._core.fetch(ids))
+        with self._core_lock:
+            return _wrap_doc_result(self._core.fetch(ids))
 
     def delete(self, ids):
-        return self._core.delete(ids)
+        with self._core_lock:
+            return self._core.delete(ids)
 
     def optimize(self, option=None):
-        if option is None:
-            return self._core.optimize()
-        return self._core.optimize(_native_value(option))
+        with self._core_lock:
+            if option is None:
+                return self._core.optimize()
+            return self._core.optimize(_native_value(option))
 
     def flush(self):
-        return self._core.flush()
+        with self._core_lock:
+            return self._core.flush()
 
     def destroy(self):
-        return self._core.destroy()
+        with self._core_lock:
+            return self._core.destroy()
 
     def create_index(self, field_name, index_param=None):
         if self._schema is None:
@@ -398,22 +409,28 @@ class Collection:
         return self.drop_scalar_index(field_name)
 
     def create_vector_index(self, field_name, index_param=None):
-        return self._core.create_vector_index(field_name, _native_value(index_param))
+        with self._core_lock:
+            return self._core.create_vector_index(field_name, _native_value(index_param))
 
     def drop_vector_index(self, field_name):
-        return self._core.drop_vector_index(field_name)
+        with self._core_lock:
+            return self._core.drop_vector_index(field_name)
 
     def create_scalar_index(self, field_name):
-        return self._core.create_scalar_index(field_name)
+        with self._core_lock:
+            return self._core.create_scalar_index(field_name)
 
     def drop_scalar_index(self, field_name):
-        return self._core.drop_scalar_index(field_name)
+        with self._core_lock:
+            return self._core.drop_scalar_index(field_name)
 
     def list_vector_indexes(self):
-        return self._core.list_vector_indexes()
+        with self._core_lock:
+            return self._core.list_vector_indexes()
 
     def list_scalar_indexes(self):
-        return self._core.list_scalar_indexes()
+        with self._core_lock:
+            return self._core.list_scalar_indexes()
 
     def __getattr__(self, name: str):
         return getattr(self._core, name)
