@@ -353,17 +353,17 @@ def test_real_collection_query_context_applies_group_by_and_output_fields(
     collection = hannsdb.create_and_open(str(tmp_path), schema)
     docs = [
         hannsdb.Doc(
-            id="11",
-            vector=[0.0, 0.0],
-            field_name="dense",
-            fields={"group": 1, "tag": "near"},
-            score=0.0,
-        ),
-        hannsdb.Doc(
             id="12",
             vector=[0.5, 0.0],
             field_name="dense",
             fields={"group": 1, "tag": "far"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="11",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "near"},
             score=0.0,
         ),
         hannsdb.Doc(
