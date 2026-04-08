@@ -332,6 +332,82 @@ def test_real_collection_query_context_routes_query_by_id_and_output_fields(
     collection.destroy()
 
 
+def test_real_collection_query_context_applies_group_by_and_output_fields(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="tag", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "near"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vector=[0.5, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "far"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="21",
+            vector=[1.0, 0.0],
+            field_name="dense",
+            fields={"group": 2, "tag": "near"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="22",
+            vector=[2.0, 0.0],
+            field_name="dense",
+            fields={"group": 2, "tag": "far"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="31",
+            vector=[10.0, 10.0],
+            field_name="dense",
+            fields={"group": 3, "tag": "far"},
+            score=0.0,
+        ),
+    ]
+    query_vector = [0.0, 0.0]
+    assert collection.insert(docs) == len(docs)
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[hannsdb.VectorQuery(field_name="dense", vector=query_vector, param=None)],
+        group_by=hannsdb.QueryGroupBy(field_name="group"),
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["11", "21"]
+    assert [doc.field("group") for doc in result] == [1, 2]
+    assert all(not doc.has_field("tag") for doc in result)
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 2}]
+    assert [doc.score for doc in result] == pytest.approx([0.0, 1.0], abs=1e-6)
+
+    collection.destroy()
+
+
 def _l2_distance(left, right):
     return sum((x - y) ** 2 for x, y in zip(left, right)) ** 0.5
 
