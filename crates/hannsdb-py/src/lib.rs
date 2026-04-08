@@ -798,6 +798,19 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
 }
 
 #[cfg(feature = "python-binding")]
+fn py_dict_to_vectors(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Vec<f32>>> {
+    let mut out = BTreeMap::new();
+    for (key, value) in fields.iter() {
+        let key = key.extract::<String>()?;
+        let value = value.extract::<Vec<f32>>().map_err(|error| {
+            PyValueError::new_err(format!("unsupported vector value for '{key}': {error}"))
+        })?;
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "python-binding")]
 fn fields_to_py_dict<'py>(
     py: Python<'py>,
     fields: &BTreeMap<String, FieldValue>,
@@ -1306,17 +1319,22 @@ struct PyDoc {
 #[pymethods]
 impl PyDoc {
     #[new]
-    #[pyo3(signature = (id, vector=None, field_name="dense", fields=None, score=None))]
+    #[pyo3(signature = (id, vector=None, field_name="dense", fields=None, score=None, vectors=None))]
     fn new(
         id: String,
         vector: Option<Vec<f32>>,
         field_name: &str,
         fields: Option<Bound<'_, PyDict>>,
         score: Option<f32>,
+        vectors: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
-        let mut vectors = BTreeMap::new();
+        let mut inner_vectors = vectors
+            .as_ref()
+            .map(py_dict_to_vectors)
+            .transpose()?
+            .unwrap_or_default();
         if let Some(vector) = vector {
-            vectors.insert(field_name.to_string(), vector);
+            inner_vectors.insert(field_name.to_string(), vector);
         }
         Ok(Self {
             inner: Doc {
@@ -1327,7 +1345,7 @@ impl PyDoc {
                     .map(py_dict_to_fields)
                     .transpose()?
                     .unwrap_or_default(),
-                vectors,
+                vectors: inner_vectors,
             },
         })
     }

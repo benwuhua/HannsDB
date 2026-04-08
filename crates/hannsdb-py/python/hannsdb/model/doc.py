@@ -138,20 +138,11 @@ class Doc:
         return type(self)(**data)
 
     def _get_native(self):
-        if not self._vectors:
-            return _native_module.Doc(
-                id=self.id,
-                fields=self.fields,
-                score=self.score,
-            )
-
-        field_name = self._field_name if self._field_name in self._vectors else next(iter(self._vectors))
         return _native_module.Doc(
             id=self.id,
-            vector=list(self._vectors[field_name]),
-            field_name=field_name,
             fields=self.fields,
             score=self.score,
+            vectors=self.vectors,
         )
 
     def __repr__(self):
