@@ -1,9 +1,50 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use hannsdb_core::db::HannsDb;
+use hannsdb_core::document::{CollectionSchema, Document, VectorFieldSchema};
 use hannsdb_daemon::routes::build_router;
 use serde_json::Value;
 use std::fs;
 use tower::ServiceExt;
+
+fn seed_non_primary_query_by_id_collection(root: &std::path::Path) {
+    let mut db = HannsDb::open(root).expect("open db");
+    let mut schema = CollectionSchema::new("vector", 2, "l2", Vec::new());
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                42,
+                Vec::new(),
+                vec![0.0, 0.0],
+                [("title".to_string(), vec![10.0, 10.0])],
+            ),
+            Document::with_vectors(
+                43,
+                Vec::new(),
+                vec![0.1, 0.0],
+                [("title".to_string(), vec![50.0, 50.0])],
+            ),
+            Document::with_vectors(
+                44,
+                Vec::new(),
+                vec![0.2, 0.0],
+                [("title".to_string(), vec![60.0, 60.0])],
+            ),
+            Document::with_vectors(
+                84,
+                Vec::new(),
+                vec![50.0, 50.0],
+                [("title".to_string(), vec![10.0, 10.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+}
 
 #[tokio::test]
 async fn health_route_returns_ok_json() {
@@ -246,46 +287,10 @@ async fn search_route_accepts_typed_primary_vector_query_and_projects_output_fie
 }
 
 #[tokio::test]
-async fn search_route_accepts_typed_query_by_id_field_name_on_primary_vector_collection() {
+async fn search_route_accepts_typed_query_by_id_field_name_on_non_primary_vector_collection() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_non_primary_query_by_id_collection(tempdir.path());
     let app = build_router(tempdir.path()).expect("build router");
-
-    let create = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/collections")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
-                .expect("build request"),
-        )
-        .await
-        .expect("send create request");
-    assert_eq!(create.status(), StatusCode::CREATED);
-
-    let insert = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/collections/docs/records")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{
-                        "ids":["42","84"],
-                        "vectors":[[0.0,0.0],[0.2,0.0]],
-                        "fields":[
-                            {"color":"red","shape":"circle"},
-                            {"color":"blue","shape":"square"}
-                        ]
-                    }"#,
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("send insert request");
-    assert_eq!(insert.status(), StatusCode::OK);
 
     let search = app
         .oneshot(
@@ -295,10 +300,10 @@ async fn search_route_accepts_typed_query_by_id_field_name_on_primary_vector_col
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{
-                        "top_k":1,
+                        "top_k":3,
+                        "queries":[{"field_name":"vector","vector":[0.0,0.0]}],
                         "query_by_id":["42"],
-                        "query_by_id_field_name":"vector",
-                        "output_fields":["color"]
+                        "query_by_id_field_name":"title"
                     }"#,
                 ))
                 .expect("build request"),
@@ -311,8 +316,15 @@ async fn search_route_accepts_typed_query_by_id_field_name_on_primary_vector_col
         .await
         .expect("read search body");
     let json: Value = serde_json::from_slice(&body).expect("parse search json");
-    assert_eq!(json["hits"][0]["id"], "42");
-    assert_eq!(json["hits"][0]["fields"]["color"], "red");
+    let hit_ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("hit id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec!["42", "84", "43"]);
+    assert!(hit_ids.iter().any(|id| id == "84"));
+    assert!(!hit_ids.iter().any(|id| id == "44"));
 }
 
 #[tokio::test]
