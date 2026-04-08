@@ -492,6 +492,81 @@ def test_real_collection_query_accepts_scalar_query_by_id_and_output_fields_lega
     collection.destroy()
 
 
+def test_real_collection_query_accepts_filter_only_legacy_kwargs_and_projects_output_fields(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "red"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vector=[0.1, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "blue"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "green"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="21",
+            vector=[1.0, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "yellow"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="22",
+            vector=[2.0, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "purple"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    result = collection.query(
+        vectors=None,
+        output_fields=["group"],
+        topk=2,
+        filter="group == 1",
+    )
+
+    assert len(result) == 2
+    assert [doc.id for doc in result] == ["11", "12"]
+    assert [doc.field("group") for doc in result] == [1, 1]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}]
+    assert all(not doc.has_field("color") for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+
+    collection.destroy()
+
+
 def test_real_collection_query_accepts_query_context_keyword_alias(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
