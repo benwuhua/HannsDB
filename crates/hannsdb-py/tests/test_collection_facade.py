@@ -225,7 +225,7 @@ def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_su
         ),
     ]
     query_vector = [0.0, 0.0]
-    collection.insert(docs)
+    assert collection.insert(docs) == len(docs)
 
     result = collection.query(
         vectors=hannsdb.VectorQuery(field_name="dense", vector=query_vector, param=None),
