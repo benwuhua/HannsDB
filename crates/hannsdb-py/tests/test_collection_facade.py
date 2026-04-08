@@ -779,6 +779,17 @@ def test_real_collection_query_accepts_pure_hnsw_query_param(tmp_path):
     assert all(not doc.has_field("color") for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
 
+    with pytest.raises(NotImplementedError) as exc_info:
+        collection.query(
+            vectors=query,
+            output_fields=["group"],
+            topk=2,
+            filter="group == 1",
+        )
+    assert "ef_search" in str(exc_info.value)
+    assert "typed single-vector fast path" in str(exc_info.value)
+    assert "unsupported:" in str(exc_info.value)
+
     collection.destroy()
 
 
