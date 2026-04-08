@@ -330,6 +330,50 @@ def test_real_collection_single_id_fetch_and_delete_parity(tmp_path):
     collection.destroy()
 
 
+def test_collection_stats_exports_are_available_across_facades():
+    assert hannsdb.CollectionStats is hannsdb._native.CollectionStats
+    assert hannsdb.model.CollectionStats is hannsdb._native.CollectionStats
+    assert hannsdb.model.schema.CollectionStats is hannsdb._native.CollectionStats
+
+
+def test_real_collection_stats_surface_matches_product_symbol(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+                index_param=hannsdb.HnswIndexParam(metric_type="ip"),
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vectors={"dense": [1.0, 2.0]},
+                fields={"session_id": "abc"},
+            )
+        ]
+    )
+
+    stats = collection.stats
+
+    assert isinstance(stats, hannsdb.CollectionStats)
+    assert stats.name == "docs"
+    assert stats.dimension == 2
+    assert stats.metric == "ip"
+    assert stats.record_count == 1
+    assert stats.deleted_count == 0
+    assert stats.live_count == 1
+
+    collection.destroy()
+
+
 def build_update_parity_collection(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
