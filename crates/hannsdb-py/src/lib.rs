@@ -351,11 +351,6 @@ fn py_query_context_to_core(
         .getattr("output_fields")?
         .extract::<Option<Vec<String>>>()?;
     let include_vector = context.getattr("include_vector")?.extract::<bool>()?;
-    if include_vector {
-        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "unsupported: include_vector is not supported on the Python facade yet",
-        ));
-    }
 
     let reranker = context.getattr("reranker")?;
     if !reranker.is_none() {
@@ -784,7 +779,7 @@ impl Collection {
                 id: hit.id.to_string(),
                 score: Some(hit.distance),
                 fields: hit.fields,
-                vectors: BTreeMap::new(),
+                vectors: hit.vectors,
                 field_name: self.primary_vector_name.clone(),
             })
             .collect())
@@ -1653,7 +1648,7 @@ impl PyCollection {
                             id: hit.id.to_string(),
                             score: Some(hit.distance),
                             fields: hit.fields,
-                            vectors: BTreeMap::new(),
+                            vectors: hit.vectors,
                             field_name: inner.primary_vector_name.clone(),
                         },
                     },

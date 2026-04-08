@@ -67,6 +67,7 @@ impl QueryExecutor {
                         BruteForceExecutionMode::FilterOnlyScan => 0.0,
                     },
                     fields: fields.clone(),
+                    vectors: BTreeMap::new(),
                 };
                 insert_best_hit(&mut best_hits, candidate);
             }

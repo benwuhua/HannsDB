@@ -54,6 +54,7 @@ pub struct DocumentHit {
     pub id: i64,
     pub distance: f32,
     pub fields: BTreeMap<String, FieldValue>,
+    pub vectors: BTreeMap<String, Vec<f32>>,
 }
 
 struct CachedSearchState {
@@ -1012,12 +1013,6 @@ impl CollectionHandle {
     }
 
     pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
-        if context.include_vector {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "include_vector is not supported on the typed query path yet",
-            ));
-        }
         let collection_meta =
             CollectionMetadata::load_from_path(&self.collection_paths().collection_meta)?;
         let query_by_id_documents = match context.query_by_id.as_ref() {
@@ -1027,11 +1022,12 @@ impl CollectionHandle {
         let plan = QueryPlanner::build(&collection_meta, context, &query_by_id_documents)?;
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
-                let mut hits = self.query_documents_with_ef(
+                let mut hits = self.query_documents_with_ef_internal(
                     &plan.vector,
                     plan.top_k,
                     plan.filter.as_deref(),
                     plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
+                    context.include_vector,
                 )?;
                 project_document_hits(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
@@ -1039,6 +1035,9 @@ impl CollectionHandle {
             QueryPlan::BruteForce(plan) => {
                 let mut hits =
                     QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)?;
+                if context.include_vector {
+                    self.materialize_document_hit_vectors(&mut hits)?;
+                }
                 project_document_hits(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
             }
@@ -1151,6 +1150,25 @@ impl CollectionHandle {
         filter: Option<&str>,
         ef_search: usize,
     ) -> io::Result<Vec<DocumentHit>> {
+        self.query_documents_with_ef_internal(query, top_k, filter, ef_search, false)
+    }
+
+    fn query_documents_with_ef_internal(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: Option<&str>,
+        ef_search: usize,
+        include_vector: bool,
+    ) -> io::Result<Vec<DocumentHit>> {
+        let collection_meta = if include_vector {
+            Some(CollectionMetadata::load_from_path(
+                &self.collection_paths().collection_meta,
+            )?)
+        } else {
+            None
+        };
+
         match filter.map(str::trim) {
             None | Some("") => {
                 let hits = self.search_with_ef(query, top_k, ef_search)?;
@@ -1159,14 +1177,34 @@ impl CollectionHandle {
                 Ok(hits
                     .into_iter()
                     .zip(documents)
-                    .map(|(hit, document)| DocumentHit {
-                        id: hit.id,
-                        distance: hit.distance,
-                        fields: document.fields,
+                    .map(|(hit, document)| {
+                        let vectors = if include_vector {
+                            document.vectors_with_primary(
+                                collection_meta
+                                    .as_ref()
+                                    .expect("collection metadata must exist when include_vector")
+                                    .primary_vector
+                                    .as_str(),
+                            )
+                        } else {
+                            BTreeMap::new()
+                        };
+                        DocumentHit {
+                            id: hit.id,
+                            distance: hit.distance,
+                            fields: document.fields,
+                            vectors,
+                        }
                     })
                     .collect())
             }
-            Some(filter) => self.query_documents_with_filter(query, top_k, filter),
+            Some(filter) => {
+                let mut hits = self.query_documents_with_filter(query, top_k, filter)?;
+                if include_vector {
+                    self.materialize_document_hit_vectors(&mut hits)?;
+                }
+                Ok(hits)
+            }
         }
     }
 
@@ -1217,6 +1255,32 @@ impl CollectionHandle {
         Ok(documents)
     }
 
+    fn materialize_document_hit_vectors(
+        &self,
+        hits: &mut [DocumentHit],
+    ) -> io::Result<()> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+
+        let primary_vector_name = CollectionMetadata::load_from_path(
+            &self.collection_paths().collection_meta,
+        )?
+        .primary_vector;
+        let documents = self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
+        if documents.len() != hits.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "failed to resolve one or more typed query hits for vector materialization",
+            ));
+        }
+
+        for (hit, document) in hits.iter_mut().zip(documents) {
+            hit.vectors = document.vectors_with_primary(primary_vector_name.as_str());
+        }
+        Ok(())
+    }
+
     fn query_documents_with_filter(
         &self,
         query: &[f32],
@@ -1258,6 +1322,7 @@ impl CollectionHandle {
                         id: stored_ids[row_idx],
                         distance: distance_by_metric(query, vector, &collection_meta.metric)?,
                         fields: fields.clone(),
+                        vectors: BTreeMap::new(),
                     },
                 };
 

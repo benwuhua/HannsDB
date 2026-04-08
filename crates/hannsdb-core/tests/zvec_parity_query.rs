@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
-    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
+    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
 };
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
@@ -1197,70 +1197,130 @@ fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_include_vector_until_supported() {
+fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
     let root = unique_temp_dir("hannsdb_typed_query_include_vector");
     let mut db = HannsDb::open(&root).expect("open db");
-    db.create_collection("docs", 2, "l2")
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema
+        .vectors
+        .push(VectorFieldSchema::new("sparse", 2));
+    db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                7,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("sparse".to_string(), vec![7.0_f32, 7.0])],
+            ),
+            Document::with_vectors(
+                8,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.1_f32, 0.0],
+                [("sparse".to_string(), vec![8.0_f32, 8.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
 
-    let err = db
+    let hits = db
         .query_with_context(
             "docs",
             &QueryContext {
                 top_k: 1,
                 queries: vec![VectorQuery {
-                    field_name: "vector".to_string(),
+                    field_name: "dense".to_string(),
                     vector: vec![0.0_f32, 0.0],
                     param: None,
                 }],
                 query_by_id: None,
                 filter: None,
-                output_fields: None,
+                output_fields: Some(vec!["group".to_string()]),
                 include_vector: true,
                 group_by: None,
                 reranker: None,
             },
         )
-        .expect_err("include_vector should be rejected until the result type carries vectors");
+        .expect("typed query should include vectors on the fast path");
 
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("include_vector"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].fields,
+        [("group".to_string(), FieldValue::Int64(1))]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(hits[0].vectors.get("dense"), Some(&vec![0.0_f32, 0.0]));
+    assert_eq!(hits[0].vectors.get("sparse"), Some(&vec![7.0_f32, 7.0]));
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_include_vector_before_query_by_id_resolution() {
-    let root = unique_temp_dir("hannsdb_typed_query_include_vector_query_by_id_guard");
+fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
+    let root = unique_temp_dir("hannsdb_typed_query_include_vector_query_by_id");
     let mut db = HannsDb::open(&root).expect("open db");
-    db.create_collection("docs", 2, "l2")
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema
+        .vectors
+        .push(VectorFieldSchema::new("sparse", 2));
+    db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
-    db.insert_documents("docs", &[Document::new(7, [], vec![0.0_f32, 0.0])])
-        .expect("insert documents");
-
-    fs::remove_file(
-        root.join("collections")
-            .join("docs")
-            .join("tombstones.json"),
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                7,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("sparse".to_string(), vec![7.0_f32, 7.0])],
+            ),
+            Document::with_vectors(
+                8,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.1_f32, 0.0],
+                [("sparse".to_string(), vec![8.0_f32, 8.0])],
+            ),
+        ],
     )
-    .expect("remove tombstones to prove query_by_id resolution is not reached");
+    .expect("insert documents");
 
-    let err = db
+    let hits = db
         .query_with_context(
             "docs",
             &QueryContext {
                 top_k: 1,
                 queries: Vec::new(),
                 query_by_id: Some(vec![7]),
-                filter: Some("1 == 1".to_string()),
-                output_fields: None,
+                filter: None,
+                output_fields: Some(vec!["group".to_string()]),
                 include_vector: true,
                 group_by: None,
                 reranker: None,
             },
         )
-        .expect_err("include_vector should fail before query_by_id resolution touches storage");
+        .expect("typed query should include vectors when recall comes from query_by_id");
 
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("include_vector"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 7);
+    assert_eq!(
+        hits[0].fields,
+        [("group".to_string(), FieldValue::Int64(1))]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(hits[0].vectors.get("dense"), Some(&vec![0.0_f32, 0.0]));
+    assert_eq!(hits[0].vectors.get("sparse"), Some(&vec![7.0_f32, 7.0]));
 }
 
 #[test]

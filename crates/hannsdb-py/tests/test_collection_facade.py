@@ -248,6 +248,48 @@ def test_real_collection_fetch_preserves_primary_field_name_for_legacy_replace(t
     collection.destroy()
 
 
+def build_multi_vector_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="sparse",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vectors={
+                    "dense": [0.0, 0.0],
+                    "sparse": [1.0, 1.0],
+                },
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="2",
+                vectors={
+                    "dense": [0.1, 0.0],
+                    "sparse": [2.0, 2.0],
+                },
+                fields={"group": 2},
+            ),
+        ]
+    )
+    return collection
+
+
 def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_surface(
     tmp_path,
 ):
@@ -1594,124 +1636,45 @@ def test_real_collection_query_rejects_query_by_id_with_reranker_legacy_kwargs(t
         collection.destroy()
 
 
-def test_real_collection_query_context_rejects_include_vector(tmp_path):
-    schema = hannsdb.CollectionSchema(
-        name="docs",
-        primary_vector="dense",
-        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
-        vectors=[
-            hannsdb.VectorSchema(
-                name="dense",
-                data_type="vector_fp32",
-                dimension=2,
-            )
-        ],
-    )
-    collection = hannsdb.create_and_open(str(tmp_path), schema)
-    collection.insert(
-        [
-            hannsdb.Doc(
-                id="1",
-                vector=[0.0, 0.0],
-                field_name="dense",
-                fields={"group": 1},
-                score=0.0,
-            ),
-            hannsdb.Doc(
-                id="2",
-                vector=[0.1, 0.0],
-                field_name="dense",
-                fields={"group": 1},
-                score=0.0,
-            ),
-            hannsdb.Doc(
-                id="3",
-                vector=[0.2, 0.0],
-                field_name="dense",
-                fields={"group": 2},
-                score=0.0,
-            ),
-        ]
-    )
-
+def test_real_collection_query_context_returns_vectors_when_requested(tmp_path):
+    collection = build_multi_vector_collection(tmp_path)
     context = hannsdb.QueryContext(
         top_k=1,
         queries=[
             hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)
         ],
+        output_fields=["group"],
         include_vector=True,
     )
 
-    try:
-        with pytest.raises(NotImplementedError) as exc_info:
-            collection.query(context)
-        assert str(exc_info.value) == (
-            "include_vector is not supported by the Python facade yet"
-        )
-        assert "unsupported:" not in str(exc_info.value)
-    finally:
-        collection.destroy()
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["1"]
+    assert result[0].field("group") == 1
+    assert result[0].vectors["dense"] == [0.0, 0.0]
+    assert result[0].vectors["sparse"] == [1.0, 1.0]
+    collection.destroy()
 
 
-def test_real_collection_query_rejects_include_vector_legacy_kwargs(tmp_path):
-    schema = hannsdb.CollectionSchema(
-        name="docs",
-        primary_vector="dense",
-        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
-        vectors=[
-            hannsdb.VectorSchema(
-                name="dense",
-                data_type="vector_fp32",
-                dimension=2,
-            )
-        ],
-    )
-    collection = hannsdb.create_and_open(str(tmp_path), schema)
-    collection.insert(
-        [
-            hannsdb.Doc(
-                id="1",
-                vector=[0.0, 0.0],
-                field_name="dense",
-                fields={"group": 1},
-                score=0.0,
-            ),
-            hannsdb.Doc(
-                id="2",
-                vector=[0.1, 0.0],
-                field_name="dense",
-                fields={"group": 1},
-                score=0.0,
-            ),
-            hannsdb.Doc(
-                id="3",
-                vector=[0.2, 0.0],
-                field_name="dense",
-                fields={"group": 2},
-                score=0.0,
-            ),
-        ]
+def test_real_collection_query_accepts_include_vector_legacy_kwargs(tmp_path):
+    collection = build_multi_vector_collection(tmp_path)
+
+    result = collection.query(
+        vectors=hannsdb.VectorQuery(
+            field_name="dense",
+            vector=[0.0, 0.0],
+            param=None,
+        ),
+        output_fields=["group"],
+        topk=1,
+        filter="",
+        include_vector=True,
     )
 
-    try:
-        with pytest.raises(NotImplementedError) as exc_info:
-            collection.query(
-                vectors=hannsdb.VectorQuery(
-                    field_name="dense",
-                    vector=[0.0, 0.0],
-                    param=None,
-                ),
-                output_fields=[],
-                topk=1,
-                filter="",
-                include_vector=True,
-            )
-        assert str(exc_info.value) == (
-            "include_vector is not supported by the Python facade yet"
-        )
-        assert "unsupported:" not in str(exc_info.value)
-    finally:
-        collection.destroy()
+    assert [doc.id for doc in result] == ["1"]
+    assert result[0].field("group") == 1
+    assert result[0].vectors["dense"] == [0.0, 0.0]
+    assert result[0].vectors["sparse"] == [1.0, 1.0]
 
 
 def test_real_collection_query_context_applies_group_by_and_output_fields(

@@ -61,12 +61,6 @@ impl QueryPlanner {
         context: &QueryContext,
         query_by_id_documents: &[Document],
     ) -> io::Result<QueryPlan> {
-        if context.include_vector {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "include_vector is not supported on the typed query path yet",
-            ));
-        }
         if context.reranker.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

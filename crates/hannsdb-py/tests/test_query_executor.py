@@ -410,7 +410,7 @@ def test_query_executor_rejects_core_unsupported_query_shape_as_not_implemented(
         executor.execute(collection, context)
 
 
-def test_query_executor_rejects_include_vector_as_not_implemented(tmp_path):
+def test_query_executor_supports_include_vector(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
@@ -422,8 +422,10 @@ def test_query_executor_rejects_include_vector_as_not_implemented(tmp_path):
         include_vector=True,
     )
 
-    with pytest.raises(NotImplementedError, match="include_vector"):
-        executor.execute(collection, context)
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["1"]
+    assert hits[0].vectors["dense"] == [0.0, 0.0]
 
 
 def test_query_executor_rejects_query_by_id_with_reranker_as_not_implemented(tmp_path):

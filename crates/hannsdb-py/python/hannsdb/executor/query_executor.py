@@ -28,8 +28,6 @@ class QueryExecutor:
         return 1
 
     def execute(self, collection: Any, context: QueryContext):
-        if context.include_vector:
-            raise NotImplementedError("include_vector is not supported by the Python facade yet")
         if context.reranker is None:
             return collection.query_context(context)
         if not isinstance(context.reranker, ReRanker):
