@@ -647,7 +647,8 @@ impl HannsDb {
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted = append_documents(&paths, collection_meta.dimension, documents)?;
+        let inserted =
+            append_documents(&paths, collection_meta.dimension, segment_meta.record_count, documents)?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -704,7 +705,8 @@ impl HannsDb {
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted = append_documents(&paths, collection_meta.dimension, documents)?;
+        let inserted =
+            append_documents(&paths, collection_meta.dimension, segment_meta.record_count, documents)?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -1579,11 +1581,16 @@ impl WalReplayPlan {
         let manifest = ManifestMetadata::load_from_path(&manifest_path(&db.root))?;
         for (collection, plan) in &self.collections {
             let paths = db.collection_paths(collection);
+            let segment_meta = if paths.segment_meta.exists() {
+                Some(SegmentMetadata::load_from_path(&paths.segment_meta)?)
+            } else {
+                None
+            };
             if !manifest.collections.iter().any(|entry| entry == collection) {
                 return Ok(true);
             }
             if !paths.collection_meta.exists()
-                || !paths.segment_meta.exists()
+                || segment_meta.is_none()
                 || !paths.tombstones.exists()
             {
                 return Ok(true);
@@ -1595,8 +1602,16 @@ impl WalReplayPlan {
             {
                 return Ok(true);
             }
-            if plan.requires_vector_sidecar && !paths.vectors.exists() {
-                return Ok(true);
+            if plan.requires_vector_sidecar {
+                match load_vectors(&paths.vectors) {
+                    Ok(vectors) => {
+                        if Some(vectors.len()) != segment_meta.as_ref().map(|meta| meta.record_count)
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    Err(_) => return Ok(true),
+                }
             }
         }
         for collection in &self.dropped_collections {
@@ -1698,12 +1713,9 @@ fn load_payloads_or_empty(
     }
 }
 
-fn load_vectors_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+fn load_vectors_or_empty(path: &Path, expected_rows: usize) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
     match load_vectors(path) {
-        Ok(mut vectors) => {
+        Ok(vectors) => {
             if vectors.len() > expected_rows {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1711,7 +1723,10 @@ fn load_vectors_or_empty(
                 ));
             }
             if vectors.len() < expected_rows {
-                vectors.resize_with(expected_rows, BTreeMap::new);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count is shorter than record row count",
+                ));
             }
             Ok(vectors)
         }
@@ -1780,8 +1795,10 @@ fn validate_documents(documents: &[Document], collection_meta: &CollectionMetada
 fn append_documents(
     paths: &CollectionPaths,
     dimension: usize,
+    existing_rows: usize,
     documents: &[Document],
 ) -> io::Result<usize> {
+    ensure_vector_rows(&paths.vectors, existing_rows)?;
     let mut ids = Vec::with_capacity(documents.len());
     let mut records = Vec::with_capacity(documents.len().saturating_mul(dimension));
     let mut payloads = Vec::with_capacity(documents.len());
@@ -1798,6 +1815,27 @@ fn append_documents(
     let _ = append_payloads(&paths.payloads, &payloads)?;
     let _ = append_vectors(&paths.vectors, &vectors)?;
     Ok(inserted)
+}
+
+fn ensure_vector_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
+    match load_vectors(path) {
+        Ok(vectors) => {
+            if vectors.len() != existing_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count is misaligned with existing records",
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if existing_rows > 0 {
+                let _ = append_vectors(path, &vec![BTreeMap::new(); existing_rows])?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn ensure_payload_rows(path: &Path, expected_rows: usize) -> io::Result<()> {
