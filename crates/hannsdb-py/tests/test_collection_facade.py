@@ -290,6 +290,56 @@ def build_multi_vector_collection(tmp_path):
     return collection
 
 
+def build_secondary_vector_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="title",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vectors={
+                    "dense": [5.0, 5.0],
+                    "title": [0.0, 0.0],
+                },
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="2",
+                vectors={
+                    "dense": [0.0, 0.0],
+                    "title": [0.2, 0.0],
+                },
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="3",
+                vectors={
+                    "dense": [1.0, 1.0],
+                    "title": [1.0, 0.0],
+                },
+                fields={"group": 2},
+            ),
+        ]
+    )
+    return collection
+
+
 def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_surface(
     tmp_path,
 ):
@@ -927,6 +977,23 @@ def test_real_collection_query_accepts_query_context_via_vectors_argument(tmp_pa
     collection.destroy()
 
 
+def test_real_collection_query_accepts_secondary_vector_field_in_query_context(tmp_path):
+    collection = build_secondary_vector_collection(tmp_path)
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[hannsdb.VectorQuery(field_name="title", vector=[0.0, 0.0], param=None)],
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["1", "2", "3"]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}, {"group": 2}]
+
+    collection.destroy()
+
+
 def test_real_collection_query_accepts_legacy_native_vector_query_object(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -981,6 +1048,23 @@ def test_real_collection_query_accepts_legacy_native_vector_query_object(tmp_pat
     assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}]
     assert all(not doc.has_field("color") for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
+
+    collection.destroy()
+
+
+def test_real_collection_query_accepts_secondary_vector_field_via_legacy_kwargs(tmp_path):
+    collection = build_secondary_vector_collection(tmp_path)
+
+    result = collection.query(
+        vectors=hannsdb.VectorQuery(field_name="title", vector=[0.0, 0.0], param=None),
+        output_fields=["group"],
+        topk=3,
+        filter="",
+    )
+
+    assert [doc.id for doc in result] == ["1", "2", "3"]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}, {"group": 2}]
 
     collection.destroy()
 

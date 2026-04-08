@@ -241,6 +241,219 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
 }
 
 #[test]
+fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce_path() {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_vector");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![0.2_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0],
+                [("title".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("secondary vector typed query");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 0.2, 1.0]
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources() {
+    let root = unique_temp_dir("hannsdb_typed_query_mixed_recall");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![0.9_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.2_f32, 0.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 0.0],
+                [("title".to_string(), vec![0.1_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![
+                    VectorQuery {
+                        field_name: "dense".to_string(),
+                        vector: vec![0.0_f32, 0.0],
+                        param: None,
+                    },
+                    VectorQuery {
+                        field_name: "title".to_string(),
+                        vector: vec![0.0_f32, 0.0],
+                        param: None,
+                    },
+                ],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("mixed typed recall sources");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 0.0, 0.1]
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_with_secondary_schema(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_single_vector_ef_search_secondary_schema");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![10.0_f32, 10.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.2_f32, 0.0],
+                [("title".to_string(), vec![11.0_f32, 11.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.1_f32, 0.0],
+                [("title".to_string(), vec![12.0_f32, 12.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let legacy_hits = db
+        .search_with_ef("docs", &[0.0_f32, 0.0], 3, 64)
+        .expect("legacy search_with_ef");
+    let typed_hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("typed query should reuse the legacy single-vector path");
+
+    assert_eq!(
+        typed_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        legacy_hits.iter().map(|hit| hit.id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_recall");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1073,18 +1286,9 @@ fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_querie
         .expect("typed filtered query");
 
     let mut expected = vec![
-        (
-            11_i64,
-            l2_distance(&query, &[0.0_f32, 0.0]),
-        ),
-        (
-            12_i64,
-            l2_distance(&query, &[1.0_f32, 0.0]),
-        ),
-        (
-            14_i64,
-            l2_distance(&query, &[1.0_f32, 1.0]),
-        ),
+        (11_i64, l2_distance(&query, &[0.0_f32, 0.0])),
+        (12_i64, l2_distance(&query, &[1.0_f32, 0.0])),
+        (14_i64, l2_distance(&query, &[1.0_f32, 1.0])),
     ];
     expected.sort_by(|left, right| {
         left.1
@@ -1206,9 +1410,7 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
         "l2",
         vec![ScalarFieldSchema::new("group", FieldType::Int64)],
     );
-    schema
-        .vectors
-        .push(VectorFieldSchema::new("sparse", 2));
+    schema.vectors.push(VectorFieldSchema::new("sparse", 2));
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
     db.insert_documents(
@@ -1271,9 +1473,7 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
         "l2",
         vec![ScalarFieldSchema::new("group", FieldType::Int64)],
     );
-    schema
-        .vectors
-        .push(VectorFieldSchema::new("sparse", 2));
+    schema.vectors.push(VectorFieldSchema::new("sparse", 2));
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
     db.insert_documents(
@@ -1345,11 +1545,16 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
     )
     .expect("insert document");
 
-    let warm_hits = db.search("docs", &[0.0_f32, 0.0], 1).expect("warm search cache");
+    let warm_hits = db
+        .search("docs", &[0.0_f32, 0.0], 1)
+        .expect("warm search cache");
     assert_eq!(warm_hits.len(), 1);
     assert_eq!(warm_hits[0].id, 7);
 
-    let tombstones_path = root.join("collections").join("docs").join("tombstones.json");
+    let tombstones_path = root
+        .join("collections")
+        .join("docs")
+        .join("tombstones.json");
     let mut tombstones =
         TombstoneMask::load_from_path(&tombstones_path).expect("load tombstones from disk");
     assert!(tombstones.mark_deleted(0));

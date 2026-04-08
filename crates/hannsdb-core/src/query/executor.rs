@@ -6,7 +6,9 @@ use std::path::Path;
 use crate::catalog::CollectionMetadata;
 use crate::db::DocumentHit;
 use crate::document::FieldValue;
-use crate::segment::{load_payloads, load_record_ids, load_records, SegmentManager, TombstoneMask};
+use crate::segment::{
+    load_payloads, load_record_ids, load_records, load_vectors, SegmentManager, TombstoneMask,
+};
 
 use super::planner::{BruteForceExecutionMode, BruteForceQueryPlan};
 use super::search::distance_by_metric;
@@ -25,10 +27,21 @@ impl QueryExecutor {
 
         let mut best_hits = HashMap::new();
         let mut shadowed_ids = HashSet::new();
+        let needs_secondary_vectors = plan.recall_sources.iter().any(|source| match &source.kind {
+            super::planner::RecallSourceKind::ExplicitVector { field_name } => {
+                field_name != &collection.primary_vector
+            }
+            super::planner::RecallSourceKind::QueryById { .. } => false,
+        });
         for segment in segment_manager.segment_paths()? {
             let records = load_records_or_empty(&segment.records, collection.dimension)?;
             let external_ids = load_record_ids_or_empty(&segment.external_ids)?;
             let payloads = load_payloads_or_empty(&segment.payloads, external_ids.len())?;
+            let vectors = if needs_secondary_vectors {
+                Some(load_vectors_or_empty(&segment.vectors, external_ids.len())?)
+            } else {
+                None
+            };
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
             if external_ids.len().saturating_mul(collection.dimension) != records.len() {
@@ -58,14 +71,23 @@ impl QueryExecutor {
                     }
                 }
 
+                let Some(distance) = (match plan.mode {
+                    BruteForceExecutionMode::Recall => best_distance(
+                        plan,
+                        vector,
+                        vectors.as_deref(),
+                        row_idx,
+                        &collection.metric,
+                        &collection.primary_vector,
+                    )?,
+                    BruteForceExecutionMode::FilterOnlyScan => Some(0.0),
+                }) else {
+                    continue;
+                };
+
                 let candidate = DocumentHit {
                     id,
-                    distance: match plan.mode {
-                        BruteForceExecutionMode::Recall => {
-                            best_distance(plan, vector, &collection.metric)?
-                        }
-                        BruteForceExecutionMode::FilterOnlyScan => 0.0,
-                    },
+                    distance,
                     fields: fields.clone(),
                     vectors: BTreeMap::new(),
                 };
@@ -90,23 +112,37 @@ impl QueryExecutor {
     }
 }
 
-fn best_distance(plan: &BruteForceQueryPlan, vector: &[f32], metric: &str) -> io::Result<f32> {
+fn best_distance(
+    plan: &BruteForceQueryPlan,
+    primary_vector: &[f32],
+    secondary_vectors: Option<&[BTreeMap<String, Vec<f32>>]>,
+    row_idx: usize,
+    metric: &str,
+    primary_vector_name: &str,
+) -> io::Result<Option<f32>> {
     let mut best = None;
     for source in &plan.recall_sources {
-        let _ = &source.kind;
-        let distance = distance_by_metric(&source.vector, vector, metric)?;
+        let candidate_vector = match &source.kind {
+            super::planner::RecallSourceKind::QueryById { .. } => Some(primary_vector),
+            super::planner::RecallSourceKind::ExplicitVector { field_name }
+                if field_name == primary_vector_name =>
+            {
+                Some(primary_vector)
+            }
+            super::planner::RecallSourceKind::ExplicitVector { field_name } => secondary_vectors
+                .and_then(|vectors| vectors[row_idx].get(field_name).map(Vec::as_slice)),
+        };
+        let Some(candidate_vector) = candidate_vector else {
+            continue;
+        };
+        let distance = distance_by_metric(&source.vector, candidate_vector, metric)?;
         match best {
             Some(current) if distance >= current => {}
             _ => best = Some(distance),
         }
     }
 
-    best.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "query plan must contain at least one recall source",
-        )
-    })
+    Ok(best)
 }
 
 fn insert_best_hit(best_hits: &mut HashMap<i64, DocumentHit>, candidate: DocumentHit) {
@@ -221,6 +257,33 @@ fn load_payloads_or_empty(
                 payloads.resize_with(expected_rows, BTreeMap::new);
             }
             Ok(payloads)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(vec![BTreeMap::new(); expected_rows])
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn load_vectors_or_empty(
+    path: &Path,
+    expected_rows: usize,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    match load_vectors(path) {
+        Ok(vectors) => {
+            if vectors.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count exceeds record row count",
+                ));
+            }
+            if vectors.len() < expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count is shorter than record row count",
+                ));
+            }
+            Ok(vectors)
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             Ok(vec![BTreeMap::new(); expected_rows])

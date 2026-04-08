@@ -47,6 +47,52 @@ def build_collection(tmp_path):
     return collection, schema
 
 
+def build_secondary_vector_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(
+                name="group",
+                data_type="int64",
+            )
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="title",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vectors={"dense": [5.0, 5.0], "title": [0.0, 0.0]},
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="2",
+                vectors={"dense": [0.0, 0.0], "title": [0.2, 0.0]},
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="3",
+                vectors={"dense": [1.0, 1.0], "title": [1.0, 0.0]},
+                fields={"group": 2},
+            ),
+        ]
+    )
+    return collection, schema
+
+
 class RecordingReranker(hannsdb.ReRanker):
     def __init__(self):
         super().__init__(topn=2)
@@ -227,6 +273,24 @@ def test_query_executor_supports_multi_query_and_query_by_id(tmp_path):
     hits = executor.execute(collection, context)
 
     assert {hit.id for hit in hits} == {"1", "2", "3"}
+    assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+
+
+def test_query_executor_supports_secondary_vector_field_in_query_context(tmp_path):
+    collection, schema = build_secondary_vector_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[
+            hannsdb.VectorQuery(field_name="title", vector=[0.0, 0.0], param=None),
+        ],
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["1", "2", "3"]
     assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
 
 

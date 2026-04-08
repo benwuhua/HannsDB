@@ -85,7 +85,8 @@ impl QueryPlanner {
         let is_single_vector_fast_path = context.group_by.is_none()
             && context.queries.len() == 1
             && context.query_by_id.is_none()
-            && filter.is_none();
+            && filter.is_none()
+            && context.queries[0].field_name == collection.primary_vector;
         if uses_ef_search && !is_single_vector_fast_path {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -95,7 +96,7 @@ impl QueryPlanner {
 
         if is_single_vector_fast_path {
             let query = &context.queries[0];
-            validate_vector_query(collection, query, true)?;
+            validate_vector_query(collection, query, true, true)?;
             if filter.is_some()
                 && query
                     .param
@@ -121,7 +122,7 @@ impl QueryPlanner {
 
         let mut recall_sources = Vec::new();
         for query in &context.queries {
-            validate_vector_query(collection, query, false)?;
+            validate_vector_query(collection, query, false, false)?;
             recall_sources.push(PlannedRecallSource {
                 kind: RecallSourceKind::ExplicitVector {
                     field_name: query.field_name.clone(),
@@ -197,6 +198,7 @@ fn validate_vector_query(
     collection: &CollectionMetadata,
     query: &VectorQuery,
     allow_ef_search: bool,
+    require_primary: bool,
 ) -> io::Result<()> {
     if !allow_ef_search
         && query
@@ -224,7 +226,7 @@ fn validate_vector_query(
         ));
     };
 
-    if query.field_name != collection.primary_vector {
+    if require_primary && query.field_name != collection.primary_vector {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
