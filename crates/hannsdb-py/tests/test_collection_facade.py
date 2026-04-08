@@ -2552,6 +2552,18 @@ def test_open_round_trips_collection_option_on_python_facade(tmp_path):
     reopened.destroy()
 
 
+def test_open_returns_default_python_collection_option_when_option_is_omitted(tmp_path):
+    schema = build_schema()
+
+    created = hannsdb.create_and_open(str(tmp_path), schema)
+    reopened = hannsdb.open(str(tmp_path))
+
+    assert reopened.option == hannsdb.CollectionOption()
+    assert reopened.option.__class__ is hannsdb.CollectionOption
+
+    reopened.destroy()
+
+
 def test_collection_from_core_wraps_native_option_as_python_wrapper(monkeypatch):
     schema = build_schema()
 
