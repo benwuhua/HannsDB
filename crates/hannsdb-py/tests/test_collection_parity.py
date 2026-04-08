@@ -118,6 +118,40 @@ def test_native_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
     collection.destroy()
 
 
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("add_column", ("session_id",)),
+        ("drop_column", ("session_id",)),
+        ("alter_column", ("session_id",)),
+    ],
+)
+def test_native_collection_column_mutation_surfaces_are_explicitly_unsupported(
+    tmp_path, method_name, args
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        schema._get_native(),
+    )
+
+    with pytest.raises(NotImplementedError, match=rf"{method_name}.*not supported yet"):
+        getattr(collection, method_name)(*args)
+
+    collection.destroy()
+
+
 def test_python_facade_exports_weighted_reranker_from_extension_and_top_level():
     assert hannsdb.extension.WeightedReRanker is hannsdb.WeightedReRanker
     from hannsdb.extension import WeightedReRanker as ExtensionWeightedReRanker

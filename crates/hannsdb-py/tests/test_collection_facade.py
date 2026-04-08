@@ -3029,6 +3029,44 @@ def test_collection_delete_by_filter_raises_before_core_delegation(monkeypatch):
         collection.delete_by_filter("session_id = 'abc'")
 
 
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("add_column", ("session_id",)),
+        ("drop_column", ("session_id",)),
+        ("alter_column", ("session_id",)),
+    ],
+)
+def test_collection_column_mutation_surfaces_raise_before_core_delegation(
+    monkeypatch, method_name, args
+):
+    schema = build_schema()
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def add_column(self, *args, **kwargs):
+            raise AssertionError("core add_column should not be called")
+
+        def drop_column(self, *args, **kwargs):
+            raise AssertionError("core drop_column should not be called")
+
+        def alter_column(self, *args, **kwargs):
+            raise AssertionError("core alter_column should not be called")
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    with pytest.raises(NotImplementedError, match=rf"{method_name}.*not supported yet"):
+        getattr(collection, method_name)(*args)
+
+
 def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monkeypatch):
     schema = build_schema()
     calls = []
