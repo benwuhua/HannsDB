@@ -6,6 +6,7 @@ from typing import Any
 
 from .. import _native as _native_module
 from .._native import CollectionOption, HnswIndexParam, IVFIndexParam
+from ..model.doc import Doc
 from ..model.schema.collection_schema import CollectionSchema, _coerce_collection_schema
 from ..model.schema.field_schema import FieldSchema, VectorSchema
 
@@ -23,6 +24,39 @@ def _schema_to_native(schema):
     if native_getter is not None:
         return native_getter()
     return schema
+
+
+def _coerce_doc_to_native(doc):
+    native_getter = getattr(doc, "_get_native", None)
+    if native_getter is not None:
+        return native_getter()
+    return doc
+
+
+def _coerce_docs_to_native(docs):
+    return [_coerce_doc_to_native(doc) for doc in list(docs)]
+
+
+def _wrap_doc_result(result):
+    if isinstance(result, (list, tuple)):
+        return [_wrap_doc(item) for item in result]
+    return result
+
+
+def _wrap_doc(item):
+    if isinstance(item, Doc):
+        return item
+    native_doc_type = getattr(_native_module, "Doc", None)
+    if native_doc_type is not None and isinstance(item, native_doc_type):
+        return Doc._from_native(item)
+    if hasattr(item, "id") and hasattr(item, "fields"):
+        return Doc(
+            id=getattr(item, "id"),
+            score=getattr(item, "score", None),
+            fields=getattr(item, "fields", None),
+            vectors=getattr(item, "vectors", None),
+        )
+    return item
 
 
 def _build_query_context(
@@ -240,19 +274,19 @@ class Collection:
                 query_by_id=query_by_id,
                 group_by=group_by,
             )
-        return self._querier.execute(self, query_context)
+        return _wrap_doc_result(self._querier.execute(self, query_context))
 
     def query_context(self, context):
-        return self._core.query_context(context)
+        return _wrap_doc_result(self._core.query_context(context))
 
     def insert(self, docs):
-        return self._core.insert(docs)
+        return self._core.insert(_coerce_docs_to_native(docs))
 
     def upsert(self, docs):
-        return self._core.upsert(docs)
+        return self._core.upsert(_coerce_docs_to_native(docs))
 
     def fetch(self, ids):
-        return self._core.fetch(ids)
+        return _wrap_doc_result(self._core.fetch(ids))
 
     def delete(self, ids):
         return self._core.delete(ids)

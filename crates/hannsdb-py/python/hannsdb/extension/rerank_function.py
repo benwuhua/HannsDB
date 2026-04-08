@@ -23,11 +23,10 @@ class ReRanker(ABC):
 
 
 def _clone_doc_with_score(doc: Doc, score: float) -> Doc:
-    return Doc(
-        id=doc.id,
-        fields=dict(doc.fields),
-        score=score,
-    )
+    replacer = getattr(doc, "_replace", None)
+    if replacer is not None:
+        return replacer(score=score)
+    return Doc(id=doc.id, fields=dict(doc.fields), score=score)
 
 
 __all__ = ["ReRanker"]

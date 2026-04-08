@@ -2,6 +2,175 @@ import hannsdb
 import pytest
 
 
+def test_doc_is_pure_python_facade_type():
+    assert hannsdb.Doc is not hannsdb._native.Doc
+    assert hannsdb.Doc.__module__ == "hannsdb.model.doc"
+
+
+def test_doc_constructor_supports_legacy_and_zvec_shapes():
+    legacy = hannsdb.Doc(
+        id="1",
+        vector=[0.1, 0.2],
+        field_name="dense",
+        fields={"session_id": "abc"},
+        score=0.5,
+    )
+    zvec = hannsdb.Doc(
+        id="2",
+        score=0.25,
+        vectors={"dense": [0.3, 0.4]},
+        fields={"session_id": "def"},
+    )
+
+    assert legacy.vector("dense") == [0.1, 0.2]
+    assert legacy.field("session_id") == "abc"
+    assert legacy.has_vector("dense") is True
+    assert legacy.has_field("session_id") is True
+    assert zvec.vector("dense") == [0.3, 0.4]
+    assert zvec.field("session_id") == "def"
+    assert zvec.has_vector("dense") is True
+    assert zvec.has_field("session_id") is True
+    assert legacy._get_native().__class__ is hannsdb._native.Doc
+    assert zvec._get_native().__class__ is hannsdb._native.Doc
+
+
+def test_doc_normalizes_numpy_vectors_and_replace():
+    np = pytest.importorskip("numpy")
+
+    doc = hannsdb.Doc(
+        id="1",
+        vectors={"dense": np.array([1.0, 2.0], dtype=np.float32)},
+        fields={"session_id": "abc"},
+        score=0.1,
+    )
+    replaced = doc._replace(score=0.2)
+
+    assert doc.vector("dense") == [1.0, 2.0]
+    assert isinstance(doc.vector("dense"), list)
+    assert replaced.score == 0.2
+    assert replaced.vector("dense") == [1.0, 2.0]
+
+
+def test_collection_insert_and_upsert_accept_pure_and_native_docs(monkeypatch):
+    schema = build_schema()
+    calls = []
+    np = pytest.importorskip("numpy")
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def insert(self, docs):
+            calls.append(("insert", docs))
+            return len(docs)
+
+        def upsert(self, docs):
+            calls.append(("upsert", docs))
+            return len(docs)
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    pure_doc = hannsdb.Doc(
+        id="1",
+        vectors={"dense": np.array([0.1, 0.2], dtype=np.float32)},
+        fields={"session_id": "abc"},
+    )
+    native_doc = hannsdb._native.Doc(
+        id="2",
+        vector=[0.3, 0.4],
+        field_name="dense",
+        fields={"session_id": "def"},
+    )
+
+    assert collection.insert([pure_doc, native_doc]) == 2
+    assert collection.upsert([pure_doc, native_doc]) == 2
+    assert [call[0] for call in calls] == ["insert", "upsert"]
+    assert all(doc.__class__ is hannsdb._native.Doc for doc in calls[0][1])
+    assert calls[0][1][0].id == "1"
+    assert calls[0][1][0].vectors == {"dense": [0.1, 0.2]}
+    assert calls[0][1][1].fields == {"session_id": "def"}
+
+
+def test_collection_fetch_query_and_query_context_wrap_native_docs(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def query_context(self, context):
+            calls.append(("query_context", context))
+            return [
+                hannsdb._native.Doc(
+                    id="1",
+                    vector=[0.1, 0.2],
+                    field_name="dense",
+                    fields={"session_id": "abc"},
+                    score=0.25,
+                )
+            ]
+
+        def fetch(self, ids):
+            calls.append(("fetch", ids))
+            return [
+                hannsdb._native.Doc(
+                    id="2",
+                    vector=[0.3, 0.4],
+                    field_name="dense",
+                    fields={"session_id": "def"},
+                    score=0.5,
+                )
+            ]
+
+    class FakeExecutor:
+        def execute(self, collection, context):
+            calls.append(("execute", collection, context))
+            return collection.query_context(context)
+
+    class FakeFactory:
+        def build(self):
+            calls.append(("build", None, None))
+            return FakeExecutor()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    fetched = collection.fetch(["2"])
+    queried = collection.query(
+        vectors=hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        output_fields=["session_id"],
+        topk=1,
+        filter="",
+    )
+    direct = collection.query_context(
+        hannsdb.QueryContext(
+            top_k=1,
+            queries=[hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)],
+        )
+    )
+
+    assert fetched[0].__class__ is hannsdb.Doc
+    assert fetched[0].field("session_id") == "def"
+    assert queried[0].__class__ is hannsdb.Doc
+    assert queried[0].field("session_id") == "abc"
+    assert direct[0].__class__ is hannsdb.Doc
+    assert direct[0].field("session_id") == "abc"
+    assert [call[0] for call in calls] == [
+        "build",
+        "fetch",
+        "execute",
+        "query_context",
+        "query_context",
+    ]
+
+
 def build_schema():
     return hannsdb.CollectionSchema(
         name="docs",
