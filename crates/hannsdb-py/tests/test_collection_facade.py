@@ -342,6 +342,90 @@ def test_real_collection_update_raises_key_error_for_missing_id(tmp_path):
     collection.destroy()
 
 
+def test_real_collection_update_coalesces_duplicate_ids_in_patch_order(tmp_path):
+    collection = build_update_parity_collection(tmp_path)
+
+    assert collection.update(
+        [
+            hannsdb.Doc(id="1", fields={"tag": "reviewed"}),
+            hannsdb.Doc(id="1", vectors={"dense": [9.0, 8.0]}),
+            hannsdb.Doc(id="1", fields={"session_id": "xyz"}),
+        ]
+    ) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field("session_id") == "xyz"
+    assert fetched.field("tag") == "reviewed"
+    assert fetched.vector("dense") == [9.0, 8.0]
+    assert fetched.vector("sparse") == [3.0, 4.0]
+
+    collection.destroy()
+
+
+def test_real_collection_update_mixed_batch_raises_before_partial_write(tmp_path):
+    collection = build_update_parity_collection(tmp_path)
+
+    with pytest.raises(KeyError, match="999"):
+        collection.update(
+            [
+                hannsdb.Doc(id="1", fields={"tag": "published"}),
+                hannsdb.Doc(id="999", fields={"tag": "missing"}),
+            ]
+        )
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field("session_id") == "abc"
+    assert fetched.field("tag") == "draft"
+    assert fetched.vector("dense") == [1.0, 2.0]
+    assert fetched.vector("sparse") == [3.0, 4.0]
+
+    collection.destroy()
+
+
+def test_real_collection_update_preserves_primary_field_name_for_secondary_only_patch(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="z_primary",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="a_secondary",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="z_primary",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                fields={"session_id": "abc"},
+                vectors={
+                    "z_primary": [1.0, 2.0],
+                    "a_secondary": [3.0, 4.0],
+                },
+            )
+        ]
+    )
+
+    assert collection.update([hannsdb.Doc(id="1", vectors={"a_secondary": [7.0, 6.0]})]) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field_name == "z_primary"
+    assert fetched.vector("z_primary") == [1.0, 2.0]
+    assert fetched.vector("a_secondary") == [7.0, 6.0]
+
+    collection.destroy()
+
+
 def build_multi_vector_collection(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",

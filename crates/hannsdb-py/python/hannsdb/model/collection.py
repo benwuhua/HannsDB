@@ -379,21 +379,24 @@ class Collection:
     def update(self, docs):
         patches = [_wrap_doc(doc) for doc in _coerce_docs_input(docs)]
         ids = [doc.id for doc in patches]
+        unique_ids = list(dict.fromkeys(ids))
         with self._core_lock:
-            fetched_docs = _wrap_doc_result(self._core.fetch(ids))
+            fetched_docs = _wrap_doc_result(self._core.fetch(unique_ids))
             current_docs = {doc.id: doc for doc in fetched_docs}
 
-            for doc_id in ids:
+            for doc_id in unique_ids:
                 if doc_id not in current_docs:
                     raise KeyError(doc_id)
 
-            merged_docs = []
+            merged_docs = {}
             for patch in patches:
                 merged = _merged_update_doc(current_docs[patch.id], patch)
                 current_docs[patch.id] = merged
-                merged_docs.append(merged)
+                merged_docs[patch.id] = merged
 
-            return self._core.upsert(_coerce_docs_to_native(merged_docs))
+            return self._core.upsert(
+                _coerce_docs_to_native([merged_docs[doc_id] for doc_id in unique_ids if doc_id in merged_docs])
+            )
 
     def fetch(self, ids):
         with self._core_lock:
