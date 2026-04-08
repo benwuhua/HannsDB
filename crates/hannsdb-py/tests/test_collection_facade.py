@@ -666,6 +666,122 @@ def test_real_collection_query_accepts_query_context_via_vectors_argument(tmp_pa
     collection.destroy()
 
 
+def test_real_collection_query_accepts_legacy_native_vector_query_object(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="1",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "red"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="2",
+            vector=[0.1, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "blue"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="3",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "green"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    legacy_query = hannsdb._native.VectorQuery(
+        field_name="dense",
+        vector=[0.0, 0.0],
+        param=None,
+    )
+    result = collection.query(vectors=legacy_query, output_fields=["group"], topk=2, filter="")
+
+    assert [doc.id for doc in result] == ["1", "2"]
+    assert [doc.field("group") for doc in result] == [1, 1]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}]
+    assert all(not doc.has_field("color") for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+
+    collection.destroy()
+
+
+def test_real_collection_query_accepts_pure_hnsw_query_param(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="1",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "red"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="2",
+            vector=[0.1, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "blue"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="3",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "green"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    query = hannsdb.VectorQuery(
+        field_name="dense",
+        vector=[0.0, 0.0],
+        param=hannsdb.HnswQueryParam(ef=64, is_using_refiner=False),
+    )
+    result = collection.query(vectors=query, output_fields=["group"], topk=2, filter="")
+
+    assert [doc.id for doc in result] == ["1", "2"]
+    assert [doc.field("group") for doc in result] == [1, 1]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}]
+    assert all(not doc.has_field("color") for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+
+    collection.destroy()
+
+
 def test_real_collection_query_rejects_both_query_context_and_context(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
