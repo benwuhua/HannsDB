@@ -710,8 +710,12 @@ def test_real_collection_query_context_rejects_include_vector(tmp_path):
     )
 
     try:
-        with pytest.raises(NotImplementedError, match="include_vector"):
+        with pytest.raises(NotImplementedError) as exc_info:
             collection.query(context)
+        assert str(exc_info.value) == (
+            "include_vector is not supported by the Python facade yet"
+        )
+        assert "unsupported:" not in str(exc_info.value)
     finally:
         collection.destroy()
 
@@ -757,7 +761,7 @@ def test_real_collection_query_rejects_include_vector_legacy_kwargs(tmp_path):
     )
 
     try:
-        with pytest.raises(NotImplementedError, match="include_vector"):
+        with pytest.raises(NotImplementedError) as exc_info:
             collection.query(
                 vectors=hannsdb.VectorQuery(
                     field_name="dense",
@@ -769,6 +773,10 @@ def test_real_collection_query_rejects_include_vector_legacy_kwargs(tmp_path):
                 filter="",
                 include_vector=True,
             )
+        assert str(exc_info.value) == (
+            "include_vector is not supported by the Python facade yet"
+        )
+        assert "unsupported:" not in str(exc_info.value)
     finally:
         collection.destroy()
 
