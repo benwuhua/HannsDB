@@ -1635,17 +1635,9 @@ fn load_shadowed_live_vector_records(
     let mut shadowed_ids = HashSet::new();
 
     for segment in segment_manager.segment_paths()? {
-        let segment_records = load_records_or_empty(&segment.records, dimension)?;
         let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
         let segment_vectors = load_vectors_or_empty(&segment.vectors, segment_external_ids.len())?;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-        if segment_external_ids.len().saturating_mul(dimension) != segment_records.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "records and ids are not aligned",
-            ));
-        }
         if segment_vectors.len() != segment_external_ids.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

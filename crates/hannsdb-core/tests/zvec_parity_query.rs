@@ -390,6 +390,82 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
 }
 
 #[test]
+fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with_dimension_mismatch_between_primary_and_secondary(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_schema_indexed_dimension_mismatch");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        3,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema
+        .vectors
+        .push(VectorFieldSchema::new("title", 2).with_index_param(
+            hannsdb_core::document::VectorIndexSchema::hnsw(Some("l2"), 16, 128),
+        ));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0, 5.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0, 0.0],
+                [("title".to_string(), vec![0.2_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0, 1.0],
+                [("title".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("schema-indexed secondary vector fast path across dimension mismatch");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 0.2, 1.0]
+    );
+}
+
+#[test]
 fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_on_typed_fast_path_with_ef_search(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_descriptor_indexed_fast_path");
