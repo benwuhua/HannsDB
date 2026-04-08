@@ -373,22 +373,18 @@ class Collection:
             return _wrap_doc_result(self._core.fetch(ids))
 
     def delete(self, ids):
-        with self._core_lock:
-            return self._core.delete(ids)
+        return self._core.delete(ids)
 
     def optimize(self, option=None):
-        with self._core_lock:
-            if option is None:
-                return self._core.optimize()
-            return self._core.optimize(_native_value(option))
+        if option is None:
+            return self._core.optimize()
+        return self._core.optimize(_native_value(option))
 
     def flush(self):
-        with self._core_lock:
-            return self._core.flush()
+        return self._core.flush()
 
     def destroy(self):
-        with self._core_lock:
-            return self._core.destroy()
+        return self._core.destroy()
 
     def create_index(self, field_name, index_param=None):
         if self._schema is None:
@@ -409,28 +405,22 @@ class Collection:
         return self.drop_scalar_index(field_name)
 
     def create_vector_index(self, field_name, index_param=None):
-        with self._core_lock:
-            return self._core.create_vector_index(field_name, _native_value(index_param))
+        return self._core.create_vector_index(field_name, _native_value(index_param))
 
     def drop_vector_index(self, field_name):
-        with self._core_lock:
-            return self._core.drop_vector_index(field_name)
+        return self._core.drop_vector_index(field_name)
 
     def create_scalar_index(self, field_name):
-        with self._core_lock:
-            return self._core.create_scalar_index(field_name)
+        return self._core.create_scalar_index(field_name)
 
     def drop_scalar_index(self, field_name):
-        with self._core_lock:
-            return self._core.drop_scalar_index(field_name)
+        return self._core.drop_scalar_index(field_name)
 
     def list_vector_indexes(self):
-        with self._core_lock:
-            return self._core.list_vector_indexes()
+        return self._core.list_vector_indexes()
 
     def list_scalar_indexes(self):
-        with self._core_lock:
-            return self._core.list_scalar_indexes()
+        return self._core.list_scalar_indexes()
 
     def __getattr__(self, name: str):
         return getattr(self._core, name)
