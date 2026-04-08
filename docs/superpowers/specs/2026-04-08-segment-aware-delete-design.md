@@ -24,7 +24,7 @@ Rewrite `delete_internal(...)` so it walks segment paths in the same shadowing o
 2. For each requested external id, only the newest visible row may be deleted.
 3. If the newest visible row is already tombstoned, the id counts as absent and older rows remain untouched.
 4. Persist `tombstones.json` and `segment.json.deleted_count` for each changed segment only.
-5. Keep WAL shape unchanged: `WalRecord::Delete { ids }` still replays through `delete_internal(...)`.
+5. Keep WAL shape unchanged: `WalRecord::Delete { ids }` still replays through `delete_internal(...)`, so replay restores the correct delete outcome by routing through the segment-aware delete path.
 6. Invalidate the collection search cache after the mutation.
 
 ## Non-Goals
@@ -39,10 +39,10 @@ Rewrite `delete_internal(...)` so it walks segment paths in the same shadowing o
 - Multi-segment delete removes the newest visible row for a target id, not an older shadowed row.
 - If a newer segment already tombstones an id, deleting that id again must not resurrect or alter older rows.
 - Legacy single-segment collections must keep working.
-- WAL replay after a crash must rebuild the same segment-aware delete state.
+- WAL replay after a crash must restore the correct delete outcome by routing through the segment-aware delete path, even if the replayed storage layout is rebuilt from WAL.
 
 ## Validation
 
 - Add a failing `collection_api` test proving `delete(ids)` works against a two-segment layout and respects shadowing/tombstones.
-- Add a failing `wal_recovery` test proving a crash after multi-segment delete replays into the correct tombstone state.
+- Add a failing `wal_recovery` test proving a crash after multi-segment delete replays into the correct delete outcome through the segment-aware delete path.
 - After implementation, run targeted `collection_api` and `wal_recovery` commands plus `git diff --check` and `git status --short`.

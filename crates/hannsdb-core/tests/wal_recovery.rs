@@ -310,7 +310,7 @@ fn wal_recovery_open_replays_logged_operations_into_missing_storage() {
 }
 
 #[test]
-fn wal_recovery_replays_segment_aware_delete_state() {
+fn wal_recovery_replays_segment_aware_delete_outcome() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
 

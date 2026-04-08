@@ -38,11 +38,11 @@ Add a test that:
 - performs `delete(ids)`
 - simulates a crash by removing mutated tombstone metadata
 - reopens the database
-- asserts replay restores the segment-aware delete state
+- asserts replay restores the correct delete outcome by routing through the segment-aware delete path
 
 - [ ] **Step 4: Run the targeted wal-recovery test to verify it fails**
 
-Run: `cargo test -p hannsdb-core --test wal_recovery wal_recovery_replays_segment_aware_delete_state -- --nocapture`
+Run: `cargo test -p hannsdb-core --test wal_recovery wal_recovery_replays_segment_aware_delete_outcome -- --nocapture`
 Expected: FAIL because replay still routes through flat-layout delete behavior.
 
 ### Task 2: Implement minimal segment-aware delete
@@ -69,7 +69,7 @@ Requirements:
 
 Run:
 - `cargo test -p hannsdb-core --test collection_api collection_api_delete_uses_segment_aware_runtime_layout -- --nocapture`
-- `cargo test -p hannsdb-core --test wal_recovery wal_recovery_replays_segment_aware_delete_state -- --nocapture`
+- `cargo test -p hannsdb-core --test wal_recovery wal_recovery_replays_segment_aware_delete_outcome -- --nocapture`
 
 Expected: PASS
 
