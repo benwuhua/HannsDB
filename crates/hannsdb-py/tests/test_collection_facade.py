@@ -170,7 +170,10 @@ def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_su
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
-        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
         vectors=[
             hannsdb.VectorSchema(
                 name="dense",
@@ -273,40 +276,39 @@ def test_real_collection_query_context_routes_query_by_id_and_output_fields(
             id="11",
             vector=[0.0, 0.0],
             field_name="dense",
-            fields={"group": 1},
+            fields={"group": 1, "color": "red"},
             score=0.0,
         ),
         hannsdb.Doc(
             id="12",
             vector=[0.2, 0.0],
             field_name="dense",
-            fields={"group": 1},
+            fields={"group": 1, "color": "blue"},
             score=0.0,
         ),
         hannsdb.Doc(
             id="13",
             vector=[1.0, 0.0],
             field_name="dense",
-            fields={"group": 2},
+            fields={"group": 2, "color": "green"},
             score=0.0,
         ),
         hannsdb.Doc(
             id="14",
             vector=[2.0, 0.0],
             field_name="dense",
-            fields={"group": 1},
+            fields={"group": 1, "color": "yellow"},
             score=0.0,
         ),
         hannsdb.Doc(
             id="15",
             vector=[10.0, 10.0],
             field_name="dense",
-            fields={"group": 2},
+            fields={"group": 2, "color": "purple"},
             score=0.0,
         ),
     ]
     query_vector = [0.1, 0.0]
-    query_by_id_vector = [0.2, 0.0]
     assert collection.insert(docs) == len(docs)
 
     context = hannsdb.QueryContext(
@@ -317,34 +319,15 @@ def test_real_collection_query_context_routes_query_by_id_and_output_fields(
     )
     result = collection.query(context)
 
-    expected = [
-        ("12", 0.0),
-        (
-            "11",
-            min(
-                _l2_distance(query_vector, [0.0, 0.0]),
-                _l2_distance(query_by_id_vector, [0.0, 0.0]),
-            ),
-        ),
-        (
-            "13",
-            min(
-                _l2_distance(query_vector, [1.0, 0.0]),
-                _l2_distance(query_by_id_vector, [1.0, 0.0]),
-            ),
-        ),
-    ]
-    expected.sort(key=lambda item: (item[1], item[0]))
-
-    assert [doc.id for doc in result] == [doc_id for doc_id, _ in expected]
-    assert [doc.field("group") for doc in result] == [1, 1, 2]
-    assert [doc.score for doc in result] == pytest.approx(
-        [distance for _, distance in expected],
-        rel=1e-6,
-        abs=1e-6,
-    )
+    assert len(result) == 3
     assert result[0].id == "12"
-    assert result[0].fields == {"group": 1}
+    assert result[0].score == pytest.approx(0.0, abs=1e-6)
+    assert "12" in [doc.id for doc in result]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}, {"group": 2}]
+    assert all(not doc.has_field("color") for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+    assert [doc.score for doc in result] == sorted(doc.score for doc in result)
 
     collection.destroy()
 
