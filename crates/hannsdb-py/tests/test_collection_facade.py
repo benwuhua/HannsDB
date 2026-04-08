@@ -415,6 +415,69 @@ def test_real_collection_query_context_merges_multiple_queries_and_projects_outp
     collection.destroy()
 
 
+def test_real_collection_query_context_applies_builtin_rrf_reranker_and_output_fields(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="tag", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="1",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "a"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="2",
+            vector=[0.1, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "b"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="3",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 2, "tag": "c"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=hannsdb.RrfReRanker(topn=3),
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["2", "1", "3"]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert all(doc.fields == {"group": doc.field("group")} for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+
+    collection.destroy()
+
+
 def test_real_collection_query_context_applies_group_by_and_output_fields(
     tmp_path,
 ):
