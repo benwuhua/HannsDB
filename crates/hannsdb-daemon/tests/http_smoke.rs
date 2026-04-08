@@ -246,6 +246,207 @@ async fn search_route_accepts_typed_primary_vector_query_and_projects_output_fie
 }
 
 #[tokio::test]
+async fn search_route_accepts_typed_query_by_id_field_name_on_primary_vector_collection() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42","84"],
+                        "vectors":[[0.0,0.0],[0.2,0.0]],
+                        "fields":[
+                            {"color":"red","shape":"circle"},
+                            {"color":"blue","shape":"square"}
+                        ]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "query_by_id":["42"],
+                        "query_by_id_field_name":"vector",
+                        "output_fields":["color"]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert_eq!(json["hits"][0]["id"], "42");
+    assert_eq!(json["hits"][0]["fields"]["color"], "red");
+}
+
+#[tokio::test]
+async fn search_route_returns_daemon_error_for_invalid_query_by_id_field_name() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42"],
+                        "vectors":[[0.0,0.0]]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "query_by_id":["42"],
+                        "query_by_id_field_name":"missing"
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert!(json["error"]
+        .as_str()
+        .expect("error string")
+        .contains("query_by_id field"));
+}
+
+#[tokio::test]
+async fn search_route_rejects_legacy_request_mixing_vector_with_query_by_id_field_name() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42"],"vectors":[[0.0,0.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "vector":[0.0,0.0],
+                        "top_k":1,
+                        "query_by_id_field_name":"vector"
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+
+    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert!(json["error"]
+        .as_str()
+        .expect("error string")
+        .contains("cannot mix legacy and typed query keys"));
+}
+
+#[tokio::test]
 async fn search_route_returns_bad_request_for_unsupported_typed_shape() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

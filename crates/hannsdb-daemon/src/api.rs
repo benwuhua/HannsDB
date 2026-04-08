@@ -85,6 +85,8 @@ pub struct TypedSearchRequest {
     #[serde(default)]
     pub query_by_id: Option<Vec<String>>,
     #[serde(default)]
+    pub query_by_id_field_name: Option<String>,
+    #[serde(default)]
     pub filter: Option<String>,
     #[serde(default)]
     pub output_fields: Option<Vec<String>>,

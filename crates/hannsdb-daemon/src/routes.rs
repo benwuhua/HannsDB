@@ -637,6 +637,7 @@ fn classify_search_request(payload: serde_json::Value) -> Result<SearchRequest, 
     let has_typed_marker = [
         "queries",
         "query_by_id",
+        "query_by_id_field_name",
         "include_vector",
         "group_by",
         "reranker",
@@ -1141,6 +1142,7 @@ fn build_query_context(request: TypedSearchRequest) -> io::Result<QueryContext> 
             })
             .collect(),
         query_by_id,
+        query_by_id_field_name: request.query_by_id_field_name,
         filter: request.filter,
         output_fields: request.output_fields,
         include_vector: request.include_vector,
