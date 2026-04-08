@@ -26,6 +26,16 @@ def _schema_to_native(schema):
     return schema
 
 
+def _resolve_index_target(schema: CollectionSchema, field_name: str):
+    try:
+        return "vector", schema.vector(field_name)
+    except KeyError:
+        try:
+            return "scalar", schema.field(field_name)
+        except KeyError as error:
+            raise KeyError(field_name) from error
+
+
 def _native_value(value):
     native_getter = getattr(value, "_get_native", None)
     if native_getter is not None:
@@ -344,11 +354,34 @@ class Collection:
     def delete(self, ids):
         return self._core.delete(ids)
 
+    def optimize(self, option=None):
+        if option is None:
+            return self._core.optimize()
+        return self._core.optimize(_native_value(option))
+
     def flush(self):
         return self._core.flush()
 
     def destroy(self):
         return self._core.destroy()
+
+    def create_index(self, field_name, index_param=None):
+        if self._schema is None:
+            raise RuntimeError("collection schema is required for index operations")
+        kind, _ = _resolve_index_target(self._schema, field_name)
+        if kind == "vector":
+            return self.create_vector_index(field_name, index_param)
+        if index_param is not None:
+            raise NotImplementedError("scalar index params are not supported")
+        return self.create_scalar_index(field_name)
+
+    def drop_index(self, field_name):
+        if self._schema is None:
+            raise RuntimeError("collection schema is required for index operations")
+        kind, _ = _resolve_index_target(self._schema, field_name)
+        if kind == "vector":
+            return self.drop_vector_index(field_name)
+        return self.drop_scalar_index(field_name)
 
     def create_vector_index(self, field_name, index_param=None):
         return self._core.create_vector_index(field_name, _native_value(index_param))

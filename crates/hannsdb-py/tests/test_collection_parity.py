@@ -5,6 +5,7 @@ import hannsdb
 
 def test_python_facade_reexports_pure_param_wrappers():
     assert hannsdb.CollectionOption is hannsdb.model.param.CollectionOption
+    assert hannsdb.OptimizeOption is hannsdb.model.param.OptimizeOption
     assert hannsdb.HnswIndexParam is hannsdb.model.param.HnswIndexParam
     assert hannsdb.IVFIndexParam is hannsdb.model.param.IVFIndexParam
     assert hannsdb.HnswQueryParam is hannsdb.model.param.HnswQueryParam
@@ -47,6 +48,7 @@ def test_star_import_exposes_native_and_facade_symbols():
     for name in [
         "MetricType",
         "CollectionOption",
+        "OptimizeOption",
         "HnswIndexParam",
         "IVFIndexParam",
         "HnswQueryParam",

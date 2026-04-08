@@ -11,6 +11,7 @@ def test_schema_types_are_pure_python_wrappers():
     assert hannsdb.FieldSchema.__module__ == "hannsdb.model.schema.field_schema"
     assert hannsdb.VectorSchema.__module__ == "hannsdb.model.schema.field_schema"
     assert hannsdb.CollectionOption.__module__ == "hannsdb.model.param.collection_option"
+    assert hannsdb.OptimizeOption.__module__ == "hannsdb.model.param.optimize_option"
     assert hannsdb.HnswIndexParam.__module__ == "hannsdb.model.param.index_params"
     assert hannsdb.IVFIndexParam.__module__ == "hannsdb.model.param.index_params"
     assert hannsdb.HnswQueryParam.__module__ == "hannsdb.model.param.index_params"
@@ -91,6 +92,7 @@ def test_vector_query_is_a_pure_python_dataclass_and_flattens_numpy_arrays():
 
 def test_param_wrappers_bridge_to_native_classes():
     option = hannsdb.CollectionOption(read_only=True, enable_mmap=False)
+    optimize = hannsdb.OptimizeOption()
     hnsw = hannsdb.HnswIndexParam(
         metric_type="cosine",
         m=32,
@@ -101,6 +103,7 @@ def test_param_wrappers_bridge_to_native_classes():
     query = hannsdb.HnswQueryParam(ef=64, is_using_refiner=True)
 
     assert option._get_native().__class__ is hannsdb._native.CollectionOption
+    assert optimize._get_native().__class__ is hannsdb._native.OptimizeOption
     assert hnsw._get_native().__class__ is hannsdb._native.HnswIndexParam
     assert ivf._get_native().__class__ is hannsdb._native.IVFIndexParam
     assert query._get_native().__class__ is hannsdb._native.HnswQueryParam
@@ -111,6 +114,11 @@ def test_param_wrappers_bridge_to_native_classes():
     assert ivf.nlist == 512
     assert query.ef == 64
     assert query.is_using_refiner is True
+
+
+def test_optimize_option_is_exported_from_model_param_and_top_level():
+    assert hannsdb.OptimizeOption is hannsdb.model.param.OptimizeOption
+    assert hannsdb.OptimizeOption.__module__ == "hannsdb.model.param.optimize_option"
 
 
 def test_param_wrappers_reject_invalid_boolean_and_integer_inputs():

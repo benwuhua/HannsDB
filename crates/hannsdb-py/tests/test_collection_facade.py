@@ -614,6 +614,129 @@ def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
     ]
 
 
+def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def create_vector_index(self, field_name, index_param=None):
+            calls.append(("create_vector_index", field_name, index_param))
+
+        def create_scalar_index(self, field_name):
+            calls.append(("create_scalar_index", field_name))
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    collection.create_index("dense", hannsdb.IVFIndexParam(metric_type="l2", nlist=8))
+    collection.create_index("session_id")
+
+    assert calls[0][0] == "create_vector_index"
+    assert calls[0][1] == "dense"
+    assert calls[0][2].__class__ is hannsdb._native.IVFIndexParam
+    assert calls[1] == ("create_scalar_index", "session_id")
+
+    with pytest.raises(NotImplementedError, match="scalar index params are not supported"):
+        collection.create_index("session_id", hannsdb.OptimizeOption())
+
+
+def test_collection_create_and_drop_index_reject_unknown_fields(monkeypatch):
+    schema = build_schema()
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def create_vector_index(self, field_name, index_param=None):
+            raise AssertionError("should not be called")
+
+        def create_scalar_index(self, field_name):
+            raise AssertionError("should not be called")
+
+        def drop_vector_index(self, field_name):
+            raise AssertionError("should not be called")
+
+        def drop_scalar_index(self, field_name):
+            raise AssertionError("should not be called")
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    with pytest.raises(KeyError, match="missing"):
+        collection.create_index("missing")
+
+    with pytest.raises(KeyError, match="missing"):
+        collection.drop_index("missing")
+
+
+def test_collection_drop_index_routes_by_schema(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def drop_vector_index(self, field_name):
+            calls.append(("drop_vector_index", field_name))
+
+        def drop_scalar_index(self, field_name):
+            calls.append(("drop_scalar_index", field_name))
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection.drop_index("dense")
+    collection.drop_index("session_id")
+
+    assert calls == [
+        ("drop_vector_index", "dense"),
+        ("drop_scalar_index", "session_id"),
+    ]
+
+
+def test_collection_optimize_explicitly_delegates(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def optimize(self, option=None):
+            calls.append(option)
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection.optimize()
+    collection.optimize(hannsdb.OptimizeOption())
+
+    assert calls[0] is None
+    assert calls[1].__class__ is hannsdb._native.OptimizeOption
+
+
 def test_ddl_surface_keeps_base_schema_but_indexes_are_visible_and_survive_reopen(tmp_path):
     collection = hannsdb.create_and_open(str(tmp_path), build_schema())
     schema_before = collection.schema
