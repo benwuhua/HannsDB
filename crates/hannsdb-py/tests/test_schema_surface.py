@@ -113,6 +113,42 @@ def test_param_wrappers_bridge_to_native_classes():
     assert query.is_using_refiner is True
 
 
+def test_param_wrappers_reject_invalid_boolean_and_integer_inputs():
+    with pytest.raises(TypeError, match="read_only"):
+        hannsdb.CollectionOption(read_only="False")
+
+    with pytest.raises(TypeError, match="m"):
+        hannsdb.HnswIndexParam(metric_type="cosine", m="8")
+
+    with pytest.raises(TypeError, match="ef_construction"):
+        hannsdb.HnswIndexParam(metric_type="cosine", ef_construction="8")
+
+    with pytest.raises(TypeError, match="nlist"):
+        hannsdb.IVFIndexParam(metric_type="l2", nlist="8")
+
+    with pytest.raises(TypeError, match="ef"):
+        hannsdb.HnswQueryParam(ef="8")
+
+
+@pytest.mark.parametrize("bad_metric_type", ["bogus", 1, object()])
+def test_index_param_wrappers_reject_invalid_metric_types(bad_metric_type):
+    expected_error = ValueError if isinstance(bad_metric_type, str) else TypeError
+
+    with pytest.raises(expected_error):
+        hannsdb.HnswIndexParam(metric_type=bad_metric_type)
+
+    with pytest.raises(expected_error):
+        hannsdb.IVFIndexParam(metric_type=bad_metric_type)
+
+
+@pytest.mark.parametrize("bad_quantize_type", ["bogus", 1, object()])
+def test_hnsw_index_param_rejects_invalid_quantize_types(bad_quantize_type):
+    expected_error = ValueError if isinstance(bad_quantize_type, str) else TypeError
+
+    with pytest.raises(expected_error):
+        hannsdb.HnswIndexParam(quantize_type=bad_quantize_type)
+
+
 @pytest.mark.parametrize("value", [1.23, {1, 2}, frozenset({1, 2})])
 def test_vector_query_rejects_scalar_and_set_like_inputs(value):
     with pytest.raises(TypeError, match="vector must be"):

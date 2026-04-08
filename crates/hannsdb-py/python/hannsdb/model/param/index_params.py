@@ -7,13 +7,37 @@ from ... import _native as _native_module
 __all__ = ["HnswIndexParam", "IVFIndexParam", "HnswQueryParam"]
 
 
-def _normalize_text(value):
+def _normalize_text(name, value):
     if value is None:
         return None
-    return str(value).strip().lower()
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string or None")
+    return value.strip().lower()
 
 
-@dataclass(frozen=True, slots=True)
+def _require_int(name, value):
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an int")
+    return value
+
+
+def _validate_metric_type(name, value):
+    normalized = _normalize_text(name, value)
+    if normalized is None:
+        return None
+    if normalized not in {"l2", "cosine", "ip"}:
+        raise ValueError(f"unsupported {name} value")
+    return normalized
+
+
+def _validate_quantize_type(name, value):
+    normalized = _normalize_text(name, value)
+    if normalized not in {"undefined", "fp16", "int8", "int4"}:
+        raise ValueError(f"unsupported {name} value")
+    return normalized
+
+
+@dataclass(frozen=True)
 class HnswIndexParam:
     metric_type: str | None = None
     m: int = 16
@@ -21,10 +45,22 @@ class HnswIndexParam:
     quantize_type: str = "undefined"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "metric_type", _normalize_text(self.metric_type))
-        object.__setattr__(self, "m", int(self.m))
-        object.__setattr__(self, "ef_construction", int(self.ef_construction))
-        object.__setattr__(self, "quantize_type", _normalize_text(self.quantize_type))
+        object.__setattr__(
+            self,
+            "metric_type",
+            _validate_metric_type("metric_type", self.metric_type),
+        )
+        object.__setattr__(self, "m", _require_int("m", self.m))
+        object.__setattr__(
+            self,
+            "ef_construction",
+            _require_int("ef_construction", self.ef_construction),
+        )
+        object.__setattr__(
+            self,
+            "quantize_type",
+            _validate_quantize_type("quantize_type", self.quantize_type),
+        )
 
     def _get_native(self):
         return _native_module.HnswIndexParam(
@@ -35,14 +71,18 @@ class HnswIndexParam:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class IVFIndexParam:
     metric_type: str | None = None
     nlist: int = 1024
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "metric_type", _normalize_text(self.metric_type))
-        object.__setattr__(self, "nlist", int(self.nlist))
+        object.__setattr__(
+            self,
+            "metric_type",
+            _validate_metric_type("metric_type", self.metric_type),
+        )
+        object.__setattr__(self, "nlist", _require_int("nlist", self.nlist))
 
     def _get_native(self):
         return _native_module.IVFIndexParam(
@@ -51,14 +91,15 @@ class IVFIndexParam:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class HnswQueryParam:
     ef: int = 32
     is_using_refiner: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ef", int(self.ef))
-        object.__setattr__(self, "is_using_refiner", bool(self.is_using_refiner))
+        object.__setattr__(self, "ef", _require_int("ef", self.ef))
+        if type(self.is_using_refiner) is not bool:
+            raise TypeError("is_using_refiner must be a bool")
 
     def _get_native(self):
         return _native_module.HnswQueryParam(
