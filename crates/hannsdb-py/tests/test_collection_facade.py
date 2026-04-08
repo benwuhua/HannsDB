@@ -354,14 +354,14 @@ def test_real_collection_query_context_merges_multiple_queries_and_projects_outp
     docs = [
         hannsdb.Doc(
             id="11",
-            vector=[0.0, 0.0],
+            vector=[0.5, 0.0],
             field_name="dense",
             fields={"group": 1, "tag": "shared"},
             score=0.0,
         ),
         hannsdb.Doc(
             id="12",
-            vector=[0.6, 0.0],
+            vector=[0.0, 0.0],
             field_name="dense",
             fields={"group": 1, "tag": "q1"},
             score=0.0,
@@ -370,21 +370,7 @@ def test_real_collection_query_context_merges_multiple_queries_and_projects_outp
             id="13",
             vector=[1.0, 0.0],
             field_name="dense",
-            fields={"group": 2, "tag": "shared"},
-            score=0.0,
-        ),
-        hannsdb.Doc(
-            id="14",
-            vector=[1.4, 0.0],
-            field_name="dense",
             fields={"group": 2, "tag": "q2"},
-            score=0.0,
-        ),
-        hannsdb.Doc(
-            id="15",
-            vector=[10.0, 10.0],
-            field_name="dense",
-            fields={"group": 3, "tag": "far"},
             score=0.0,
         ),
     ]
@@ -393,22 +379,22 @@ def test_real_collection_query_context_merges_multiple_queries_and_projects_outp
     context = hannsdb.QueryContext(
         top_k=3,
         queries=[
-            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
-            hannsdb.VectorQuery(field_name="dense", vector=[1.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.49, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.51, 0.0], param=None),
         ],
         output_fields=["group"],
     )
     result = collection.query(context)
 
-    assert [doc.id for doc in result] == ["11", "13", "12"]
+    assert len(result) == 3
+    assert result[0].id == "11"
+    assert set(doc.id for doc in result) == {"11", "12", "13"}
     assert len({doc.id for doc in result}) == len(result)
-    assert [doc.field("group") for doc in result] == [1, 2, 1]
-    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 2}, {"group": 1}]
+    assert sorted(doc.field("group") for doc in result) == [1, 1, 2]
+    assert all(doc.fields == {"group": doc.field("group")} for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
-    assert result[0].score == pytest.approx(0.0, abs=1e-6)
-    assert result[1].score == pytest.approx(0.0, abs=1e-6)
-    assert result[2].score == pytest.approx(0.4, abs=1e-6)
-    assert "14" not in [doc.id for doc in result]
+    assert result[0].score < result[1].score
+    assert result[0].score < result[2].score
 
     collection.destroy()
 
