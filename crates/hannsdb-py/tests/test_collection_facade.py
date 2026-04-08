@@ -538,6 +538,62 @@ def test_real_collection_query_context_rejects_group_by_with_reranker(tmp_path):
         collection.destroy()
 
 
+def test_real_collection_query_context_rejects_query_by_id_with_reranker(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vector=[0.0, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="2",
+                vector=[0.1, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="3",
+                vector=[0.2, 0.0],
+                field_name="dense",
+                fields={"group": 2},
+                score=0.0,
+            ),
+        ]
+    )
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)
+        ],
+        query_by_id=["1"],
+        reranker=hannsdb.RrfReRanker(topn=2),
+    )
+
+    try:
+        with pytest.raises(NotImplementedError, match="query_by_id"):
+            collection.query(context)
+    finally:
+        collection.destroy()
+
+
 def test_real_collection_query_context_applies_group_by_and_output_fields(
     tmp_path,
 ):
