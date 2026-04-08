@@ -1244,6 +1244,7 @@ fn collection_api_rejects_invalid_schema_primary_vector_index_config() {
                 metric: Some("bogus".to_string()),
                 m: 16,
                 ef_construction: 64,
+                quantize_type: None,
             }),
         ],
     };

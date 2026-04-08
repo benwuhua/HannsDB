@@ -16,11 +16,10 @@ fn stored_schema_value() -> Value {
         ],
         vectors: vec![
             VectorFieldSchema::new("title", 384),
-            VectorFieldSchema::new("dense", 384).with_index_param(VectorIndexSchema::hnsw(
-                Some("cosine"),
-                32,
-                128,
-            )),
+            VectorFieldSchema::new("dense", 384).with_index_param(
+                VectorIndexSchema::hnsw(Some("cosine"), 32, 128)
+                    .with_quantize_type(Some("fp16")),
+            ),
         ],
     };
     let metadata = CollectionMetadata::new_with_schema("docs", schema);
@@ -72,7 +71,8 @@ fn zvec_parity_schema_round_trips_vector_index_metadata() {
         "kind": "hnsw",
         "metric": "cosine",
         "m": 32,
-        "ef_construction": 128
+        "ef_construction": 128,
+        "quantize_type": "fp16"
     });
 
     assert_eq!(index_param, expected_index_param);

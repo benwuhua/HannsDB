@@ -169,6 +169,22 @@ fn metric_type_name(metric: MetricType) -> &'static str {
     }
 }
 
+fn quantize_type_name(quantize: QuantizeType) -> &'static str {
+    match quantize {
+        QuantizeType::Undefined => "undefined",
+        QuantizeType::Fp16 => "fp16",
+        QuantizeType::Int8 => "int8",
+        QuantizeType::Int4 => "int4",
+    }
+}
+
+fn quantize_type_value(quantize: QuantizeType) -> Option<&'static str> {
+    match quantize {
+        QuantizeType::Undefined => None,
+        _ => Some(quantize_type_name(quantize)),
+    }
+}
+
 fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCollectionSchema> {
     if schema.vectors.is_empty() {
         return Err(std::io::Error::new(
@@ -222,11 +238,14 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             }
 
             let index_param = match vector.index_param.as_ref() {
-                Some(IndexParam::Hnsw(params)) => Some(CoreVectorIndexSchema::hnsw(
-                    params.metric_type.map(metric_type_name),
-                    params.m,
-                    params.ef_construction,
-                )),
+                Some(IndexParam::Hnsw(params)) => Some(
+                    CoreVectorIndexSchema::hnsw(
+                        params.metric_type.map(metric_type_name),
+                        params.m,
+                        params.ef_construction,
+                    )
+                    .with_quantize_type(quantize_type_value(params.quantize_type)),
+                ),
                 Some(IndexParam::Ivf(params)) => Some(CoreVectorIndexSchema::ivf(
                     params.metric_type.map(metric_type_name),
                     params.nlist,
@@ -448,10 +467,18 @@ fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>)
         Some(IndexParam::Hnsw(params)) => (
             "hnsw",
             metric_json(params.metric_type),
-            format!(
-                r#"{{"m":{},"ef_construction":{}}}"#,
-                params.m, params.ef_construction
-            ),
+            match quantize_type_value(params.quantize_type) {
+                Some(quantize_type) => format!(
+                    r#"{{"m":{},"ef_construction":{},"quantize_type":{}}}"#,
+                    params.m,
+                    params.ef_construction,
+                    json_string(quantize_type)
+                ),
+                None => format!(
+                    r#"{{"m":{},"ef_construction":{}}}"#,
+                    params.m, params.ef_construction
+                ),
+            },
         ),
         Some(IndexParam::Ivf(params)) => (
             "ivf",

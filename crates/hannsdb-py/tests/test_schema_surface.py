@@ -32,6 +32,7 @@ def build_schema():
             metric_type="cosine",
             m=32,
             ef_construction=128,
+            quantize_type=hannsdb.QuantizeType.Fp16,
         ),
     )
     return hannsdb.CollectionSchema(
@@ -299,6 +300,7 @@ def test_open_recovers_legacy_dimension_style_collection_json(tmp_path):
     assert reopened.schema.primary_vector == "dense"
     assert [field.name for field in reopened.schema.fields] == ["session_id"]
     assert reopened.schema.vector("dense").dimension == 384
+    assert reopened.schema.vector("dense").index_param.quantize_type == "undefined"
 
     collection.destroy()
 
@@ -340,7 +342,11 @@ def test_create_and_open_persists_richer_schema(tmp_path):
         "metric": "cosine",
         "m": 32,
         "ef_construction": 128,
+        "quantize_type": "fp16",
     }
+
+    reopened = hannsdb.open(str(tmp_path))
+    assert reopened.schema.vector("dense").index_param.quantize_type == "fp16"
 
     collection.destroy()
 

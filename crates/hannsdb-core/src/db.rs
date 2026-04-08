@@ -1903,6 +1903,7 @@ fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::R
             metric,
             m,
             ef_construction,
+            ..
         }) => VectorIndexDescriptor {
             field_name: primary_vector.name.clone(),
             kind: VectorIndexKind::Hnsw,
@@ -1961,6 +1962,7 @@ fn resolve_primary_vector_descriptor(
             metric,
             m,
             ef_construction,
+            ..
         }) => (
             VectorIndexKind::Hnsw,
             metric.clone(),

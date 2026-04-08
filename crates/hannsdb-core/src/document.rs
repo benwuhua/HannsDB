@@ -54,6 +54,8 @@ pub enum VectorIndexSchema {
         metric: Option<String>,
         m: usize,
         ef_construction: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quantize_type: Option<String>,
     },
     Ivf {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +70,24 @@ impl VectorIndexSchema {
             metric: metric.map(str::to_string),
             m,
             ef_construction,
+            quantize_type: None,
+        }
+    }
+
+    pub fn with_quantize_type(self, quantize_type: Option<&str>) -> Self {
+        match self {
+            Self::Hnsw {
+                metric,
+                m,
+                ef_construction,
+                ..
+            } => Self::Hnsw {
+                metric,
+                m,
+                ef_construction,
+                quantize_type: quantize_type.map(str::to_string),
+            },
+            other => other,
         }
     }
 
@@ -81,6 +101,13 @@ impl VectorIndexSchema {
     pub fn metric(&self) -> Option<&str> {
         match self {
             Self::Hnsw { metric, .. } | Self::Ivf { metric, .. } => metric.as_deref(),
+        }
+    }
+
+    pub fn quantize_type(&self) -> Option<&str> {
+        match self {
+            Self::Hnsw { quantize_type, .. } => quantize_type.as_deref(),
+            Self::Ivf { .. } => None,
         }
     }
 

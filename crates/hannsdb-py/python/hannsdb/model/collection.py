@@ -181,6 +181,7 @@ def _index_param_from_metadata(metadata: dict[str, Any]):
             metric_type=metric,
             m=int(metadata.get("m", 16)),
             ef_construction=int(metadata.get("ef_construction", 128)),
+            quantize_type=metadata.get("quantize_type", "undefined"),
         )
     if kind == "ivf":
         return IVFIndexParam(
