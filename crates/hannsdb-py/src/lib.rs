@@ -1555,6 +1555,13 @@ impl PyCollection {
         Ok(self.inner_ref()?.collection_name.clone())
     }
 
+    #[getter]
+    fn option(&self) -> PyResult<PyCollectionOption> {
+        Ok(PyCollectionOption {
+            inner: self.inner_ref()?.option.clone(),
+        })
+    }
+
     fn insert(&mut self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
         let docs = docs
             .into_iter()

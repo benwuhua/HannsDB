@@ -57,6 +57,14 @@ def _native_value(value):
     return value
 
 
+def _wrap_collection_option(option):
+    if option is None:
+        return CollectionOption()
+    if isinstance(option, CollectionOption):
+        return option
+    return CollectionOption(read_only=option.read_only, enable_mmap=option.enable_mmap)
+
+
 def _coerce_doc_to_native(doc):
     native_getter = getattr(doc, "_get_native", None)
     if native_getter is not None:
@@ -293,6 +301,7 @@ class Collection:
         self._core_lock = threading.RLock()
         self._schema = _coerce_collection_schema(schema) if schema is not None else None
         self._querier = _build_query_executor(self._schema) if self._schema is not None else None
+        self._option = _wrap_collection_option(getattr(core_collection, "option", None))
 
     @classmethod
     def _from_core(
@@ -314,6 +323,7 @@ class Collection:
         schema = _coerce_collection_schema(schema)
         inst._schema = schema
         inst._querier = _build_query_executor(schema)
+        inst._option = _wrap_collection_option(getattr(core_collection, "option", None))
         return inst
 
     @property
@@ -327,6 +337,10 @@ class Collection:
     @property
     def schema(self) -> CollectionSchema:
         return self._schema
+
+    @property
+    def option(self) -> CollectionOption:
+        return self._option
 
     @property
     def stats(self):
