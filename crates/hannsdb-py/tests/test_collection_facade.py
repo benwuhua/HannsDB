@@ -330,6 +330,15 @@ def test_real_collection_single_id_fetch_and_delete_parity(tmp_path):
     collection.destroy()
 
 
+def test_real_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+
+    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
+        collection.delete_by_filter("session_id = 'abc'")
+
+    collection.destroy()
+
+
 def test_collection_stats_exports_are_available_across_facades():
     assert hannsdb.CollectionStats is hannsdb._native.CollectionStats
     assert hannsdb.model.CollectionStats is hannsdb._native.CollectionStats
@@ -2996,6 +3005,28 @@ def test_collection_surface_single_id_helpers_delegate_via_list(monkeypatch):
         ("fetch", ["missing"]),
         ("delete", ["1"]),
     ]
+
+
+def test_collection_delete_by_filter_raises_before_core_delegation(monkeypatch):
+    schema = build_schema()
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def delete_by_filter(self, filter):
+            raise AssertionError("core delete_by_filter should not be called")
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
+        collection.delete_by_filter("session_id = 'abc'")
 
 
 def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monkeypatch):

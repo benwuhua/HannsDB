@@ -1,6 +1,7 @@
 import dataclasses
 
 import hannsdb
+import pytest
 
 
 def test_python_facade_reexports_pure_param_wrappers():
@@ -89,6 +90,30 @@ def test_native_collection_defaults_option_when_omitted(tmp_path):
     assert collection.option.__class__ is hannsdb._native.CollectionOption
     assert collection.option.read_only is False
     assert collection.option.enable_mmap is True
+
+    collection.destroy()
+
+
+def test_native_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        schema._get_native(),
+    )
+
+    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
+        collection.delete_by_filter("session_id = 'abc'")
 
     collection.destroy()
 
