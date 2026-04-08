@@ -433,6 +433,15 @@ class Collection:
     def delete_by_filter(self, filter: str):
         raise NotImplementedError("delete_by_filter is not supported yet")
 
+    def add_column(self, field_name, option=None):
+        raise NotImplementedError("add_column is not supported yet")
+
+    def drop_column(self, field_name):
+        raise NotImplementedError("drop_column is not supported yet")
+
+    def alter_column(self, field_name, option=None):
+        raise NotImplementedError("alter_column is not supported yet")
+
     def optimize(self, option=None):
         if option is None:
             return self._core.optimize()

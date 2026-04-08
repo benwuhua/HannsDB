@@ -1595,6 +1595,31 @@ impl PyCollection {
         ))
     }
 
+    #[pyo3(signature = (field_name, option=None))]
+    fn add_column(&mut self, field_name: String, option: Option<Py<PyAny>>) -> PyResult<()> {
+        let _ = field_name;
+        let _ = option;
+        Err(PyNotImplementedError::new_err(
+            "add_column is not supported yet",
+        ))
+    }
+
+    fn drop_column(&mut self, field_name: String) -> PyResult<()> {
+        let _ = field_name;
+        Err(PyNotImplementedError::new_err(
+            "drop_column is not supported yet",
+        ))
+    }
+
+    #[pyo3(signature = (field_name, option=None))]
+    fn alter_column(&mut self, field_name: String, option: Option<Py<PyAny>>) -> PyResult<()> {
+        let _ = field_name;
+        let _ = option;
+        Err(PyNotImplementedError::new_err(
+            "alter_column is not supported yet",
+        ))
+    }
+
     #[pyo3(signature = (vectors, output_fields=None, topk=100, filter=None))]
     fn query(
         &self,
