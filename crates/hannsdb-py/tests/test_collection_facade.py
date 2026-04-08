@@ -332,6 +332,63 @@ def test_create_and_open_returns_python_facade_and_keeps_schema(tmp_path):
     collection.destroy()
 
 
+def test_create_and_open_accepts_pure_collection_option(monkeypatch, tmp_path):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = str(tmp_path)
+        collection_name = "docs"
+
+    def fake_create_and_open(path, native_schema, option):
+        calls.append((path, native_schema, option))
+        return FakeCore()
+
+    monkeypatch.setattr(hannsdb.model.collection._native_module, "create_and_open", fake_create_and_open)
+
+    collection = hannsdb.create_and_open(
+        str(tmp_path),
+        schema,
+        option=hannsdb.CollectionOption(read_only=True, enable_mmap=False),
+    )
+
+    assert calls[0][0] == str(tmp_path)
+    assert calls[0][1].__class__ is hannsdb._native.CollectionSchema
+    assert calls[0][2].__class__ is hannsdb._native.CollectionOption
+    assert calls[0][2].read_only is True
+    assert calls[0][2].enable_mmap is False
+    assert collection.collection_name == "docs"
+
+
+def test_collection_create_vector_index_accepts_pure_and_native_params(monkeypatch):
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def create_vector_index(self, field_name, index_param=None):
+            calls.append((field_name, index_param))
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=build_schema())
+    pure_param = hannsdb.HnswIndexParam(metric_type="cosine", m=32, ef_construction=128)
+    native_param = hannsdb._native.IVFIndexParam(metric_type="l2", nlist=8)
+
+    collection.create_vector_index("dense", pure_param)
+    collection.create_vector_index("title", native_param)
+
+    assert calls[0][0] == "dense"
+    assert calls[0][1].__class__ is hannsdb._native.HnswIndexParam
+    assert calls[1][0] == "title"
+    assert calls[1][1].__class__ is hannsdb._native.IVFIndexParam
+
+
 def test_open_recovers_schema_from_collection_metadata(tmp_path):
     created = hannsdb.create_and_open(str(tmp_path), build_schema())
     reopened = hannsdb.open(str(tmp_path))

@@ -10,6 +10,10 @@ def test_schema_types_are_pure_python_wrappers():
     assert hannsdb.CollectionSchema.__module__ == "hannsdb.model.schema.collection_schema"
     assert hannsdb.FieldSchema.__module__ == "hannsdb.model.schema.field_schema"
     assert hannsdb.VectorSchema.__module__ == "hannsdb.model.schema.field_schema"
+    assert hannsdb.CollectionOption.__module__ == "hannsdb.model.param.collection_option"
+    assert hannsdb.HnswIndexParam.__module__ == "hannsdb.model.param.index_params"
+    assert hannsdb.IVFIndexParam.__module__ == "hannsdb.model.param.index_params"
+    assert hannsdb.HnswQueryParam.__module__ == "hannsdb.model.param.index_params"
 
 
 def build_schema():
@@ -83,6 +87,30 @@ def test_vector_query_is_a_pure_python_dataclass_and_flattens_numpy_arrays():
 
     assert query.field_name == "dense"
     assert query.vector == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_param_wrappers_bridge_to_native_classes():
+    option = hannsdb.CollectionOption(read_only=True, enable_mmap=False)
+    hnsw = hannsdb.HnswIndexParam(
+        metric_type="cosine",
+        m=32,
+        ef_construction=128,
+        quantize_type="fp16",
+    )
+    ivf = hannsdb.IVFIndexParam(metric_type="l2", nlist=512)
+    query = hannsdb.HnswQueryParam(ef=64, is_using_refiner=True)
+
+    assert option._get_native().__class__ is hannsdb._native.CollectionOption
+    assert hnsw._get_native().__class__ is hannsdb._native.HnswIndexParam
+    assert ivf._get_native().__class__ is hannsdb._native.IVFIndexParam
+    assert query._get_native().__class__ is hannsdb._native.HnswQueryParam
+    assert option._get_native().read_only is True
+    assert option._get_native().enable_mmap is False
+    assert hnsw.m == 32
+    assert hnsw.ef_construction == 128
+    assert ivf.nlist == 512
+    assert query.ef == 64
+    assert query.is_using_refiner is True
 
 
 @pytest.mark.parametrize("value", [1.23, {1, 2}, frozenset({1, 2})])

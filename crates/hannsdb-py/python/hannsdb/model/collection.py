@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from .. import _native as _native_module
-from .._native import CollectionOption, HnswIndexParam, IVFIndexParam
 from ..model.doc import Doc
+from ..model.param import CollectionOption, HnswIndexParam, IVFIndexParam
 from ..model.schema.collection_schema import CollectionSchema, _coerce_collection_schema
 from ..model.schema.field_schema import FieldSchema, VectorSchema
 
@@ -24,6 +24,13 @@ def _schema_to_native(schema):
     if native_getter is not None:
         return native_getter()
     return schema
+
+
+def _native_value(value):
+    native_getter = getattr(value, "_get_native", None)
+    if native_getter is not None:
+        return native_getter()
+    return value
 
 
 def _coerce_doc_to_native(doc):
@@ -344,7 +351,7 @@ class Collection:
         return self._core.destroy()
 
     def create_vector_index(self, field_name, index_param=None):
-        return self._core.create_vector_index(field_name, index_param)
+        return self._core.create_vector_index(field_name, _native_value(index_param))
 
     def drop_vector_index(self, field_name):
         return self._core.drop_vector_index(field_name)
@@ -366,10 +373,14 @@ class Collection:
 
 
 def create_and_open(path, schema, option: CollectionOption | None = None):
-    core_collection = _native_module.create_and_open(path, _schema_to_native(schema), option)
+    core_collection = _native_module.create_and_open(
+        path,
+        _schema_to_native(schema),
+        _native_value(option),
+    )
     return Collection._from_core(core_collection, schema=schema)
 
 
 def open(path, option: CollectionOption | None = None):
-    core_collection = _native_module.open(path, option)
+    core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)

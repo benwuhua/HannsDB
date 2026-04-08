@@ -115,11 +115,15 @@ class VectorSchema:
         return self._index_param
 
     def _get_native(self):
+        index_param = self.index_param
+        native_getter = getattr(index_param, "_get_native", None)
+        if native_getter is not None:
+            index_param = native_getter()
         return _native_module.VectorSchema(
             self.name,
             self.data_type,
             self.dimension,
-            self.index_param,
+            index_param,
         )
 
     def _as_tuple(self):
