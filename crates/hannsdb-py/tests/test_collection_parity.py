@@ -41,6 +41,58 @@ def test_python_facade_reexports_core_schema_and_executor_types():
     assert factory.build().schema is schema
 
 
+def test_native_collection_exposes_option_property(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    option = hannsdb._native.CollectionOption(True, False)
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        schema._get_native(),
+        option,
+    )
+
+    assert collection.option.__class__ is hannsdb._native.CollectionOption
+    assert collection.option.read_only is True
+    assert collection.option.enable_mmap is False
+
+    collection.destroy()
+
+
+def test_native_collection_defaults_option_when_omitted(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        schema._get_native(),
+    )
+
+    assert collection.option.__class__ is hannsdb._native.CollectionOption
+    assert collection.option.read_only is False
+    assert collection.option.enable_mmap is True
+
+    collection.destroy()
+
+
 def test_python_facade_exports_weighted_reranker_from_extension_and_top_level():
     assert hannsdb.extension.WeightedReRanker is hannsdb.WeightedReRanker
     from hannsdb.extension import WeightedReRanker as ExtensionWeightedReRanker

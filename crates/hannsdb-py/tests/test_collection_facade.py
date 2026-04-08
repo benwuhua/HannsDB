@@ -2521,8 +2521,55 @@ def test_create_and_open_returns_python_facade_and_keeps_schema(tmp_path):
     assert collection.collection_name == "docs"
     assert collection.path == str(tmp_path)
     assert [vector.name for vector in collection.schema.vectors] == ["title", "dense"]
+    assert collection.option == hannsdb.CollectionOption()
+    assert collection.option.__class__ is hannsdb.CollectionOption
 
     collection.destroy()
+
+
+def test_create_and_open_round_trips_collection_option_on_python_facade(tmp_path):
+    schema = build_schema()
+    option = hannsdb.CollectionOption(read_only=True, enable_mmap=False)
+
+    collection = hannsdb.create_and_open(str(tmp_path), schema, option=option)
+
+    assert collection.option == option
+    assert collection.option.__class__ is hannsdb.CollectionOption
+
+    collection.destroy()
+
+
+def test_open_round_trips_collection_option_on_python_facade(tmp_path):
+    schema = build_schema()
+    option = hannsdb.CollectionOption(read_only=True, enable_mmap=False)
+
+    created = hannsdb.create_and_open(str(tmp_path), schema, option=option)
+    reopened = hannsdb.open(str(tmp_path), option=option)
+
+    assert reopened.option == option
+    assert reopened.option.__class__ is hannsdb.CollectionOption
+
+    reopened.destroy()
+
+
+def test_collection_from_core_wraps_native_option_as_python_wrapper(monkeypatch):
+    schema = build_schema()
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+        option = hannsdb._native.CollectionOption(True, False)
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    assert collection.option == hannsdb.CollectionOption(read_only=True, enable_mmap=False)
+    assert collection.option.__class__ is hannsdb.CollectionOption
 
 
 def test_create_and_open_accepts_pure_collection_option(monkeypatch, tmp_path):
