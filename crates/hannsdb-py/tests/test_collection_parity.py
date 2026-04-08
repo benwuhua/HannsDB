@@ -41,6 +41,13 @@ def test_python_facade_reexports_core_schema_and_executor_types():
     assert factory.build().schema is schema
 
 
+def test_python_facade_exports_weighted_reranker_from_extension_and_top_level():
+    assert hannsdb.extension.WeightedReRanker is hannsdb.WeightedReRanker
+    from hannsdb.extension import WeightedReRanker as ExtensionWeightedReRanker
+
+    assert ExtensionWeightedReRanker is hannsdb.WeightedReRanker
+
+
 def test_star_import_exposes_native_and_facade_symbols():
     namespace = {}
     exec("from hannsdb import *", namespace)

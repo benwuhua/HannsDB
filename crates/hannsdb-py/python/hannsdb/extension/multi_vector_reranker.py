@@ -87,7 +87,7 @@ class WeightedReRanker(ReRanker):
         if self.metric == MetricType.L2:
             return 1.0 - 2.0 * math.atan(score) / math.pi
         if self.metric == MetricType.Ip:
-            return 0.5 + math.atan(score) / math.pi
+            return 0.5 - math.atan(score) / math.pi
         if self.metric == MetricType.Cosine:
             return 1.0 - score / 2.0
         raise ValueError("unsupported metric")

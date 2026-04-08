@@ -287,6 +287,28 @@ def test_weighted_reranker_combines_normalized_scores_by_field_weight():
     assert hits[2].score == pytest.approx(normalize_l2(0.1))
 
 
+def test_weighted_reranker_orders_ip_scores_with_distance_convention():
+    reranker = hannsdb.WeightedReRanker(metric=hannsdb.MetricType.Ip)
+
+    query_results = {
+        "dense": [
+            hannsdb.Doc(id="good", score=-10.0),
+            hannsdb.Doc(id="bad", score=0.0),
+        ]
+    }
+
+    hits = reranker.rerank(query_results)
+
+    assert [hit.id for hit in hits] == ["good", "bad"]
+    assert hits[0].score > hits[1].score
+
+
+def test_weighted_reranker_accepts_string_metric_name():
+    reranker = hannsdb.WeightedReRanker(metric="cosine")
+
+    assert reranker.metric is hannsdb.MetricType.Cosine
+
+
 def test_query_executor_factory_exposes_create_method():
     schema = hannsdb.CollectionSchema(
         name="docs",
