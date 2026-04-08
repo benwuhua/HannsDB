@@ -7,12 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+    VectorIndexSchema,
 };
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
 };
 use hannsdb_core::segment::{
-    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+    append_payloads, append_record_ids, append_records, append_vectors, SegmentMetadata,
+    SegmentSet, TombstoneMask,
 };
 use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 
@@ -70,6 +72,76 @@ fn rewrite_collection_to_two_segment_layout(
     assert_eq!(inserted, second_segment_documents.len());
     let _ = append_record_ids(&seg2_dir.join("ids.bin"), &ids).expect("append ids");
     let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &payloads).expect("append payloads");
+
+    let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    for row_idx in deleted_second_segment_rows {
+        let marked = seg2_tombstone.mark_deleted(*row_idx);
+        assert!(marked, "row index must be valid in seg-0002 tombstone");
+    }
+    seg2_tombstone
+        .save_to_path(&seg2_dir.join("tombstones.json"))
+        .expect("save seg-0002 tombstones");
+
+    SegmentMetadata::new(
+        "seg-0002",
+        dimension,
+        second_segment_documents.len(),
+        seg2_tombstone.deleted_count(),
+    )
+    .save_to_path(&seg2_dir.join("segment.json"))
+    .expect("save seg-0002 metadata");
+
+    SegmentSet {
+        active_segment_id: "seg-0002".to_string(),
+        immutable_segment_ids: vec!["seg-0001".to_string()],
+    }
+    .save_to_path(&collection_dir.join("segment_set.json"))
+    .expect("save segment set");
+}
+
+fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
+    root: &std::path::Path,
+    collection: &str,
+    dimension: usize,
+    second_segment_documents: &[Document],
+    deleted_second_segment_rows: &[usize],
+) {
+    let collection_dir = root.join("collections").join(collection);
+    let segments_dir = collection_dir.join("segments");
+    let seg1_dir = segments_dir.join("seg-0001");
+    let seg2_dir = segments_dir.join("seg-0002");
+    fs::create_dir_all(&seg1_dir).expect("create seg-0001 dir");
+    fs::create_dir_all(&seg2_dir).expect("create seg-0002 dir");
+
+    for file in [
+        "segment.json",
+        "records.bin",
+        "ids.bin",
+        "payloads.jsonl",
+        "vectors.jsonl",
+        "tombstones.json",
+    ] {
+        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+    }
+
+    let mut ids = Vec::with_capacity(second_segment_documents.len());
+    let mut vectors = Vec::with_capacity(second_segment_documents.len() * dimension);
+    let mut payloads = Vec::with_capacity(second_segment_documents.len());
+    let mut vector_sidecars = Vec::with_capacity(second_segment_documents.len());
+    for document in second_segment_documents {
+        ids.push(document.id);
+        vectors.extend_from_slice(&document.vector);
+        payloads.push(document.fields.clone());
+        vector_sidecars.push(document.vectors.clone());
+    }
+
+    let inserted =
+        append_records(&seg2_dir.join("records.bin"), dimension, &vectors).expect("append records");
+    assert_eq!(inserted, second_segment_documents.len());
+    let _ = append_record_ids(&seg2_dir.join("ids.bin"), &ids).expect("append ids");
+    let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &payloads).expect("append payloads");
+    let _ = append_vectors(&seg2_dir.join("vectors.jsonl"), &vector_sidecars)
+        .expect("append vectors");
 
     let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
     for row_idx in deleted_second_segment_rows {
@@ -1383,6 +1455,230 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
         hits[1].distance > hits[0].distance,
         "newer row should shadow the old one even if it is farther away"
     );
+}
+
+#[test]
+fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respects_tombstones_and_missing_vectors(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_shadowing_across_segments");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        3,
+        "l2",
+        vec![ScalarFieldSchema::new("version", FieldType::String)],
+    );
+    schema.vectors.push(
+        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+            Some("l2"),
+            16,
+            128,
+        )),
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("version".to_string(), FieldValue::String("old-1".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("version".to_string(), FieldValue::String("old-2".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.1_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("version".to_string(), FieldValue::String("old-3".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.05_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                4,
+                [("version".to_string(), FieldValue::String("old-4".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.2_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    rewrite_collection_to_two_segment_layout_with_secondary_vectors(
+        &root,
+        "docs",
+        3,
+        &[
+            Document::with_vectors(
+                1,
+                [("version".to_string(), FieldValue::String("new-1".to_string()))],
+                vec![1.0_f32, 1.0, 1.0],
+                [("title".to_string(), vec![10.0_f32, 10.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("version".to_string(), FieldValue::String("new-2".to_string()))],
+                vec![1.0_f32, 1.0, 1.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::new(
+                3,
+                [("version".to_string(), FieldValue::String("new-3".to_string()))],
+                vec![1.0_f32, 1.0, 1.0],
+            ),
+            Document::with_vectors(
+                5,
+                [("version".to_string(), FieldValue::String("new-5".to_string()))],
+                vec![1.0_f32, 1.0, 1.0],
+                [("title".to_string(), vec![0.3_f32, 0.0])],
+            ),
+        ],
+        &[1],
+    );
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 4,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("secondary typed fast path across segments");
+
+    let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec![4, 5, 1]);
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![4, 5, 1]
+    );
+    assert!(hits.iter().all(|hit| hit.id != 2));
+    assert!(hits.iter().all(|hit| hit.id != 3));
+    let hit1 = hits.iter().find(|hit| hit.id == 1).expect("id 1 result");
+    assert!(
+        hit1.distance > 1.0,
+        "newer live row should shadow the older zero-distance secondary vector"
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_dropping_secondary_index(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_cache_invalidation");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        3,
+        "l2",
+        vec![ScalarFieldSchema::new("version", FieldType::String)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "title".to_string(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some("l2".to_string()),
+            params: serde_json::json!({
+                "m": 16,
+                "ef_construction": 128,
+            }),
+        },
+    )
+    .expect("register descriptor-backed secondary vector index");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("version".to_string(), FieldValue::String("first".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.9_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("version".to_string(), FieldValue::String("second".to_string()))],
+                vec![9.0_f32, 9.0, 9.0],
+                [("title".to_string(), vec![0.1_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let warm_hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("warm secondary cache");
+    assert_eq!(
+        warm_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+
+    db.drop_vector_index("docs", "title")
+        .expect("drop secondary vector index");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("dropping the index should invalidate the cached secondary fast path");
+
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(err.to_string().contains("ef_search"));
 }
 
 #[test]
