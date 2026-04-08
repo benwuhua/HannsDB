@@ -373,12 +373,12 @@ class Collection:
             return _wrap_doc_result(self._core.query_context(context))
 
     def insert(self, docs):
-        docs = list(docs)
+        docs = _coerce_docs_input(docs)
         with self._core_lock:
             return self._core.insert(_coerce_docs_to_native(docs))
 
     def upsert(self, docs):
-        docs = list(docs)
+        docs = _coerce_docs_input(docs)
         with self._core_lock:
             return self._core.upsert(_coerce_docs_to_native(docs))
 
