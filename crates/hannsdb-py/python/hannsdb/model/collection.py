@@ -115,6 +115,7 @@ def _build_query_context(
     include_vector: bool = False,
     reranker=None,
     query_by_id=None,
+    query_by_id_field_name=None,
     group_by=None,
 ):
     from ..model.param.vector_query import QueryContext
@@ -133,6 +134,7 @@ def _build_query_context(
         include_vector=include_vector,
         queries=query_list,
         query_by_id=query_by_id,
+        query_by_id_field_name=query_by_id_field_name,
         group_by=group_by,
         reranker=reranker,
     )
@@ -302,6 +304,7 @@ class Collection:
         include_vector: bool = False,
         reranker=None,
         query_by_id=None,
+        query_by_id_field_name=None,
         group_by=None,
         query_context=None,
         context=None,
@@ -323,6 +326,7 @@ class Collection:
                 include_vector=include_vector,
                 reranker=reranker,
                 query_by_id=query_by_id,
+                query_by_id_field_name=query_by_id_field_name,
                 group_by=group_by,
             )
         return _wrap_doc_result(self._querier.execute(self, query_context))

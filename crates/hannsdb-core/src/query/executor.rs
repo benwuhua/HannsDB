@@ -31,7 +31,9 @@ impl QueryExecutor {
             super::planner::RecallSourceKind::ExplicitVector { field_name } => {
                 field_name != &collection.primary_vector
             }
-            super::planner::RecallSourceKind::QueryById { .. } => false,
+            super::planner::RecallSourceKind::QueryById { field_name, .. } => {
+                field_name != &collection.primary_vector
+            }
         });
         for segment in segment_manager.segment_paths()? {
             let records = load_records_or_empty(&segment.records, collection.dimension)?;
@@ -123,14 +125,16 @@ fn best_distance(
     let mut best = None;
     for source in &plan.recall_sources {
         let candidate_vector = match &source.kind {
-            super::planner::RecallSourceKind::QueryById { .. } => Some(primary_vector),
-            super::planner::RecallSourceKind::ExplicitVector { field_name }
-                if field_name == primary_vector_name =>
-            {
-                Some(primary_vector)
+            super::planner::RecallSourceKind::QueryById { field_name, .. }
+            | super::planner::RecallSourceKind::ExplicitVector { field_name } => {
+                candidate_vector_for_field(
+                    field_name,
+                    primary_vector,
+                    secondary_vectors,
+                    row_idx,
+                    primary_vector_name,
+                )
             }
-            super::planner::RecallSourceKind::ExplicitVector { field_name } => secondary_vectors
-                .and_then(|vectors| vectors[row_idx].get(field_name).map(Vec::as_slice)),
         };
         let Some(candidate_vector) = candidate_vector else {
             continue;
@@ -143,6 +147,20 @@ fn best_distance(
     }
 
     Ok(best)
+}
+
+fn candidate_vector_for_field<'a>(
+    field_name: &str,
+    primary_vector: &'a [f32],
+    secondary_vectors: Option<&'a [BTreeMap<String, Vec<f32>>]>,
+    row_idx: usize,
+    primary_vector_name: &str,
+) -> Option<&'a [f32]> {
+    if field_name == primary_vector_name {
+        Some(primary_vector)
+    } else {
+        secondary_vectors.and_then(|vectors| vectors[row_idx].get(field_name).map(Vec::as_slice))
+    }
 }
 
 fn insert_best_hit(best_hits: &mut HashMap<i64, DocumentHit>, candidate: DocumentHit) {

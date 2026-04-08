@@ -508,6 +508,187 @@ def test_real_collection_query_context_routes_query_by_id_and_output_fields(
     collection.destroy()
 
 
+def test_real_collection_query_context_routes_query_by_id_field_name_to_secondary_vector(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="title",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vectors={"dense": [9.0, 9.0], "title": [0.0, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vectors={"dense": [0.0, 0.0], "title": [0.2, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vectors={"dense": [1.0, 0.0], "title": [1.0, 0.0]},
+            field_name="dense",
+            fields={"group": 2},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)],
+        query_by_id=["11"],
+        query_by_id_field_name="title",
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["11", "12", "13"]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert result[0].score == pytest.approx(0.0, abs=1e-6)
+
+    collection.destroy()
+
+
+def test_real_collection_query_context_defaults_query_by_id_to_primary_vector(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="title",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vectors={"dense": [5.0, 5.0], "title": [0.0, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vectors={"dense": [0.0, 0.0], "title": [0.2, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vectors={"dense": [1.0, 1.0], "title": [1.0, 0.0]},
+            field_name="dense",
+            fields={"group": 2},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        query_by_id=["11"],
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["11", "13", "12"]
+    assert [doc.field("group") for doc in result] == [1, 2, 1]
+    assert result[0].score == pytest.approx(0.0, abs=1e-6)
+
+    collection.destroy()
+
+
+def test_real_collection_query_accepts_query_by_id_field_name_legacy_kwargs(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="title",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vectors={"dense": [9.0, 9.0], "title": [0.0, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vectors={"dense": [0.0, 0.0], "title": [0.2, 0.0]},
+            field_name="dense",
+            fields={"group": 1},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vectors={"dense": [1.0, 0.0], "title": [1.0, 0.0]},
+            field_name="dense",
+            fields={"group": 2},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    result = collection.query(
+        vectors=hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        query_by_id=["11"],
+        query_by_id_field_name="title",
+        topk=3,
+    )
+
+    assert [doc.id for doc in result] == ["11", "12", "13"]
+    assert [doc.field("group") for doc in result] == [1, 1, 2]
+
+    collection.destroy()
+
+
 def test_real_collection_query_accepts_legacy_kwargs_with_query_by_id_and_output_fields(
     tmp_path,
 ):

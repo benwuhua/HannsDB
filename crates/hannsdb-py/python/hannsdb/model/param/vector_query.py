@@ -54,6 +54,7 @@ class QueryContext:
     include_vector: bool = False
     queries: list[VectorQuery] = field(default_factory=list)
     query_by_id: Optional[list[int | str] | int | str] = None
+    query_by_id_field_name: Optional[str] = None
     group_by: Optional[QueryGroupBy] = None
     reranker: Optional[ReRanker] = None
 

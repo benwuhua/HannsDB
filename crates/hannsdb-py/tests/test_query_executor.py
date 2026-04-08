@@ -226,6 +226,16 @@ def test_query_context_normalizes_scalar_output_fields_and_query_by_id():
     assert context.query_by_id == [2]
 
 
+def test_query_context_accepts_query_by_id_field_name():
+    context = hannsdb.QueryContext(
+        query_by_id=["2"],
+        query_by_id_field_name="title",
+    )
+
+    assert context.query_by_id == ["2"]
+    assert context.query_by_id_field_name == "title"
+
+
 def test_reranker_constructors_validate_arguments():
     with pytest.raises(ValueError, match="topn"):
         hannsdb.RrfReRanker(topn=-1)
@@ -274,6 +284,27 @@ def test_query_executor_supports_multi_query_and_query_by_id(tmp_path):
 
     assert {hit.id for hit in hits} == {"1", "2", "3"}
     assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+
+
+def test_query_executor_supports_secondary_query_by_id_field_name(tmp_path):
+    collection, schema = build_secondary_vector_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        ],
+        query_by_id=["1"],
+        query_by_id_field_name="title",
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["1", "2", "3"]
+    assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+    assert hits[0].score == pytest.approx(0.0, abs=1e-6)
 
 
 def test_query_executor_supports_secondary_vector_field_in_query_context(tmp_path):

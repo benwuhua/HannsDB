@@ -346,6 +346,9 @@ fn py_query_context_to_core(
 
     let query_by_id_attr = context.getattr("query_by_id")?;
     let query_by_id = parse_query_ids(py, &query_by_id_attr)?;
+    let query_by_id_field_name = context
+        .getattr("query_by_id_field_name")?
+        .extract::<Option<String>>()?;
     let filter = context.getattr("filter")?.extract::<Option<String>>()?;
     let output_fields = context
         .getattr("output_fields")?
@@ -371,6 +374,7 @@ fn py_query_context_to_core(
         top_k,
         queries: core_queries,
         query_by_id,
+        query_by_id_field_name,
         filter,
         output_fields,
         include_vector,

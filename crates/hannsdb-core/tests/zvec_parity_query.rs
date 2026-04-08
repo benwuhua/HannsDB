@@ -133,6 +133,7 @@ fn main() {
         top_k: 8,
         queries: vec![query],
         query_by_id: Some(vec![11, 22]),
+        query_by_id_field_name: Some("secondary".to_string()),
         filter: Some("group == 1".to_string()),
         output_fields: Some(vec!["group".to_string()]),
         include_vector: false,
@@ -214,6 +215,7 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
                     param: None,
                 }],
                 query_by_id: Some(vec![2]),
+                query_by_id_field_name: None,
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
@@ -289,6 +291,7 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -364,6 +367,7 @@ fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources(
                     },
                 ],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -438,6 +442,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
                     }),
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -508,6 +513,7 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -571,6 +577,7 @@ fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -637,6 +644,7 @@ fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -676,6 +684,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -702,6 +711,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -738,6 +748,7 @@ fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
                 top_k: 3,
                 queries: Vec::new(),
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
@@ -771,6 +782,7 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -841,6 +853,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -920,6 +933,7 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -987,6 +1001,7 @@ fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombsto
                 top_k: 1,
                 queries: Vec::new(),
                 query_by_id: Some(vec![7]),
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -1034,6 +1049,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
                     }),
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -1081,6 +1097,7 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
                     }),
                 }],
                 query_by_id: Some(vec![7]),
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: false,
@@ -1192,6 +1209,7 @@ fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_
                 top_k: 2,
                 queries: Vec::new(),
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
@@ -1276,6 +1294,7 @@ fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_querie
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
@@ -1377,6 +1396,7 @@ fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: Some(vec!["color".to_string()]),
                 include_vector: false,
@@ -1443,6 +1463,7 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: Some(vec!["group".to_string()]),
                 include_vector: true,
@@ -1502,6 +1523,7 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
                 top_k: 1,
                 queries: Vec::new(),
                 query_by_id: Some(vec![7]),
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: Some(vec!["group".to_string()]),
                 include_vector: true,
@@ -1521,6 +1543,205 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
     );
     assert_eq!(hits[0].vectors.get("dense"), Some(&vec![0.0_f32, 0.0]));
     assert_eq!(hits[0].vectors.get("sparse"), Some(&vec![7.0_f32, 7.0]));
+}
+
+#[test]
+fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_name_is_unset() {
+    let root = unique_temp_dir("hannsdb_typed_query_query_by_id_primary_default");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("sparse", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                7,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("sparse".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                8,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("sparse".to_string(), vec![0.2_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                9,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0],
+                [("sparse".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: Vec::new(),
+                query_by_id: Some(vec![7]),
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: Some(vec!["group".to_string()]),
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("query should default query_by_id to primary vector recall");
+
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![7, 9, 8]);
+    assert_eq!(hits[0].distance, 0.0);
+    assert_eq!(hits[0].fields.get("group"), Some(&FieldValue::Int64(1)));
+}
+
+#[test]
+fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configured() {
+    let root = unique_temp_dir("hannsdb_typed_query_query_by_id_secondary_recall");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("sparse", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                7,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![9.0_f32, 9.0],
+                [("sparse".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                8,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.1_f32, 0.0],
+                [("sparse".to_string(), vec![0.2_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: Some(vec![7]),
+                query_by_id_field_name: Some("sparse".to_string()),
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("query should recall from secondary vector");
+
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![7, 8]);
+    assert_eq!(hits[0].distance, 0.0);
+    assert!(hits[1].distance > hits[0].distance);
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_invalid_query_by_id_field_name() {
+    let root = unique_temp_dir("hannsdb_typed_query_query_by_id_invalid_field");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new("dense", 2, "l2", vec![]);
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: Some(vec![1]),
+                query_by_id_field_name: Some("missing".to_string()),
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("invalid query_by_id field should error");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("missing"));
+}
+
+#[test]
+fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing() {
+    let root = unique_temp_dir("hannsdb_typed_query_query_by_id_missing_secondary");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("sparse", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            7,
+            [("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        )],
+    )
+    .expect("insert document");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: Some(vec![7]),
+                query_by_id_field_name: Some("sparse".to_string()),
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("missing secondary vector should error");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("sparse"));
 }
 
 #[test]
@@ -1581,6 +1802,7 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
                     param: None,
                 }],
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: None,
                 output_fields: None,
                 include_vector: true,
@@ -1639,6 +1861,7 @@ fn zvec_parity_filter_only_query_projects_output_fields() {
                 top_k: 2,
                 queries: Vec::new(),
                 query_by_id: None,
+                query_by_id_field_name: None,
                 filter: Some("group == 1".to_string()),
                 output_fields: Some(vec!["color".to_string()]),
                 include_vector: false,
