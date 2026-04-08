@@ -1023,6 +1023,7 @@ impl CollectionHandle {
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
                 let mut hits = self.query_documents_with_ef_internal(
+                    Some(&collection_meta),
                     &plan.vector,
                     plan.top_k,
                     plan.filter.as_deref(),
@@ -1036,7 +1037,7 @@ impl CollectionHandle {
                 let mut hits =
                     QueryExecutor::execute(&self.segment_manager, &collection_meta, &plan)?;
                 if context.include_vector {
-                    self.materialize_document_hit_vectors(&mut hits)?;
+                    self.materialize_document_hit_vectors(&collection_meta, &mut hits)?;
                 }
                 project_document_hits(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
@@ -1150,30 +1151,33 @@ impl CollectionHandle {
         filter: Option<&str>,
         ef_search: usize,
     ) -> io::Result<Vec<DocumentHit>> {
-        self.query_documents_with_ef_internal(query, top_k, filter, ef_search, false)
+        self.query_documents_with_ef_internal(None, query, top_k, filter, ef_search, false)
     }
 
     fn query_documents_with_ef_internal(
         &self,
+        collection_meta: Option<&CollectionMetadata>,
         query: &[f32],
         top_k: usize,
         filter: Option<&str>,
         ef_search: usize,
         include_vector: bool,
     ) -> io::Result<Vec<DocumentHit>> {
-        let collection_meta = if include_vector {
-            Some(CollectionMetadata::load_from_path(
-                &self.collection_paths().collection_meta,
-            )?)
-        } else {
-            None
-        };
-
         match filter.map(str::trim) {
             None | Some("") => {
                 let hits = self.search_with_ef(query, top_k, ef_search)?;
                 let documents =
                     self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
+                if include_vector && documents.len() != hits.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "failed to resolve {} typed query hit(s) for vector materialization, got {}",
+                            hits.len(),
+                            documents.len()
+                        ),
+                    ));
+                }
                 Ok(hits
                     .into_iter()
                     .zip(documents)
@@ -1181,7 +1185,6 @@ impl CollectionHandle {
                         let vectors = if include_vector {
                             document.vectors_with_primary(
                                 collection_meta
-                                    .as_ref()
                                     .expect("collection metadata must exist when include_vector")
                                     .primary_vector
                                     .as_str(),
@@ -1201,7 +1204,9 @@ impl CollectionHandle {
             Some(filter) => {
                 let mut hits = self.query_documents_with_filter(query, top_k, filter)?;
                 if include_vector {
-                    self.materialize_document_hit_vectors(&mut hits)?;
+                    let collection_meta = collection_meta
+                        .expect("collection metadata must exist when include_vector");
+                    self.materialize_document_hit_vectors(collection_meta, &mut hits)?;
                 }
                 Ok(hits)
             }
@@ -1257,16 +1262,13 @@ impl CollectionHandle {
 
     fn materialize_document_hit_vectors(
         &self,
+        collection_meta: &CollectionMetadata,
         hits: &mut [DocumentHit],
     ) -> io::Result<()> {
         if hits.is_empty() {
             return Ok(());
         }
 
-        let primary_vector_name = CollectionMetadata::load_from_path(
-            &self.collection_paths().collection_meta,
-        )?
-        .primary_vector;
         let documents = self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
         if documents.len() != hits.len() {
             return Err(io::Error::new(
@@ -1276,7 +1278,7 @@ impl CollectionHandle {
         }
 
         for (hit, document) in hits.iter_mut().zip(documents) {
-            hit.vectors = document.vectors_with_primary(primary_vector_name.as_str());
+            hit.vectors = document.vectors_with_primary(collection_meta.primary_vector.as_str());
         }
         Ok(())
     }

@@ -1324,6 +1324,72 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
 }
 
 #[test]
+fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_from_disk() {
+    let root = unique_temp_dir("hannsdb_typed_query_include_vector_fetch_mismatch");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            7,
+            [("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        )],
+    )
+    .expect("insert document");
+
+    let warm_hits = db.search("docs", &[0.0_f32, 0.0], 1).expect("warm search cache");
+    assert_eq!(warm_hits.len(), 1);
+    assert_eq!(warm_hits[0].id, 7);
+
+    let tombstones_path = root.join("collections").join("docs").join("tombstones.json");
+    let mut tombstones =
+        TombstoneMask::load_from_path(&tombstones_path).expect("load tombstones from disk");
+    assert!(tombstones.mark_deleted(0));
+    tombstones
+        .save_to_path(&tombstones_path)
+        .expect("persist tombstones");
+
+    let segment_meta_path = root.join("collections").join("docs").join("segment.json");
+    let mut segment_meta =
+        SegmentMetadata::load_from_path(&segment_meta_path).expect("load segment metadata");
+    segment_meta.deleted_count = tombstones.deleted_count();
+    segment_meta
+        .save_to_path(&segment_meta_path)
+        .expect("persist segment metadata");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 1,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: None,
+                output_fields: None,
+                include_vector: true,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("include_vector should error when fetch cannot materialize a cached hit");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(err.to_string().contains("failed to resolve"));
+}
+
+#[test]
 fn zvec_parity_filter_only_query_projects_output_fields() {
     let root = unique_temp_dir("hannsdb_typed_query_filter_only_output_fields");
     let mut db = HannsDb::open(&root).expect("open db");
