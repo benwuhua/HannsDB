@@ -120,7 +120,7 @@ Source: [`logs/vectordb_bench.log`](/Users/ryan/Code/HannsDB/logs/vectordb_bench
   - the search-side brute-force bottleneck has been removed from the critical path for this case
   - the new benchmark blocker is knowhere-backed HNSW build cost during optimize on the `50K / 1536 / cosine` dataset
 
-## 2026-04-08 parity smoke entrypoint and current gate coverage
+## 9a) 2026-04-08 parity smoke entrypoint and current gate coverage
 
 - New smoke entrypoint:
   - `scripts/run_zvec_parity_smoke.sh`
