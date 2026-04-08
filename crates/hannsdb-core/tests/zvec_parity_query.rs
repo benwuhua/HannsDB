@@ -1579,7 +1579,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
 }
 
 #[test]
-fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_dropping_secondary_index(
+fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_secondary_insert(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_cache_invalidation");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1651,14 +1651,22 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_droppin
         vec![2, 1]
     );
 
-    db.drop_vector_index("docs", "title")
-        .expect("drop secondary vector index");
+    db.insert_documents(
+        "docs",
+        &[Document::with_vectors(
+            3,
+            [("version".to_string(), FieldValue::String("fresh".to_string()))],
+            vec![9.0_f32, 9.0, 9.0],
+            [("title".to_string(), vec![0.0_f32, 0.0])],
+        )],
+    )
+    .expect("insert closer document");
 
-    let err = db
+    let hits = db
         .query_with_context(
             "docs",
             &QueryContext {
-                top_k: 2,
+                top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
                     vector: vec![0.0_f32, 0.0],
@@ -1675,10 +1683,14 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_droppin
                 reranker: None,
             },
         )
-        .expect_err("dropping the index should invalidate the cached secondary fast path");
+        .expect("second secondary fast-path query should reflect inserted document");
 
-    assert_eq!(err.kind(), ErrorKind::Unsupported);
-    assert!(err.to_string().contains("ef_search"));
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![3, 2, 1]
+    );
+    assert_eq!(hits[0].distance, 0.0);
+    assert_eq!(hits[0].fields.get("version"), Some(&FieldValue::String("fresh".to_string())));
 }
 
 #[test]
