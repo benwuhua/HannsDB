@@ -77,6 +77,12 @@ def _coerce_docs_input(docs):
     return list(docs)
 
 
+def _coerce_id_input(ids):
+    if isinstance(ids, str):
+        return True, [ids]
+    return False, ids
+
+
 def _wrap_doc_result(result):
     if isinstance(result, (list, tuple)):
         return [_wrap_doc(item) for item in result]
@@ -399,10 +405,15 @@ class Collection:
             )
 
     def fetch(self, ids):
+        single_id, ids = _coerce_id_input(ids)
         with self._core_lock:
-            return _wrap_doc_result(self._core.fetch(ids))
+            result = _wrap_doc_result(self._core.fetch(ids))
+        if single_id:
+            return result[0] if result else None
+        return result
 
     def delete(self, ids):
+        _, ids = _coerce_id_input(ids)
         return self._core.delete(ids)
 
     def optimize(self, option=None):
