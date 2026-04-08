@@ -126,9 +126,6 @@ class VectorSchema:
             index_param,
         )
 
-    def _as_tuple(self):
-        return self.name, self.data_type, self.dimension, repr(self.index_param)
-
     def __repr__(self) -> str:
         return (
             "VectorSchema("

@@ -16,6 +16,10 @@ def _coerce_collection_schema(value) -> "CollectionSchema":
         return value
     fields = [_coerce_field_schema(field) for field in getattr(value, "fields", [])]
     vectors = [_coerce_vector_schema(vector) for vector in getattr(value, "vectors", [])]
+    if not vectors:
+        vector_schema = getattr(value, "vector_schema", None)
+        if vector_schema is not None:
+            vectors = [_coerce_vector_schema(vector_schema)]
     primary_vector = getattr(value, "primary_vector", None)
     if primary_vector is None and vectors:
         primary_vector = vectors[0].name

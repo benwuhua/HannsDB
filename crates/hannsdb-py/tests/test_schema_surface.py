@@ -1,5 +1,6 @@
 import json
 import dataclasses
+from types import SimpleNamespace
 from pathlib import Path
 
 import hannsdb
@@ -265,6 +266,25 @@ def test_create_and_open_accepts_legacy_native_schema_input(tmp_path):
     assert collection.schema.vector("dense").dimension == 384
 
     collection.destroy()
+
+
+def test_collection_schema_coercion_accepts_legacy_vector_schema_only_shape():
+    legacy = SimpleNamespace(
+        name="docs",
+        primary_vector=None,
+        vector_schema=hannsdb.VectorSchema(
+            name="dense",
+            data_type="vector_fp32",
+            dimension=384,
+        ),
+        fields=[],
+    )
+
+    schema = hannsdb.model.schema.collection_schema._coerce_collection_schema(legacy)
+
+    assert schema.name == "docs"
+    assert [vector.name for vector in schema.vectors] == ["dense"]
+    assert schema.primary_vector == "dense"
 
 
 def test_open_recovers_legacy_dimension_style_collection_json(tmp_path):
