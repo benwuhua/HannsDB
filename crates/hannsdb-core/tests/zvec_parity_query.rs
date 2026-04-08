@@ -1745,6 +1745,65 @@ fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing
 }
 
 #[test]
+fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_absent() {
+    let root = unique_temp_dir("hannsdb_typed_query_ignore_query_by_id_field_name");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                2,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.2_f32, 0.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "dense".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: None,
+                }],
+                query_by_id: None,
+                query_by_id_field_name: Some("missing".to_string()),
+                filter: None,
+                output_fields: Some(vec!["group".to_string()]),
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("query_by_id_field_name should be ignored when query_by_id is absent");
+
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.fields.get("group"))
+            .collect::<Vec<_>>(),
+        vec![Some(&FieldValue::Int64(1)), Some(&FieldValue::Int64(2))]
+    );
+}
+
+#[test]
 fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_from_disk() {
     let root = unique_temp_dir("hannsdb_typed_query_include_vector_fetch_mismatch");
     let mut db = HannsDb::open(&root).expect("open db");

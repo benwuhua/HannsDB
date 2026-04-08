@@ -74,32 +74,6 @@ impl QueryPlanner {
             .map(str::trim)
             .filter(|filter| !filter.is_empty())
             .map(str::to_owned);
-        let query_by_id_field_name = match context.query_by_id_field_name.as_deref() {
-            Some(field_name) => {
-                let field_name = field_name.trim();
-                if field_name.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "query_by_id_field_name must not be empty",
-                    ));
-                }
-                field_name.to_owned()
-            }
-            None => collection.primary_vector.clone(),
-        };
-        let query_by_id_vector_schema = collection
-            .vectors
-            .iter()
-            .find(|vector| vector.name == query_by_id_field_name)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "query_by_id field '{}' is not defined in collection '{}'",
-                        query_by_id_field_name, collection.name
-                    ),
-                )
-            })?;
 
         let uses_ef_search = context.queries.iter().any(|query| {
             query
@@ -158,6 +132,32 @@ impl QueryPlanner {
         }
 
         if let Some(query_by_id) = context.query_by_id.as_ref() {
+            let query_by_id_field_name = match context.query_by_id_field_name.as_deref() {
+                Some(field_name) => {
+                    let field_name = field_name.trim();
+                    if field_name.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "query_by_id_field_name must not be empty",
+                        ));
+                    }
+                    field_name.to_owned()
+                }
+                None => collection.primary_vector.clone(),
+            };
+            let query_by_id_vector_schema = collection
+                .vectors
+                .iter()
+                .find(|vector| vector.name == query_by_id_field_name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "query_by_id field '{}' is not defined in collection '{}'",
+                            query_by_id_field_name, collection.name
+                        ),
+                    )
+                })?;
             if query_by_id.len() != query_by_id_documents.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
