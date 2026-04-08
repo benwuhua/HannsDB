@@ -248,6 +248,51 @@ def test_real_collection_fetch_preserves_primary_field_name_for_legacy_replace(t
     collection.destroy()
 
 
+def test_real_collection_single_id_fetch_and_delete_parity(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    first = hannsdb.Doc(
+        id="1",
+        vectors={"dense": [1.0, 2.0]},
+        fields={"session_id": "abc"},
+    )
+    second = hannsdb.Doc(
+        id="2",
+        vectors={"dense": [3.0, 4.0]},
+        fields={"session_id": "def"},
+    )
+
+    assert collection.insert([first, second]) == 2
+
+    fetched = collection.fetch("1")
+    assert fetched is not None
+    assert fetched.id == "1"
+    assert fetched.vector("dense") == [1.0, 2.0]
+    assert fetched.field("session_id") == "abc"
+
+    assert collection.fetch("3") is None
+
+    assert collection.fetch(["1", "2"]) == [first, second]
+    assert collection.delete("1") == 1
+    assert collection.fetch("1") is None
+    assert collection.fetch(["2"]) == [second]
+    assert collection.delete(["2"]) == 1
+    assert collection.fetch(["2"]) == []
+
+    collection.destroy()
+
+
 def build_update_parity_collection(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -2722,6 +2767,52 @@ def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
         "create_scalar_index",
         "drop_scalar_index",
         "destroy",
+    ]
+
+
+def test_collection_surface_single_id_helpers_delegate_via_list(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def fetch(self, ids):
+            calls.append(("fetch", ids))
+            if ids == ["1"]:
+                return [
+                    hannsdb._native.Doc(
+                        id="1",
+                        fields={"session_id": "abc"},
+                        vectors={"dense": [1.0, 2.0]},
+                        field_name="dense",
+                    )
+                ]
+            return []
+
+        def delete(self, ids):
+            calls.append(("delete", ids))
+            return len(ids)
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    fetched = collection.fetch("1")
+    assert fetched is not None
+    assert fetched.id == "1"
+    assert fetched.vector("dense") == [1.0, 2.0]
+    assert collection.fetch("missing") is None
+    assert collection.delete("1") == 1
+    assert calls == [
+        ("fetch", ["1"]),
+        ("fetch", ["missing"]),
+        ("delete", ["1"]),
     ]
 
 
