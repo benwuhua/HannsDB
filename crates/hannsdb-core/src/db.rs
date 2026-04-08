@@ -2500,3 +2500,103 @@ fn adapter_error_to_io(err: AdapterError) -> io::Error {
         AdapterError::Backend(msg) => io::Error::other(msg),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{CollectionSchema, Document, VectorFieldSchema, VectorIndexSchema};
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    #[test]
+    fn secondary_indexed_field_fast_path_warms_cache_with_lazy_optimized_ann() {
+        let tempdir = tempdir().expect("tempdir");
+        let db = seeded_db_with_secondary_indexed_collection(tempdir.path());
+        let handle = db
+            .open_collection_handle("docs")
+            .expect("open collection handle");
+
+        let hits = handle
+            .search_field_with_ef_internal("title", &[0.0_f32, 0.0], 3, 64)
+            .expect("search secondary vector field");
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+
+        let cache = handle
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        let state = cache.get("title").expect("cached secondary search state");
+        assert!(
+            state.optimized_ann.is_some(),
+            "secondary indexed fast path should warm an in-memory ANN runtime"
+        );
+    }
+
+    #[test]
+    fn primary_plain_search_keeps_cached_state_unoptimized_without_optimize() {
+        let tempdir = tempdir().expect("tempdir");
+        let db = seeded_db_with_secondary_indexed_collection(tempdir.path());
+        let handle = db
+            .open_collection_handle("docs")
+            .expect("open collection handle");
+
+        let hits = db
+            .search("docs", &[0.0_f32, 0.0], 1)
+            .expect("plain primary search");
+
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![2]);
+
+        let cache = handle
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        let state = cache.get("dense").expect("cached primary search state");
+        assert!(
+            state.optimized_ann.is_none(),
+            "plain primary search should stay unoptimized until optimize() or persisted HNSW load"
+        );
+    }
+
+    fn seeded_db_with_secondary_indexed_collection(root: &Path) -> HannsDb {
+        let mut db = HannsDb::open(root).expect("open db");
+        let mut schema = CollectionSchema::new("dense", 2, "l2", Vec::new());
+        schema.vectors.push(
+            VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+                Some("l2"),
+                16,
+                128,
+            )),
+        );
+        db.create_collection_with_schema("docs", &schema)
+            .expect("create collection");
+        db.insert_documents(
+            "docs",
+            &[
+                Document::with_vectors(
+                    1,
+                    [],
+                    vec![5.0_f32, 5.0],
+                    [("title".to_string(), vec![0.0_f32, 0.0])],
+                ),
+                Document::with_vectors(
+                    2,
+                    [],
+                    vec![0.0_f32, 0.0],
+                    [("title".to_string(), vec![2.0_f32, 0.0])],
+                ),
+                Document::with_vectors(
+                    3,
+                    [],
+                    vec![1.0_f32, 1.0],
+                    [("title".to_string(), vec![1.0_f32, 0.0])],
+                ),
+            ],
+        )
+        .expect("insert documents");
+        db
+    }
+}
