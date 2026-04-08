@@ -35,6 +35,11 @@ fn write_segment(
     let _ = append_record_ids(&segment_dir.join("ids.bin"), &ids).expect("write ids");
     let _ =
         append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
+    let _ = hannsdb_core::segment::append_vectors(
+        &segment_dir.join("vectors.jsonl"),
+        &vec![std::collections::BTreeMap::new(); documents.len()],
+    )
+    .expect("write vectors");
 
     let mut tombstone = TombstoneMask::new(documents.len());
     for row_idx in deleted_rows {

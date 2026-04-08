@@ -11,6 +11,7 @@ pub struct SegmentPaths {
     pub records: PathBuf,
     pub external_ids: PathBuf,
     pub payloads: PathBuf,
+    pub vectors: PathBuf,
     pub tombstones: PathBuf,
 }
 
@@ -23,6 +24,7 @@ impl SegmentPaths {
             records: collection_dir.join("records.bin"),
             external_ids: collection_dir.join("ids.bin"),
             payloads: collection_dir.join("payloads.jsonl"),
+            vectors: collection_dir.join("vectors.jsonl"),
             tombstones: collection_dir.join("tombstones.json"),
         }
     }
@@ -34,6 +36,7 @@ impl SegmentPaths {
             records: segment_dir.join("records.bin"),
             external_ids: segment_dir.join("ids.bin"),
             payloads: segment_dir.join("payloads.jsonl"),
+            vectors: segment_dir.join("vectors.jsonl"),
             tombstones: segment_dir.join("tombstones.json"),
             dir: segment_dir,
         }

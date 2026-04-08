@@ -17,8 +17,8 @@ use crate::query::{
 };
 use crate::segment::{
     append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
-    load_records, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
-    VersionSet,
+    load_records, append_vectors, load_vectors, SegmentManager, SegmentMetadata, SegmentPaths,
+    SegmentSet, TombstoneMask, VersionSet,
 };
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
@@ -408,6 +408,7 @@ impl HannsDb {
         let mut compacted_ids = Vec::new();
         let mut compacted_records = Vec::new();
         let mut compacted_payloads = Vec::new();
+        let mut compacted_vectors = Vec::new();
 
         for segment_id in &immutable_segment_ids {
             let segment_dir = paths.segments_dir.join(segment_id);
@@ -427,6 +428,8 @@ impl HannsDb {
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
                 load_payloads_or_empty(&segment_paths.payloads, segment_external_ids.len())?;
+            let segment_vectors =
+                load_vectors_or_empty(&segment_paths.vectors, segment_external_ids.len())?;
             let segment_tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
 
             if segment_external_ids
@@ -450,6 +453,7 @@ impl HannsDb {
                 compacted_records.extend_from_slice(vector);
                 compacted_ids.push(segment_external_ids[row_idx]);
                 compacted_payloads.push(segment_payloads[row_idx].clone());
+                compacted_vectors.push(segment_vectors[row_idx].clone());
             }
         }
 
@@ -466,6 +470,7 @@ impl HannsDb {
         }
         let _ = append_record_ids(&compacted_paths.external_ids, &compacted_ids)?;
         let _ = append_payloads(&compacted_paths.payloads, &compacted_payloads)?;
+        let _ = append_vectors(&compacted_paths.vectors, &compacted_vectors)?;
         TombstoneMask::new(compacted_ids.len()).save_to_path(&compacted_paths.tombstones)?;
         SegmentMetadata::new(
             compacted_segment_id.clone(),
@@ -619,7 +624,7 @@ impl HannsDb {
         let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
         let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
 
-        validate_documents(documents, collection_meta.dimension)?;
+        validate_documents(documents, &collection_meta)?;
 
         let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
         for document in documents {
@@ -677,7 +682,7 @@ impl HannsDb {
         let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
         let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
 
-        validate_documents(documents, collection_meta.dimension)?;
+        validate_documents(documents, &collection_meta)?;
 
         if log_wal {
             append_wal_record(
@@ -1172,6 +1177,7 @@ impl CollectionHandle {
                 let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
                 let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
                 let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+                let vectors = load_vectors_or_empty(&segment.vectors, stored_ids.len())?;
                 let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
                 if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
@@ -1192,6 +1198,7 @@ impl CollectionHandle {
                         id: *external_id,
                         fields: payloads[row_idx].clone(),
                         vector: records[start..end].to_vec(),
+                        vectors: vectors[row_idx].clone(),
                     });
                     break;
                 }
@@ -1444,6 +1451,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
         records: dir.join("records.bin"),
         external_ids: dir.join("ids.bin"),
         payloads: dir.join("payloads.jsonl"),
+        vectors: dir.join("vectors.jsonl"),
         tombstones: dir.join("tombstones.json"),
     }
 }
@@ -1458,6 +1466,7 @@ struct CollectionPaths {
     records: PathBuf,
     external_ids: PathBuf,
     payloads: PathBuf,
+    vectors: PathBuf,
     tombstones: PathBuf,
 }
 
@@ -1492,6 +1501,7 @@ impl Ord for RankedDocumentHit {
 #[derive(Debug, Default)]
 struct WalCollectionPlan {
     requires_data_files: bool,
+    requires_vector_sidecar: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1528,6 +1538,9 @@ impl WalReplayPlan {
                 } if !documents.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
                         plan.requires_data_files = true;
+                        if documents.iter().any(|document| !document.vectors.is_empty()) {
+                            plan.requires_vector_sidecar = true;
+                        }
                     }
                 }
                 WalRecord::UpsertDocuments {
@@ -1536,6 +1549,9 @@ impl WalReplayPlan {
                 } if !documents.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
                         plan.requires_data_files = true;
+                        if documents.iter().any(|document| !document.vectors.is_empty()) {
+                            plan.requires_vector_sidecar = true;
+                        }
                     }
                 }
                 WalRecord::Delete { collection, ids } if !ids.is_empty() => {
@@ -1577,6 +1593,9 @@ impl WalReplayPlan {
                     || !paths.external_ids.exists()
                     || !paths.payloads.exists())
             {
+                return Ok(true);
+            }
+            if plan.requires_vector_sidecar && !paths.vectors.exists() {
                 return Ok(true);
             }
         }
@@ -1679,14 +1698,43 @@ fn load_payloads_or_empty(
     }
 }
 
-fn validate_documents(documents: &[Document], dimension: usize) -> io::Result<()> {
-    if dimension == 0 {
+fn load_vectors_or_empty(
+    path: &Path,
+    expected_rows: usize,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    match load_vectors(path) {
+        Ok(mut vectors) => {
+            if vectors.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count exceeds record row count",
+                ));
+            }
+            if vectors.len() < expected_rows {
+                vectors.resize_with(expected_rows, BTreeMap::new);
+            }
+            Ok(vectors)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(vec![BTreeMap::new(); expected_rows])
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn validate_documents(documents: &[Document], collection_meta: &CollectionMetadata) -> io::Result<()> {
+    if collection_meta.dimension == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "collection dimension must be > 0",
         ));
     }
 
+    let vector_schemas = collection_meta
+        .vectors
+        .iter()
+        .map(|vector| (vector.name.as_str(), vector))
+        .collect::<HashMap<_, _>>();
     let mut ids = HashSet::with_capacity(documents.len());
     for document in documents {
         if !ids.insert(document.id) {
@@ -1695,14 +1743,34 @@ fn validate_documents(documents: &[Document], dimension: usize) -> io::Result<()
                 format!("duplicate external id in batch: {}", document.id),
             ));
         }
-        if document.vector.len() != dimension {
+        if document.vector.len() != collection_meta.dimension {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "document vector dimension mismatch: expected {dimension}, got {}",
+                    "document vector dimension mismatch: expected {}, got {}",
+                    collection_meta.dimension,
                     document.vector.len()
                 ),
             ));
+        }
+        for (name, vector) in &document.vectors {
+            let schema = vector_schemas.get(name.as_str()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("document vector '{}' is not defined in collection schema", name),
+                )
+            })?;
+            if vector.len() != schema.dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document vector '{}' dimension mismatch: expected {}, got {}",
+                        name,
+                        schema.dimension,
+                        vector.len()
+                    ),
+                ));
+            }
         }
     }
 
@@ -1717,15 +1785,18 @@ fn append_documents(
     let mut ids = Vec::with_capacity(documents.len());
     let mut records = Vec::with_capacity(documents.len().saturating_mul(dimension));
     let mut payloads = Vec::with_capacity(documents.len());
+    let mut vectors = Vec::with_capacity(documents.len());
     for document in documents {
         ids.push(document.id);
         records.extend_from_slice(&document.vector);
         payloads.push(document.fields.clone());
+        vectors.push(document.vectors.clone());
     }
 
     let inserted = append_records(&paths.records, dimension, &records)?;
     let _ = append_record_ids(&paths.external_ids, &ids)?;
     let _ = append_payloads(&paths.payloads, &payloads)?;
+    let _ = append_vectors(&paths.vectors, &vectors)?;
     Ok(inserted)
 }
 

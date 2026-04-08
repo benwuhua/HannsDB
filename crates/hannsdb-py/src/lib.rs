@@ -384,31 +384,37 @@ fn py_query_context_to_core(
 }
 
 fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Result<CoreDocument> {
-    if doc.vectors.len() != 1 || !doc.vectors.contains_key(primary_vector_name) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("doc must contain exactly one vector named '{primary_vector_name}'"),
-        ));
-    }
+    let primary_vector = doc
+        .vectors
+        .get(primary_vector_name)
+        .cloned()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("doc must contain a vector named '{primary_vector_name}'"),
+            )
+        })?;
 
-    Ok(CoreDocument::new(
+    let mut vectors = doc.vectors.clone();
+    vectors.remove(primary_vector_name);
+
+    Ok(CoreDocument::with_vectors(
         parse_doc_id(&doc.id)?,
         doc.fields.clone(),
-        doc.vectors
-            .get(primary_vector_name)
-            .cloned()
-            .expect("checked primary vector presence"),
+        primary_vector,
+        vectors,
     ))
 }
 
 fn doc_from_core_document(document: CoreDocument, primary_vector_name: &str) -> Doc {
+    let id = document.id.to_string();
+    let fields = document.fields.clone();
+    let vectors = document.vectors_with_primary(primary_vector_name);
     Doc {
-        id: document.id.to_string(),
+        id,
         score: None,
-        fields: document.fields,
-        vectors: [(primary_vector_name.to_string(), document.vector)]
-            .into_iter()
-            .collect(),
+        fields,
+        vectors,
     }
 }
 

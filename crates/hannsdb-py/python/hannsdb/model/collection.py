@@ -68,31 +68,6 @@ def _coerce_docs_to_native(docs):
     return [_coerce_doc_to_native(doc) for doc in list(docs)]
 
 
-def _is_native_collection(core_collection) -> bool:
-    native_collection_type = getattr(_native_module, "Collection", None)
-    return native_collection_type is not None and isinstance(core_collection, native_collection_type)
-
-
-def _doc_vector_count(doc) -> int:
-    vectors = getattr(doc, "vectors", None)
-    if vectors is None:
-        return 0
-    try:
-        return len(vectors)
-    except TypeError:
-        return len(list(vectors))
-
-
-def _raise_if_multi_vector_write_unsupported(core_collection, docs):
-    if not _is_native_collection(core_collection):
-        return
-    for doc in docs:
-        if _doc_vector_count(doc) > 1:
-            raise NotImplementedError(
-                "multi-vector document writes are not supported yet; only the primary vector can be written"
-            )
-
-
 def _wrap_doc_result(result):
     if isinstance(result, (list, tuple)):
         return [_wrap_doc(item) for item in result]
@@ -358,13 +333,11 @@ class Collection:
 
     def insert(self, docs):
         docs = list(docs)
-        _raise_if_multi_vector_write_unsupported(self._core, docs)
         with self._core_lock:
             return self._core.insert(_coerce_docs_to_native(docs))
 
     def upsert(self, docs):
         docs = list(docs)
-        _raise_if_multi_vector_write_unsupported(self._core, docs)
         with self._core_lock:
             return self._core.upsert(_coerce_docs_to_native(docs))
 

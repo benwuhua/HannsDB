@@ -1,4 +1,5 @@
 use std::fs;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,9 +46,13 @@ fn rewrite_collection_to_two_segment_layout(
         "records.bin",
         "ids.bin",
         "payloads.jsonl",
+        "vectors.jsonl",
         "tombstones.json",
     ] {
-        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+        let source = collection_dir.join(file);
+        if source.exists() {
+            fs::rename(source, seg1_dir.join(file)).expect("move seg-0001 file");
+        }
     }
 
     let mut second_ids = Vec::with_capacity(second_segment_documents.len());
@@ -65,6 +70,11 @@ fn rewrite_collection_to_two_segment_layout(
     let _ = append_record_ids(&seg2_dir.join("ids.bin"), &second_ids).expect("append seg-0002 ids");
     let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &second_payloads)
         .expect("append seg-0002 payloads");
+    let _ = hannsdb_core::segment::append_vectors(
+        &seg2_dir.join("vectors.jsonl"),
+        &vec![BTreeMap::new(); second_segment_documents.len()],
+    )
+    .expect("append seg-0002 vectors");
 
     let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
     for row_idx in deleted_second_segment_rows {

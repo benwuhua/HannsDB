@@ -102,8 +102,24 @@ def test_wrap_doc_preserves_legacy_doc_like_vector_and_field_name():
     assert wrapped.field("session_id") == "abc"
 
 
-def test_real_collection_rejects_multi_vector_doc_writes(tmp_path):
-    schema = build_schema()
+def test_real_collection_supports_multi_vector_doc_writes_and_round_trip(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="sparse",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
     collection = hannsdb.create_and_open(str(tmp_path), schema)
     doc = hannsdb.Doc(
         id="1",
@@ -117,19 +133,26 @@ def test_real_collection_rejects_multi_vector_doc_writes(tmp_path):
         "sparse": [3.0, 4.0],
     }
 
-    with pytest.raises(
-        NotImplementedError,
-        match="multi-vector document writes are not supported yet",
-    ):
-        collection.insert([doc])
+    assert collection.insert([doc]) == 1
+    upserted = doc._replace(
+        score=0.2,
+        vectors={
+            "dense": [2.0, 3.0],
+            "sparse": [4.0, 5.0],
+        },
+    )
+    assert collection.upsert([upserted]) == 1
 
-    with pytest.raises(
-        NotImplementedError,
-        match="multi-vector document writes are not supported yet",
-    ):
-        collection.upsert([doc])
+    fetched = collection.fetch(["1"])
+    assert fetched[0].vector("dense") == [2.0, 3.0]
+    assert fetched[0].vector("sparse") == [4.0, 5.0]
+    assert fetched[0].field("session_id") == "abc"
 
-    collection.destroy()
+    reopened = hannsdb.open(str(tmp_path))
+    replayed = reopened.fetch(["1"])
+    assert replayed[0].vector("dense") == [2.0, 3.0]
+    assert replayed[0].vector("sparse") == [4.0, 5.0]
+    reopened.destroy()
 
 
 def test_real_collection_insert_and_upsert_accept_single_vector_docs(tmp_path):

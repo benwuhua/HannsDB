@@ -246,6 +246,8 @@ pub struct Document {
     pub id: i64,
     pub fields: BTreeMap<String, FieldValue>,
     pub vector: Vec<f32>,
+    #[serde(default)]
+    pub vectors: BTreeMap<String, Vec<f32>>,
 }
 
 impl Document {
@@ -258,6 +260,31 @@ impl Document {
             id,
             fields: fields.into_iter().collect(),
             vector,
+            vectors: BTreeMap::new(),
         }
+    }
+
+    pub fn with_vectors(
+        id: i64,
+        fields: impl IntoIterator<Item = (String, FieldValue)>,
+        vector: Vec<f32>,
+        vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
+    ) -> Self {
+        Self {
+            id,
+            fields: fields.into_iter().collect(),
+            vector,
+            vectors: vectors.into_iter().collect(),
+        }
+    }
+
+    pub fn primary_vector(&self) -> &[f32] {
+        &self.vector
+    }
+
+    pub fn vectors_with_primary(&self, primary_vector_name: &str) -> BTreeMap<String, Vec<f32>> {
+        let mut vectors = self.vectors.clone();
+        vectors.insert(primary_vector_name.to_string(), self.vector.clone());
+        vectors
     }
 }
