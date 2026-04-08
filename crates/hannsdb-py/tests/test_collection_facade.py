@@ -759,3 +759,48 @@ def test_ddl_surface_keeps_base_schema_but_indexes_are_visible_and_survive_reope
     assert reopened.list_scalar_indexes() == ["session_id"]
 
     collection.destroy()
+
+
+def test_collection_convenience_create_and_drop_index_persist_through_reopen(tmp_path):
+    schema = build_schema()
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+
+    collection.create_index("dense", hannsdb.HnswIndexParam(metric_type="cosine", m=32))
+    collection.create_index("session_id")
+
+    reopened = hannsdb.open(str(tmp_path))
+    assert reopened.list_vector_indexes() == ["dense"]
+    assert reopened.list_scalar_indexes() == ["session_id"]
+
+    reopened.drop_index("dense")
+    reopened.drop_index("session_id")
+
+    reopened_again = hannsdb.open(str(tmp_path))
+    assert reopened_again.list_vector_indexes() == []
+    assert reopened_again.list_scalar_indexes() == []
+
+    collection.destroy()
+
+
+def test_collection_convenience_index_operations_reject_ambiguous_field_names(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="shared",
+        fields=[hannsdb.FieldSchema(name="shared", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="shared",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+
+    with pytest.raises(ValueError, match="ambiguous field name.*shared"):
+        collection.create_index("shared")
+
+    with pytest.raises(ValueError, match="ambiguous field name.*shared"):
+        collection.drop_index("shared")
+
+    collection.destroy()

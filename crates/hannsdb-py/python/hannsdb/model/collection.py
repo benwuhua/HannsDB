@@ -27,13 +27,26 @@ def _schema_to_native(schema):
 
 
 def _resolve_index_target(schema: CollectionSchema, field_name: str):
+    vector = None
+    scalar = None
     try:
-        return "vector", schema.vector(field_name)
+        vector = schema.vector(field_name)
     except KeyError:
-        try:
-            return "scalar", schema.field(field_name)
-        except KeyError as error:
-            raise KeyError(field_name) from error
+        pass
+    try:
+        scalar = schema.field(field_name)
+    except KeyError:
+        pass
+
+    if vector is not None and scalar is not None:
+        raise ValueError(
+            f"ambiguous field name {field_name!r}: matches both vector and scalar schemas"
+        )
+    if vector is not None:
+        return "vector", vector
+    if scalar is not None:
+        return "scalar", scalar
+    raise KeyError(field_name)
 
 
 def _native_value(value):
