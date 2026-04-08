@@ -207,6 +207,43 @@ def test_real_collection_insert_and_upsert_accept_single_vector_docs(tmp_path):
     collection.destroy()
 
 
+def test_real_collection_insert_and_upsert_accept_single_doc_input(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    doc = hannsdb.Doc(
+        id="1",
+        vector=[1.0, 2.0],
+        field_name="dense",
+        fields={"session_id": "abc"},
+        score=0.1,
+    )
+    updated = doc._replace(
+        score=0.2,
+        fields={"session_id": "xyz"},
+        vector=[3.0, 4.0],
+    )
+
+    assert collection.insert(doc) == 1
+    assert collection.upsert(updated) == 1
+
+    fetched = collection.fetch(["1"])
+    assert fetched[0].vector("dense") == [3.0, 4.0]
+    assert fetched[0].field("session_id") == "xyz"
+
+    collection.destroy()
+
+
 def test_real_collection_fetch_preserves_primary_field_name_for_legacy_replace(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -2768,6 +2805,48 @@ def test_collection_surface_methods_delegate_to_core_handle(monkeypatch):
         "drop_scalar_index",
         "destroy",
     ]
+
+
+def test_collection_surface_single_doc_writes_delegate_via_one_element_list(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def insert(self, docs):
+            calls.append(("insert", docs))
+            return 1
+
+        def upsert(self, docs):
+            calls.append(("upsert", docs))
+            return 2
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    doc = hannsdb.Doc(
+        id="1",
+        vectors={"dense": [1.0, 2.0]},
+        fields={"session_id": "abc"},
+    )
+
+    assert collection.insert(doc) == 1
+    assert collection.upsert(doc) == 2
+
+    assert len(calls) == 2
+    for name, docs in calls:
+        assert isinstance(docs, list)
+        assert len(docs) == 1
+        assert docs[0].__class__ is hannsdb._native.Doc
+        assert docs[0].id == "1"
+        assert docs[0].fields == {"session_id": "abc"}
+        assert docs[0].vectors == {"dense": [1.0, 2.0]}
 
 
 def test_collection_surface_single_id_helpers_delegate_via_list(monkeypatch):
