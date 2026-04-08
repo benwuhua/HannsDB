@@ -567,6 +567,66 @@ def test_real_collection_query_accepts_filter_only_legacy_kwargs_and_projects_ou
     collection.destroy()
 
 
+def test_real_collection_query_rejects_filter_only_group_by_legacy_kwargs(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "red"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vector=[0.1, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "blue"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "green"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        collection.query(
+            vectors=None,
+            output_fields=["group"],
+            topk=2,
+            filter="group == 1",
+            group_by=hannsdb.QueryGroupBy(field_name="group"),
+        )
+
+    message = str(exc_info.value)
+    assert "group_by requires at least one recall source" in message
+    assert "unsupported:" in message
+
+    collection.destroy()
+
+
 def test_real_collection_query_accepts_query_context_keyword_alias(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
