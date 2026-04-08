@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "python-binding")]
 use numpy::PyReadonlyArray1;
 #[cfg(feature = "python-binding")]
-use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyNotImplementedError, PyRuntimeError, PyValueError};
 #[cfg(feature = "python-binding")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
@@ -1587,6 +1587,12 @@ impl PyCollection {
 
     fn delete(&mut self, ids: Vec<String>) -> PyResult<usize> {
         self.inner_mut()?.delete(&ids).map_err(io_to_py_err)
+    }
+
+    fn delete_by_filter(&mut self, _filter: String) -> PyResult<()> {
+        Err(PyNotImplementedError::new_err(
+            "delete_by_filter is not supported yet",
+        ))
     }
 
     #[pyo3(signature = (vectors, output_fields=None, topk=100, filter=None))]

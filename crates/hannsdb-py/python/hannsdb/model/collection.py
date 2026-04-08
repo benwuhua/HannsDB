@@ -430,6 +430,9 @@ class Collection:
         _, ids = _coerce_id_input(ids)
         return self._core.delete(ids)
 
+    def delete_by_filter(self, filter: str):
+        raise NotImplementedError("delete_by_filter is not supported yet")
+
     def optimize(self, option=None):
         if option is None:
             return self._core.optimize()
