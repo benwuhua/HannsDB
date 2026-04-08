@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
-    VectorIndexSchema,
 };
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
@@ -15,6 +14,7 @@ use hannsdb_core::query::{
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
+use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -323,15 +323,22 @@ fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_brutefo
         "l2",
         vec![ScalarFieldSchema::new("group", FieldType::Int64)],
     );
-    schema.vectors.push(
-        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
-            Some("cosine"),
-            16,
-            128,
-        )),
-    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "title".to_string(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some("cosine".to_string()),
+            params: serde_json::json!({
+                "m": 16,
+                "ef_construction": 128,
+            }),
+        },
+    )
+    .expect("register descriptor-backed secondary vector index");
     db.insert_documents(
         "docs",
         &[
@@ -390,15 +397,22 @@ fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_brutefo
         "l2",
         vec![ScalarFieldSchema::new("group", FieldType::Int64)],
     );
-    schema.vectors.push(
-        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
-            Some("cosine"),
-            16,
-            128,
-        )),
-    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "title".to_string(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some("cosine".to_string()),
+            params: serde_json::json!({
+                "m": 16,
+                "ef_construction": 128,
+            }),
+        },
+    )
+    .expect("register descriptor-backed secondary vector index");
     db.insert_documents(
         "docs",
         &[
@@ -459,15 +473,22 @@ fn zvec_parity_query_context_rejects_mixed_metric_typed_recall_sources() {
         "l2",
         vec![ScalarFieldSchema::new("group", FieldType::Int64)],
     );
-    schema.vectors.push(
-        VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
-            Some("cosine"),
-            16,
-            128,
-        )),
-    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "title".to_string(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some("cosine".to_string()),
+            params: serde_json::json!({
+                "m": 16,
+                "ef_construction": 128,
+            }),
+        },
+    )
+    .expect("register descriptor-backed secondary vector index");
 
     let err = db
         .query_with_context(

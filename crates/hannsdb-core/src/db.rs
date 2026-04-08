@@ -16,8 +16,8 @@ use crate::query::{
     QueryPlanner, SearchHit,
 };
 use crate::segment::{
-    append_payloads, append_record_ids, append_records, load_payloads, load_record_ids,
-    load_records, append_vectors, load_vectors, SegmentManager, SegmentMetadata, SegmentPaths,
+    append_payloads, append_record_ids, append_records, append_vectors, load_payloads,
+    load_record_ids, load_records, load_vectors, SegmentManager, SegmentMetadata, SegmentPaths,
     SegmentSet, TombstoneMask, VersionSet,
 };
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
@@ -175,6 +175,7 @@ impl HannsDb {
             )
         })?;
         validate_schema_primary_vector_descriptor(schema)?;
+        validate_schema_secondary_vector_descriptors(schema)?;
         let dimension = schema.dimension();
         if dimension == 0 {
             return Err(io::Error::new(
@@ -651,8 +652,12 @@ impl HannsDb {
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted =
-            append_documents(&paths, collection_meta.dimension, segment_meta.record_count, documents)?;
+        let inserted = append_documents(
+            &paths,
+            collection_meta.dimension,
+            segment_meta.record_count,
+            documents,
+        )?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -709,8 +714,12 @@ impl HannsDb {
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted =
-            append_documents(&paths, collection_meta.dimension, segment_meta.record_count, documents)?;
+        let inserted = append_documents(
+            &paths,
+            collection_meta.dimension,
+            segment_meta.record_count,
+            documents,
+        )?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -1013,13 +1022,19 @@ impl CollectionHandle {
     }
 
     pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
-        let collection_meta =
-            CollectionMetadata::load_from_path(&self.collection_paths().collection_meta)?;
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         let query_by_id_documents = match context.query_by_id.as_ref() {
             Some(query_by_id) => self.fetch_documents(query_by_id)?,
             None => Vec::new(),
         };
-        let plan = QueryPlanner::build(&collection_meta, context, &query_by_id_documents)?;
+        let plan = QueryPlanner::build(
+            &collection_meta,
+            &index_catalog,
+            context,
+            &query_by_id_documents,
+        )?;
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
                 let mut hits = self.query_documents_with_ef_internal(
@@ -1672,7 +1687,8 @@ impl WalReplayPlan {
             if plan.requires_vector_sidecar {
                 match load_vectors(&paths.vectors) {
                     Ok(vectors) => {
-                        if Some(vectors.len()) != segment_meta.as_ref().map(|meta| meta.record_count)
+                        if Some(vectors.len())
+                            != segment_meta.as_ref().map(|meta| meta.record_count)
                         {
                             return Ok(true);
                         }
@@ -1780,7 +1796,10 @@ fn load_payloads_or_empty(
     }
 }
 
-fn load_vectors_or_empty(path: &Path, expected_rows: usize) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+fn load_vectors_or_empty(
+    path: &Path,
+    expected_rows: usize,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
     match load_vectors(path) {
         Ok(vectors) => {
             if vectors.len() > expected_rows {
@@ -1804,7 +1823,10 @@ fn load_vectors_or_empty(path: &Path, expected_rows: usize) -> io::Result<Vec<BT
     }
 }
 
-fn validate_documents(documents: &[Document], collection_meta: &CollectionMetadata) -> io::Result<()> {
+fn validate_documents(
+    documents: &[Document],
+    collection_meta: &CollectionMetadata,
+) -> io::Result<()> {
     if collection_meta.dimension == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1851,7 +1873,10 @@ fn validate_documents(documents: &[Document], collection_meta: &CollectionMetada
             let schema = vector_schemas.get(name.as_str()).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("document vector '{}' is not defined in collection schema", name),
+                    format!(
+                        "document vector '{}' is not defined in collection schema",
+                        name
+                    ),
                 )
             })?;
             if vector.len() != schema.dimension {
@@ -2112,6 +2137,43 @@ fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::R
         },
     };
     validate_vector_index_descriptor(primary_vector.dimension, &descriptor)
+}
+
+fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io::Result<()> {
+    let primary_vector_name = schema.primary_vector_name();
+    for vector in schema
+        .vectors
+        .iter()
+        .filter(|vector| vector.name != primary_vector_name)
+    {
+        let Some(index_param) = vector.index_param.as_ref() else {
+            continue;
+        };
+        let descriptor = match index_param {
+            VectorIndexSchema::Ivf { metric, nlist } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::Ivf,
+                metric: metric.clone(),
+                params: serde_json::json!({ "nlist": nlist }),
+            },
+            VectorIndexSchema::Hnsw {
+                metric,
+                m,
+                ef_construction,
+                ..
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::Hnsw,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "m": m,
+                    "ef_construction": ef_construction
+                }),
+            },
+        };
+        validate_vector_index_descriptor(vector.dimension, &descriptor)?;
+    }
+    Ok(())
 }
 
 fn resolve_primary_vector_descriptor(

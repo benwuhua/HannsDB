@@ -1,7 +1,7 @@
 use std::io;
 
-use crate::catalog::CollectionMetadata;
-use crate::document::Document;
+use crate::catalog::{CollectionMetadata, IndexCatalog};
+use crate::document::{Document, VectorFieldSchema};
 
 use super::{parse_filter, FilterExpr, QueryContext, QueryGroupBy, VectorQuery};
 
@@ -59,6 +59,7 @@ pub(crate) struct QueryPlanner;
 impl QueryPlanner {
     pub(crate) fn build(
         collection: &CollectionMetadata,
+        index_catalog: &IndexCatalog,
         context: &QueryContext,
         query_by_id_documents: &[Document],
     ) -> io::Result<QueryPlan> {
@@ -97,7 +98,7 @@ impl QueryPlanner {
 
         if is_single_vector_fast_path {
             let query = &context.queries[0];
-            validate_vector_query(collection, query, true, true)?;
+            validate_vector_query(collection, index_catalog, query, true, true)?;
             if filter.is_some()
                 && query
                     .param
@@ -123,7 +124,7 @@ impl QueryPlanner {
 
         let mut recall_sources = Vec::new();
         for query in &context.queries {
-            let metric = validate_vector_query(collection, query, false, false)?;
+            let metric = validate_vector_query(collection, index_catalog, query, false, false)?;
             recall_sources.push(PlannedRecallSource {
                 kind: RecallSourceKind::ExplicitVector {
                     field_name: query.field_name.clone(),
@@ -206,7 +207,11 @@ impl QueryPlanner {
                         field_name: query_by_id_field_name.clone(),
                     },
                     vector: vector.to_vec(),
-                    metric: resolve_vector_metric(collection, query_by_id_vector_schema)?,
+                    metric: resolve_vector_metric(
+                        collection,
+                        index_catalog,
+                        query_by_id_vector_schema,
+                    )?,
                 });
             }
         }
@@ -253,6 +258,7 @@ impl QueryPlanner {
 
 fn validate_vector_query(
     collection: &CollectionMetadata,
+    index_catalog: &IndexCatalog,
     query: &VectorQuery,
     allow_ef_search: bool,
     require_primary: bool,
@@ -304,17 +310,22 @@ fn validate_vector_query(
         ));
     }
 
-    resolve_vector_metric(collection, vector_schema)
+    resolve_vector_metric(collection, index_catalog, vector_schema)
 }
 
 fn resolve_vector_metric(
     collection: &CollectionMetadata,
-    vector_schema: &crate::document::VectorFieldSchema,
+    index_catalog: &IndexCatalog,
+    vector_schema: &VectorFieldSchema,
 ) -> io::Result<String> {
-    Ok(vector_schema
-        .metric()
-        .unwrap_or(collection.metric.as_str())
-        .to_ascii_lowercase())
+    let metric = index_catalog
+        .vector_indexes
+        .iter()
+        .find(|descriptor| descriptor.field_name == vector_schema.name)
+        .and_then(|descriptor| descriptor.metric.as_deref())
+        .or_else(|| vector_schema.metric())
+        .unwrap_or(collection.metric.as_str());
+    Ok(metric.to_ascii_lowercase())
 }
 
 fn mixed_metric_error(recall_sources: &[PlannedRecallSource]) -> Option<String> {

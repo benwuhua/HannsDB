@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1031,7 +1031,10 @@ fn collection_api_optimize_uses_explicit_flat_descriptor_for_primary_vector() {
         .search("docs", &[1.0_f32, 0.0], 1)
         .expect("search should use explicit flat descriptor");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, 2, "cosine flat index should prefer aligned vector");
+    assert_eq!(
+        hits[0].id, 2,
+        "cosine flat index should prefer aligned vector"
+    );
 }
 
 #[test]
@@ -1062,7 +1065,10 @@ fn collection_api_optimize_uses_explicit_ivf_descriptor_for_primary_vector() {
         .search("docs", &[1.0_f32, 0.0], 1)
         .expect("search should use explicit ivf descriptor");
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, 2, "cosine ivf index should prefer aligned vector");
+    assert_eq!(
+        hits[0].id, 2,
+        "cosine ivf index should prefer aligned vector"
+    );
 }
 
 #[test]
@@ -1099,7 +1105,10 @@ fn collection_api_drop_primary_vector_descriptor_reverts_to_schema_fallback() {
     let fallback_hits = db
         .search("docs", &[1.0_f32, 0.0], 1)
         .expect("search should use schema fallback");
-    assert_eq!(fallback_hits[0].id, 1, "schema l2 fallback should prefer nearest vector");
+    assert_eq!(
+        fallback_hits[0].id, 1,
+        "schema l2 fallback should prefer nearest vector"
+    );
 }
 
 #[test]
@@ -1109,10 +1118,8 @@ fn collection_api_schema_created_ivf_primary_vector_optimizes_and_searches() {
     let schema = CollectionSchema {
         primary_vector: "vector".to_string(),
         fields: Vec::new(),
-        vectors: vec![
-            VectorFieldSchema::new("vector", 2)
-                .with_index_param(VectorIndexSchema::ivf(Some("cosine"), 4)),
-        ],
+        vectors: vec![VectorFieldSchema::new("vector", 2)
+            .with_index_param(VectorIndexSchema::ivf(Some("cosine"), 4))],
     };
     db.create_collection_with_schema("docs", &schema)
         .expect("create collection with ivf primary vector");
@@ -1165,8 +1172,14 @@ fn collection_api_drop_scalar_index_removes_only_scalar_descriptor() {
     db.drop_scalar_index("docs", "category")
         .expect("drop scalar descriptor");
 
-    assert!(db.list_scalar_indexes("docs").expect("list scalar").is_empty());
-    assert_eq!(db.list_vector_indexes("docs").expect("list vector").len(), 1);
+    assert!(db
+        .list_scalar_indexes("docs")
+        .expect("list scalar")
+        .is_empty());
+    assert_eq!(
+        db.list_vector_indexes("docs").expect("list vector").len(),
+        1
+    );
 }
 
 #[test]
@@ -1210,12 +1223,18 @@ fn collection_api_vector_index_ddl_removes_stale_hnsw_blob() {
         },
     )
     .expect("create vector descriptor should invalidate stale blob");
-    assert!(!blob_path.exists(), "stale hnsw blob should be removed on create");
+    assert!(
+        !blob_path.exists(),
+        "stale hnsw blob should be removed on create"
+    );
 
     fs::write(&blob_path, b"stale graph").expect("rewrite stale hnsw blob");
     db.drop_vector_index("docs", "vector")
         .expect("drop vector descriptor should invalidate stale blob");
-    assert!(!blob_path.exists(), "stale hnsw blob should be removed on drop");
+    assert!(
+        !blob_path.exists(),
+        "stale hnsw blob should be removed on drop"
+    );
 }
 
 #[test]
@@ -1249,18 +1268,45 @@ fn collection_api_rejects_invalid_schema_primary_vector_index_config() {
     let schema = CollectionSchema {
         primary_vector: "vector".to_string(),
         fields: Vec::new(),
-        vectors: vec![
-            VectorFieldSchema::new("vector", 2).with_index_param(VectorIndexSchema::Hnsw {
+        vectors: vec![VectorFieldSchema::new("vector", 2).with_index_param(
+            VectorIndexSchema::Hnsw {
                 metric: Some("bogus".to_string()),
                 m: 16,
                 ef_construction: 64,
                 quantize_type: None,
-            }),
-        ],
+            },
+        )],
     };
 
     let err = db
         .create_collection_with_schema("docs", &schema)
         .expect_err("invalid schema-defined primary index config should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn collection_api_rejects_invalid_schema_secondary_vector_index_config() {
+    let root = unique_temp_dir("hannsdb_collection_api_reject_invalid_schema_secondary_index");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("dense", 2).with_index_param(VectorIndexSchema::hnsw(
+                Some("l2"),
+                16,
+                64,
+            )),
+            VectorFieldSchema::new("title", 2).with_index_param(VectorIndexSchema::hnsw(
+                Some("bogus"),
+                16,
+                64,
+            )),
+        ],
+    };
+
+    let err = db
+        .create_collection_with_schema("docs", &schema)
+        .expect_err("invalid schema-defined secondary index config should fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
