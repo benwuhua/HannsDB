@@ -2,6 +2,7 @@ use std::io;
 
 use crate::catalog::{CollectionMetadata, IndexCatalog};
 use crate::document::{Document, VectorFieldSchema};
+use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 
 use super::{parse_filter, FilterExpr, QueryContext, QueryGroupBy, VectorQuery};
 
@@ -13,8 +14,8 @@ pub(crate) enum QueryPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LegacySingleVectorPlan {
+    pub(crate) field_name: String,
     pub(crate) top_k: usize,
-    pub(crate) filter: Option<String>,
     pub(crate) vector: Vec<f32>,
     pub(crate) ef_search: Option<usize>,
     pub(crate) output_fields: Option<Vec<String>>,
@@ -88,7 +89,12 @@ impl QueryPlanner {
             && context.queries.len() == 1
             && context.query_by_id.is_none()
             && filter.is_none()
-            && context.queries[0].field_name == collection.primary_vector;
+            && resolve_vector_descriptor_for_field(
+                collection,
+                index_catalog,
+                &context.queries[0].field_name,
+            )?
+            .is_some();
         if uses_ef_search && !is_single_vector_fast_path {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -98,22 +104,10 @@ impl QueryPlanner {
 
         if is_single_vector_fast_path {
             let query = &context.queries[0];
-            validate_vector_query(collection, index_catalog, query, true, true)?;
-            if filter.is_some()
-                && query
-                    .param
-                    .as_ref()
-                    .and_then(|param| param.ef_search)
-                    .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "vector query param ef_search is not supported with filtered typed single-vector fast path queries",
-                ));
-            }
+            validate_vector_query(collection, index_catalog, query, true, false)?;
             return Ok(QueryPlan::LegacySingleVector(LegacySingleVectorPlan {
+                field_name: query.field_name.clone(),
                 top_k: context.top_k,
-                filter,
                 vector: query.vector.clone(),
                 ef_search: query.param.as_ref().and_then(|param| param.ef_search),
                 output_fields: context.output_fields.clone(),
@@ -311,6 +305,121 @@ fn validate_vector_query(
     }
 
     resolve_vector_metric(collection, index_catalog, vector_schema)
+}
+
+pub(crate) fn resolve_vector_descriptor_for_field(
+    collection: &CollectionMetadata,
+    index_catalog: &IndexCatalog,
+    field_name: &str,
+) -> io::Result<Option<VectorIndexDescriptor>> {
+    if field_name == collection.primary_vector {
+        return Ok(Some(resolve_primary_vector_descriptor_for_planner(
+            collection,
+            index_catalog,
+        )?));
+    }
+
+    let Some(vector_schema) = collection
+        .vectors
+        .iter()
+        .find(|vector| vector.name == field_name)
+    else {
+        return Ok(None);
+    };
+
+    if let Some(descriptor) = index_catalog
+        .vector_indexes
+        .iter()
+        .find(|descriptor| descriptor.field_name == field_name)
+    {
+        return Ok(Some(descriptor.clone()));
+    }
+
+    Ok(vector_schema
+        .index_param
+        .as_ref()
+        .map(|index_param| VectorIndexDescriptor {
+            field_name: vector_schema.name.clone(),
+            kind: match index_param {
+                crate::document::VectorIndexSchema::Ivf { .. } => VectorIndexKind::Ivf,
+                crate::document::VectorIndexSchema::Hnsw { .. } => VectorIndexKind::Hnsw,
+            },
+            metric: index_param.metric().map(str::to_string),
+            params: match index_param {
+                crate::document::VectorIndexSchema::Ivf { nlist, .. } => {
+                    serde_json::json!({ "nlist": nlist })
+                }
+                crate::document::VectorIndexSchema::Hnsw {
+                    m, ef_construction, ..
+                } => serde_json::json!({
+                    "m": m,
+                    "ef_construction": ef_construction,
+                }),
+            },
+        }))
+}
+
+fn resolve_primary_vector_descriptor_for_planner(
+    collection_meta: &CollectionMetadata,
+    index_catalog: &IndexCatalog,
+) -> io::Result<VectorIndexDescriptor> {
+    if let Some(descriptor) = index_catalog
+        .vector_indexes
+        .iter()
+        .find(|descriptor| descriptor.field_name == collection_meta.primary_vector)
+    {
+        return Ok(descriptor.clone());
+    }
+
+    let primary_vector = collection_meta
+        .vectors
+        .iter()
+        .find(|vector| vector.name == collection_meta.primary_vector)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "primary vector '{}' is not defined in collection metadata",
+                    collection_meta.primary_vector
+                ),
+            )
+        })?;
+
+    let (kind, metric, params) = match primary_vector.index_param.as_ref() {
+        Some(crate::document::VectorIndexSchema::Ivf { metric, nlist }) => (
+            VectorIndexKind::Ivf,
+            metric.clone(),
+            serde_json::json!({ "nlist": nlist }),
+        ),
+        Some(crate::document::VectorIndexSchema::Hnsw {
+            metric,
+            m,
+            ef_construction,
+            ..
+        }) => (
+            VectorIndexKind::Hnsw,
+            metric.clone(),
+            serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction
+            }),
+        ),
+        None => (
+            VectorIndexKind::Hnsw,
+            Some(collection_meta.metric.clone()),
+            serde_json::json!({
+                "m": collection_meta.hnsw_m,
+                "ef_construction": collection_meta.hnsw_ef_construction
+            }),
+        ),
+    };
+
+    Ok(VectorIndexDescriptor {
+        field_name: collection_meta.primary_vector.clone(),
+        kind,
+        metric,
+        params,
+    })
 }
 
 fn resolve_vector_metric(

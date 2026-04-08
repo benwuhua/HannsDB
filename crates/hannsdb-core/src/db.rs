@@ -12,8 +12,8 @@ use hannsdb_index::factory::DefaultIndexFactory;
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
 use crate::query::{
-    distance_by_metric, parse_filter, search_by_metric, QueryContext, QueryExecutor, QueryPlan,
-    QueryPlanner, SearchHit,
+    distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
+    QueryContext, QueryExecutor, QueryPlan, QueryPlanner, SearchHit,
 };
 use crate::segment::{
     append_payloads, append_record_ids, append_records, append_vectors, load_payloads,
@@ -57,16 +57,19 @@ pub struct DocumentHit {
     pub vectors: BTreeMap<String, Vec<f32>>,
 }
 
+#[derive(Clone)]
 struct CachedSearchState {
     records: Arc<Vec<f32>>,
     external_ids: Arc<Vec<i64>>,
     tombstone: Arc<TombstoneMask>,
     dimension: usize,
     metric: String,
-    primary_index: VectorIndexDescriptor,
+    field_name: String,
+    descriptor: VectorIndexDescriptor,
     optimized_ann: Option<OptimizedAnnState>,
 }
 
+#[derive(Clone)]
 struct OptimizedAnnState {
     backend: Arc<dyn VectorIndexBackend>,
     ann_external_ids: Arc<Vec<i64>>,
@@ -82,7 +85,7 @@ pub struct CollectionHandle {
     segment_manager: SegmentManager,
     version_set: RwLock<VersionSet>,
     index_registry: Arc<IndexRegistry>,
-    search_cache: Mutex<Option<CachedSearchState>>,
+    search_cache: Mutex<HashMap<String, CachedSearchState>>,
 }
 
 impl HannsDb {
@@ -948,7 +951,7 @@ impl CollectionHandle {
             segment_manager,
             version_set: RwLock::new(version_set),
             index_registry,
-            search_cache: Mutex::new(None),
+            search_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -966,59 +969,8 @@ impl CollectionHandle {
         top_k: usize,
         _ef_search: usize,
     ) -> io::Result<Vec<SearchHit>> {
-        let ef_search = _ef_search.max(1);
-        let mut cache = self
-            .search_cache
-            .lock()
-            .expect("search cache mutex poisoned");
-        if cache.is_none() {
-            let state = if let Some(ann_state) = self.try_load_persisted_ann_state()? {
-                ann_state
-            } else {
-                self.load_search_state()?
-            };
-            *cache = Some(state);
-        }
-
-        let state = cache
-            .as_ref()
-            .expect("search cache must contain requested collection");
-        if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-            let optimized_snapshot = (
-                Arc::clone(&optimized_ann.backend),
-                Arc::clone(&optimized_ann.ann_external_ids),
-                optimized_ann.metric.clone(),
-            );
-            drop(cache);
-            return ann_search(
-                optimized_snapshot.0.as_ref(),
-                optimized_snapshot.1.as_slice(),
-                &optimized_snapshot.2,
-                query,
-                top_k,
-                ef_search,
-            );
-        }
-        let brute_force_snapshot = (
-            Arc::clone(&state.records),
-            Arc::clone(&state.external_ids),
-            Arc::clone(&state.tombstone),
-            state.dimension,
-            state.metric.clone(),
-        );
-        drop(cache);
-
-        let (records, external_ids, tombstone, dimension, metric) = brute_force_snapshot;
-
-        search_by_metric(
-            &records,
-            &external_ids,
-            dimension,
-            tombstone.as_ref(),
-            query,
-            top_k,
-            &metric,
-        )
+        let field_name = self.collection_primary_vector_name()?;
+        self.search_field_with_ef_internal(&field_name, query, top_k, _ef_search)
     }
 
     pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
@@ -1037,11 +989,11 @@ impl CollectionHandle {
         )?;
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
-                let mut hits = self.query_documents_with_ef_internal(
-                    Some(&collection_meta),
+                let mut hits = self.query_documents_for_field_with_ef_internal(
+                    &collection_meta,
+                    &plan.field_name,
                     &plan.vector,
                     plan.top_k,
-                    plan.filter.as_deref(),
                     plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
                     context.include_vector,
                 )?;
@@ -1062,7 +1014,8 @@ impl CollectionHandle {
 
     pub fn optimize(&self) -> io::Result<()> {
         let _index_registry = Arc::clone(&self.index_registry);
-        let mut state = self.load_search_state()?;
+        let field_name = self.collection_primary_vector_name()?;
+        let mut state = self.load_search_state_for_field(&field_name)?;
         let mut hnsw_bytes = None;
         state.optimized_ann = Some(build_optimized_ann_state(&state, &mut hnsw_bytes)?);
         #[cfg(feature = "knowhere-backend")]
@@ -1089,7 +1042,7 @@ impl CollectionHandle {
             .search_cache
             .lock()
             .expect("search cache mutex poisoned");
-        *cache = Some(state);
+        cache.insert(state.field_name.clone(), state);
         Ok(())
     }
 
@@ -1180,7 +1133,12 @@ impl CollectionHandle {
     ) -> io::Result<Vec<DocumentHit>> {
         match filter.map(str::trim) {
             None | Some("") => {
-                let hits = self.search_with_ef(query, top_k, ef_search)?;
+                let field_name = match collection_meta {
+                    Some(collection_meta) => collection_meta.primary_vector.clone(),
+                    None => self.collection_primary_vector_name()?,
+                };
+                let hits =
+                    self.search_field_with_ef_internal(&field_name, query, top_k, ef_search)?;
                 let documents =
                     self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
                 if include_vector && documents.len() != hits.len() {
@@ -1226,6 +1184,84 @@ impl CollectionHandle {
                 Ok(hits)
             }
         }
+    }
+
+    fn query_documents_for_field_with_ef_internal(
+        &self,
+        collection_meta: &CollectionMetadata,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+        include_vector: bool,
+    ) -> io::Result<Vec<DocumentHit>> {
+        let hits = self.search_field_with_ef_internal(field_name, query, top_k, ef_search)?;
+        let documents = self.fetch_documents(&hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
+        if include_vector && documents.len() != hits.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "failed to resolve {} typed query hit(s) for vector materialization, got {}",
+                    hits.len(),
+                    documents.len()
+                ),
+            ));
+        }
+        Ok(hits
+            .into_iter()
+            .zip(documents)
+            .map(|(hit, document)| {
+                let vectors = if include_vector {
+                    document.vectors_with_primary(collection_meta.primary_vector.as_str())
+                } else {
+                    BTreeMap::new()
+                };
+                DocumentHit {
+                    id: hit.id,
+                    distance: hit.distance,
+                    fields: document.fields,
+                    vectors,
+                }
+            })
+            .collect())
+    }
+
+    fn search_field_with_ef_internal(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        let state = self.cached_search_state_for_field(field_name)?;
+        let ef_search = ef_search.max(1);
+        if state.field_name == self.collection_primary_vector_name()? {
+            if let Some(optimized_ann) = state.optimized_ann.as_ref() {
+                let optimized_snapshot = (
+                    Arc::clone(&optimized_ann.backend),
+                    Arc::clone(&optimized_ann.ann_external_ids),
+                    optimized_ann.metric.clone(),
+                );
+                return ann_search(
+                    optimized_snapshot.0.as_ref(),
+                    optimized_snapshot.1.as_slice(),
+                    &optimized_snapshot.2,
+                    query,
+                    top_k,
+                    ef_search,
+                );
+            }
+        }
+
+        search_by_metric(
+            &state.records,
+            &state.external_ids,
+            state.dimension,
+            state.tombstone.as_ref(),
+            query,
+            top_k,
+            &state.metric,
+        )
     }
 
     fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
@@ -1370,24 +1406,94 @@ impl CollectionHandle {
         collection_paths_for_root(&self.root, &self.name)
     }
 
-    fn load_search_state(&self) -> io::Result<CachedSearchState> {
+    fn collection_primary_vector_name(&self) -> io::Result<String> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        Ok(collection_meta.primary_vector)
+    }
+
+    fn load_search_state_for_field(&self, field_name: &str) -> io::Result<CachedSearchState> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
-        let primary_index = resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
-        let metric = collection_meta.metric.clone();
-        let (records, external_ids) =
-            load_shadowed_live_records(&self.segment_manager, collection_meta.dimension)?;
+        let descriptor = resolve_vector_descriptor_for_field(&collection_meta, &index_catalog, field_name)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "vector field '{}' does not have a resolvable index descriptor in collection '{}'",
+                        field_name, collection_meta.name
+                    ),
+                )
+            })?;
+        let vector_schema = collection_meta
+            .vectors
+            .iter()
+            .find(|vector| vector.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "vector field '{}' is not defined in collection '{}'",
+                        field_name, collection_meta.name
+                    ),
+                )
+            })?;
+
+        let (records, external_ids) = if field_name == collection_meta.primary_vector {
+            load_shadowed_live_records(&self.segment_manager, vector_schema.dimension)?
+        } else {
+            load_shadowed_live_vector_records(
+                &self.segment_manager,
+                vector_schema.dimension,
+                field_name,
+            )?
+        };
 
         Ok(CachedSearchState {
             records: Arc::new(records),
             external_ids: Arc::new(external_ids),
             tombstone: Arc::new(TombstoneMask::new(0)),
-            dimension: collection_meta.dimension,
-            metric,
-            primary_index,
+            dimension: vector_schema.dimension,
+            metric: descriptor
+                .metric
+                .clone()
+                .unwrap_or_else(|| collection_meta.metric.clone())
+                .to_ascii_lowercase(),
+            field_name: field_name.to_string(),
+            descriptor,
             optimized_ann: None,
         })
+    }
+
+    fn cached_search_state_for_field(&self, field_name: &str) -> io::Result<CachedSearchState> {
+        if let Some(state) = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned")
+            .get(field_name)
+            .cloned()
+        {
+            return Ok(state);
+        }
+
+        let primary_name = self.collection_primary_vector_name()?;
+        let state = if field_name == primary_name {
+            self.try_load_persisted_ann_state()?
+                .unwrap_or(self.load_search_state_for_field(field_name)?)
+        } else {
+            self.load_search_state_for_field(field_name)?
+        };
+
+        let mut cache = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        if let Some(state) = cache.get(field_name) {
+            return Ok(state.clone());
+        }
+        cache.insert(field_name.to_string(), state.clone());
+        Ok(state)
     }
 
     fn try_load_persisted_ann_state(&self) -> io::Result<Option<CachedSearchState>> {
@@ -1424,7 +1530,8 @@ impl CollectionHandle {
                     .map_err(adapter_error_to_io)
             }) {
                 Ok(backend) => {
-                    let mut state = self.load_search_state()?;
+                    let mut state =
+                        self.load_search_state_for_field(&collection_meta.primary_vector)?;
                     log::info!(
                         "Loaded persisted HNSW index for '{}' from '{}'",
                         self.name,
@@ -1455,7 +1562,7 @@ impl CollectionHandle {
             .search_cache
             .lock()
             .expect("search cache mutex poisoned");
-        *cache = None;
+        cache.clear();
     }
 
     fn refresh_version_set(&self) -> io::Result<()> {
@@ -1511,6 +1618,64 @@ fn load_shadowed_live_records(
             let start = row_idx * dimension;
             let end = start + dimension;
             records.extend_from_slice(&segment_records[start..end]);
+            external_ids.push(external_id);
+        }
+    }
+
+    Ok((records, external_ids))
+}
+
+fn load_shadowed_live_vector_records(
+    segment_manager: &SegmentManager,
+    dimension: usize,
+    field_name: &str,
+) -> io::Result<(Vec<f32>, Vec<i64>)> {
+    let mut records = Vec::new();
+    let mut external_ids = Vec::new();
+    let mut shadowed_ids = HashSet::new();
+
+    for segment in segment_manager.segment_paths()? {
+        let segment_records = load_records_or_empty(&segment.records, dimension)?;
+        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+        let segment_vectors = load_vectors_or_empty(&segment.vectors, segment_external_ids.len())?;
+        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+        if segment_external_ids.len().saturating_mul(dimension) != segment_records.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "records and ids are not aligned",
+            ));
+        }
+        if segment_vectors.len() != segment_external_ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vector rows and ids are not aligned",
+            ));
+        }
+
+        for row_idx in (0..segment_external_ids.len()).rev() {
+            let external_id = segment_external_ids[row_idx];
+            if !shadowed_ids.insert(external_id) {
+                continue;
+            }
+            if tombstone.is_deleted(row_idx) {
+                continue;
+            }
+            let Some(vector) = segment_vectors[row_idx].get(field_name) else {
+                continue;
+            };
+            if vector.len() != dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "vector field '{}' dimension mismatch: expected {}, got {}",
+                        field_name,
+                        dimension,
+                        vector.len()
+                    ),
+                ));
+            }
+            records.extend_from_slice(vector);
             external_ids.push(external_id);
         }
     }
@@ -2176,6 +2341,7 @@ fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io
     Ok(())
 }
 
+#[cfg(feature = "knowhere-backend")]
 fn resolve_primary_vector_descriptor(
     collection_meta: &CollectionMetadata,
     index_catalog: &IndexCatalog,
@@ -2244,7 +2410,7 @@ fn build_optimized_ann_state(
     index_bytes_out: &mut Option<Vec<u8>>,
 ) -> io::Result<OptimizedAnnState> {
     let metric = state
-        .primary_index
+        .descriptor
         .metric
         .clone()
         .unwrap_or_else(|| state.metric.clone())
@@ -2272,7 +2438,7 @@ fn build_optimized_ann_state(
     };
 
     let mut backend = DefaultIndexFactory::default()
-        .create_vector_index(state.dimension, &state.primary_index, None)
+        .create_vector_index(state.dimension, &state.descriptor, None)
         .map_err(adapter_error_to_io)?;
     if !flat_vectors.is_empty() {
         backend

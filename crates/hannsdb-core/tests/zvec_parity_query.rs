@@ -314,6 +314,226 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
 }
 
 #[test]
+fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_typed_fast_path_with_ef_search(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_schema_indexed_fast_path");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema
+        .vectors
+        .push(VectorFieldSchema::new("title", 2).with_index_param(
+            hannsdb_core::document::VectorIndexSchema::hnsw(Some("l2"), 16, 128),
+        ));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![2.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0],
+                [("title".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("schema-indexed secondary vector fast path");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 3, 2]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 1.0, 2.0]
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_on_typed_fast_path_with_ef_search(
+) {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_descriptor_indexed_fast_path");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.create_vector_index(
+        "docs",
+        VectorIndexDescriptor {
+            field_name: "title".to_string(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some("l2".to_string()),
+            params: serde_json::json!({
+                "m": 16,
+                "ef_construction": 128,
+            }),
+        },
+    )
+    .expect("register descriptor-backed secondary vector index");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![2.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0_f32, 1.0],
+                [("title".to_string(), vec![1.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("descriptor-backed secondary vector fast path");
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 3, 2]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.distance).collect::<Vec<_>>(),
+        vec![0.0, 1.0, 2.0]
+    );
+}
+
+#[test]
+fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_field() {
+    let root = unique_temp_dir("hannsdb_typed_query_secondary_unindexed_ef_search");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let mut schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    schema.vectors.push(VectorFieldSchema::new("title", 2));
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![5.0_f32, 5.0],
+                [("title".to_string(), vec![0.0_f32, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+                [("title".to_string(), vec![2.0_f32, 0.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let err = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 2,
+                queries: vec![VectorQuery {
+                    field_name: "title".to_string(),
+                    vector: vec![0.0_f32, 0.0],
+                    param: Some(VectorQueryParam {
+                        ef_search: Some(64),
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect_err("unindexed secondary ef_search should remain unsupported");
+
+    assert_eq!(err.kind(), ErrorKind::Unsupported);
+    assert!(err.to_string().contains("ef_search"));
+}
+
+#[test]
 fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_bruteforce_path() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_vector_metric");
     let mut db = HannsDb::open(&root).expect("open db");
