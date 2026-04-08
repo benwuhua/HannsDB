@@ -81,7 +81,7 @@ class Doc:
     @classmethod
     def _from_native(cls, doc):
         vectors = _normalize_vectors(getattr(doc, "vectors", None))
-        field_name = next(iter(vectors), "dense")
+        field_name = str(getattr(doc, "field_name", next(iter(vectors), "dense")))
         return cls(
             id=getattr(doc, "id"),
             score=getattr(doc, "score", None),
@@ -156,6 +156,7 @@ class Doc:
     def _get_native(self):
         return _native_module.Doc(
             id=self.id,
+            field_name=self.field_name,
             fields=self.fields,
             score=self.score,
             vectors=self.vectors,

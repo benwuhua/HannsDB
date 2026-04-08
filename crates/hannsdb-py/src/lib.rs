@@ -132,6 +132,7 @@ pub struct Doc {
     pub score: Option<f32>,
     pub fields: BTreeMap<String, FieldValue>,
     pub vectors: BTreeMap<String, Vec<f32>>,
+    pub field_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -415,6 +416,7 @@ fn doc_from_core_document(document: CoreDocument, primary_vector_name: &str) -> 
         score: None,
         fields,
         vectors,
+        field_name: primary_vector_name.to_string(),
     }
 }
 
@@ -726,6 +728,7 @@ impl Collection {
                             score: Some(hit.distance),
                             fields: select_output_fields(&hit.fields, &output_fields),
                             vectors: BTreeMap::new(),
+                            field_name: self.primary_vector_name.clone(),
                         })
                         .collect()
                 });
@@ -746,6 +749,7 @@ impl Collection {
                     score: Some(hit.distance),
                     fields: BTreeMap::new(),
                     vectors: BTreeMap::new(),
+                    field_name: self.primary_vector_name.clone(),
                 })
                 .collect());
         }
@@ -762,6 +766,7 @@ impl Collection {
                 score: Some(hit.distance),
                 fields: select_output_fields(&document.fields, &output_fields),
                 vectors: BTreeMap::new(),
+                field_name: self.primary_vector_name.clone(),
             })
             .collect())
     }
@@ -780,6 +785,7 @@ impl Collection {
                 score: Some(hit.distance),
                 fields: hit.fields,
                 vectors: BTreeMap::new(),
+                field_name: self.primary_vector_name.clone(),
             })
             .collect())
     }
@@ -1370,15 +1376,29 @@ impl PyDoc {
             inner_vectors.insert(field_name.to_string(), vector);
         }
         Ok(Self {
-            inner: Doc {
-                id,
-                score,
-                fields: fields
-                    .as_ref()
-                    .map(py_dict_to_fields)
-                    .transpose()?
-                    .unwrap_or_default(),
-                vectors: inner_vectors,
+            inner: {
+                let field_name = if inner_vectors.is_empty() {
+                    field_name.to_string()
+                } else if inner_vectors.contains_key(field_name) {
+                    field_name.to_string()
+                } else {
+                    inner_vectors
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| field_name.to_string())
+                };
+                Doc {
+                    id,
+                    score,
+                    fields: fields
+                        .as_ref()
+                        .map(py_dict_to_fields)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    vectors: inner_vectors,
+                    field_name,
+                }
             },
         })
     }
@@ -1401,6 +1421,11 @@ impl PyDoc {
     #[getter]
     fn vectors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         vectors_to_py_dict(py, &self.inner.vectors)
+    }
+
+    #[getter]
+    fn field_name(&self) -> String {
+        self.inner.field_name.clone()
     }
 }
 
@@ -1591,6 +1616,7 @@ impl PyCollection {
                                 score: Some(score),
                                 fields: BTreeMap::new(),
                                 vectors: BTreeMap::new(),
+                                field_name: inner.primary_vector_name.clone(),
                             },
                         },
                     )
@@ -1628,6 +1654,7 @@ impl PyCollection {
                             score: Some(hit.distance),
                             fields: hit.fields,
                             vectors: BTreeMap::new(),
+                            field_name: inner.primary_vector_name.clone(),
                         },
                     },
                 )
@@ -1849,6 +1876,7 @@ mod tests {
                 .map(|(name, value)| (name.to_string(), value))
                 .collect(),
             vectors: [("dense".to_string(), vector)].into_iter().collect(),
+            field_name: "dense".to_string(),
         }
     }
 
@@ -1889,6 +1917,7 @@ mod tests {
             vectors: [("dense".to_string(), vec![0.0, 0.1, 0.2, 0.3])]
                 .into_iter()
                 .collect(),
+            field_name: "dense".to_string(),
         };
         let _query = VectorQuery {
             field_name: "dense".to_string(),

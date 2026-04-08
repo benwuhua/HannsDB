@@ -586,10 +586,13 @@ impl HannsDb {
         }
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
+        ensure_vector_rows(&paths.vectors, segment_meta.record_count)?;
         let inserted = append_records(&paths.records, collection_meta.dimension, vectors)?;
         let _ = append_record_ids(&paths.external_ids, external_ids)?;
         let empty_payloads = vec![BTreeMap::new(); inserted];
+        let empty_vectors = vec![BTreeMap::new(); inserted];
         let _ = append_payloads(&paths.payloads, &empty_payloads)?;
+        let _ = append_vectors(&paths.vectors, &empty_vectors)?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -1540,9 +1543,7 @@ impl WalReplayPlan {
                 } if !documents.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
                         plan.requires_data_files = true;
-                        if documents.iter().any(|document| !document.vectors.is_empty()) {
-                            plan.requires_vector_sidecar = true;
-                        }
+                        plan.requires_vector_sidecar = true;
                     }
                 }
                 WalRecord::UpsertDocuments {
@@ -1551,9 +1552,7 @@ impl WalReplayPlan {
                 } if !documents.is_empty() => {
                     if let Some(plan) = collections.get_mut(collection) {
                         plan.requires_data_files = true;
-                        if documents.iter().any(|document| !document.vectors.is_empty()) {
-                            plan.requires_vector_sidecar = true;
-                        }
+                        plan.requires_vector_sidecar = true;
                     }
                 }
                 WalRecord::Delete { collection, ids } if !ids.is_empty() => {
@@ -1765,6 +1764,18 @@ fn validate_documents(documents: &[Document], collection_meta: &CollectionMetada
                     "document vector dimension mismatch: expected {}, got {}",
                     collection_meta.dimension,
                     document.vector.len()
+                ),
+            ));
+        }
+        if document
+            .vectors
+            .contains_key(collection_meta.primary_vector.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "document secondary vectors cannot contain primary vector '{}'",
+                    collection_meta.primary_vector
                 ),
             ));
         }

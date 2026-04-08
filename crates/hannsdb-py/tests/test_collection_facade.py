@@ -187,6 +187,47 @@ def test_real_collection_insert_and_upsert_accept_single_vector_docs(tmp_path):
     collection.destroy()
 
 
+def test_real_collection_fetch_preserves_primary_field_name_for_legacy_replace(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="z_primary",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="a_secondary",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+            hannsdb.VectorSchema(
+                name="z_primary",
+                data_type="vector_fp32",
+                dimension=2,
+            ),
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    original = hannsdb.Doc(
+        id="1",
+        fields={"session_id": "abc"},
+        vectors={
+            "z_primary": [1.0, 2.0],
+            "a_secondary": [3.0, 4.0],
+        },
+    )
+    assert collection.insert([original]) == 1
+
+    fetched = collection.fetch(["1"])[0]
+    assert fetched.field_name == "z_primary"
+
+    updated = fetched._replace(vector=[9.0, 8.0])
+    assert collection.upsert([updated]) == 1
+    replayed = collection.fetch(["1"])[0]
+    assert replayed.vector("z_primary") == [9.0, 8.0]
+    assert replayed.vector("a_secondary") == [3.0, 4.0]
+
+    collection.destroy()
+
+
 def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_surface(
     tmp_path,
 ):
