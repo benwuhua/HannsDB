@@ -1235,22 +1235,20 @@ impl CollectionHandle {
     ) -> io::Result<Vec<SearchHit>> {
         let state = self.cached_search_state_for_field(field_name)?;
         let ef_search = ef_search.max(1);
-        if state.field_name == self.collection_primary_vector_name()? {
-            if let Some(optimized_ann) = state.optimized_ann.as_ref() {
-                let optimized_snapshot = (
-                    Arc::clone(&optimized_ann.backend),
-                    Arc::clone(&optimized_ann.ann_external_ids),
-                    optimized_ann.metric.clone(),
-                );
-                return ann_search(
-                    optimized_snapshot.0.as_ref(),
-                    optimized_snapshot.1.as_slice(),
-                    &optimized_snapshot.2,
-                    query,
-                    top_k,
-                    ef_search,
-                );
-            }
+        if let Some(optimized_ann) = state.optimized_ann.as_ref() {
+            let optimized_snapshot = (
+                Arc::clone(&optimized_ann.backend),
+                Arc::clone(&optimized_ann.ann_external_ids),
+                optimized_ann.metric.clone(),
+            );
+            return ann_search(
+                optimized_snapshot.0.as_ref(),
+                optimized_snapshot.1.as_slice(),
+                &optimized_snapshot.2,
+                query,
+                top_k,
+                ef_search,
+            );
         }
 
         search_by_metric(
@@ -1478,12 +1476,15 @@ impl CollectionHandle {
         }
 
         let primary_name = self.collection_primary_vector_name()?;
-        let state = if field_name == primary_name {
+        let mut state = if field_name == primary_name {
             self.try_load_persisted_ann_state()?
                 .unwrap_or(self.load_search_state_for_field(field_name)?)
         } else {
             self.load_search_state_for_field(field_name)?
         };
+        if field_name != primary_name {
+            attach_lazy_optimized_ann_for_secondary_field(&mut state)?;
+        }
 
         let mut cache = self
             .search_cache
@@ -1574,6 +1575,21 @@ impl CollectionHandle {
         *snapshot = version_set;
         Ok(())
     }
+}
+
+fn attach_lazy_optimized_ann_for_secondary_field(state: &mut CachedSearchState) -> io::Result<()> {
+    if state.optimized_ann.is_some()
+        || !matches!(
+            state.descriptor.kind,
+            VectorIndexKind::Hnsw | VectorIndexKind::Ivf
+        )
+    {
+        return Ok(());
+    }
+
+    let mut index_bytes = None;
+    state.optimized_ann = Some(build_optimized_ann_state(state, &mut index_bytes)?);
+    Ok(())
 }
 
 fn project_document_hits(hits: &mut [DocumentHit], output_fields: Option<&[String]>) {
