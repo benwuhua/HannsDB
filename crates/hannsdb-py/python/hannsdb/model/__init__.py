@@ -10,11 +10,12 @@ from .param import (
     QueryGroupBy,
     VectorQuery,
 )
-from .schema import CollectionSchema, FieldSchema, VectorSchema
+from .schema import CollectionSchema, CollectionStats, FieldSchema, VectorSchema
 
 __all__ = [
     "Collection",
     "CollectionSchema",
+    "CollectionStats",
     "CollectionOption",
     "Doc",
     "FieldSchema",
