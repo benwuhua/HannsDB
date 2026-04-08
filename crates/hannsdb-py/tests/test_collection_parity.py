@@ -60,5 +60,6 @@ def test_star_import_exposes_native_and_facade_symbols():
         "QueryExecutorFactory",
         "QueryGroupBy",
         "RrfReRanker",
+        "WeightedReRanker",
     ]:
         assert name in namespace

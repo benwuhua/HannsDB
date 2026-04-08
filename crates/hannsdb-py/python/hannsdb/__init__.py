@@ -3,7 +3,7 @@ from ._native import *  # noqa: F401,F403
 from . import typing as typing
 from .typing import DataType, LogLevel, MetricType, QuantizeType
 from .executor import QueryExecutorFactory
-from .extension import ReRanker, RrfReRanker
+from .extension import ReRanker, RrfReRanker, WeightedReRanker
 from .model import (
     Collection,
     CollectionSchema,
@@ -39,6 +39,7 @@ _facade_exports = [
     "MetricType",
     "ReRanker",
     "RrfReRanker",
+    "WeightedReRanker",
     "IVFIndexParam",
     "QuantizeType",
     "VectorQuery",

@@ -245,6 +245,46 @@ def test_reranker_constructors_validate_arguments():
         hannsdb.RrfReRanker(topn="2")
     with pytest.raises(TypeError, match="rank_constant"):
         hannsdb.RrfReRanker(rank_constant="60")
+    with pytest.raises(ValueError, match="topn"):
+        hannsdb.WeightedReRanker(topn=-1)
+    with pytest.raises(ValueError, match="metric"):
+        hannsdb.WeightedReRanker(metric="euclidean")
+    with pytest.raises(TypeError, match="weights"):
+        hannsdb.WeightedReRanker(weights=["dense"])
+    with pytest.raises(TypeError, match="weights"):
+        hannsdb.WeightedReRanker(weights={"dense": "1.0"})
+    with pytest.raises(TypeError, match="weights"):
+        hannsdb.WeightedReRanker(weights={1: 1.0})
+
+
+def test_weighted_reranker_combines_normalized_scores_by_field_weight():
+    reranker = hannsdb.WeightedReRanker(
+        topn=3,
+        metric=hannsdb.MetricType.L2,
+        weights={"dense": 2.0},
+    )
+
+    query_results = {
+        "dense": [
+            hannsdb.Doc(id="a", score=0.0, fields={"source": "dense"}),
+            hannsdb.Doc(id="b", score=1.0, fields={"source": "dense"}),
+        ],
+        "title": [
+            hannsdb.Doc(id="a", score=0.5, fields={"source": "title"}),
+            hannsdb.Doc(id="c", score=0.1, fields={"source": "title"}),
+        ],
+    }
+
+    hits = reranker.rerank(query_results)
+
+    def normalize_l2(score):
+        return 1.0 - 2.0 * math.atan(score) / math.pi
+
+    assert [hit.id for hit in hits] == ["a", "b", "c"]
+    assert hits[0] is not query_results["dense"][0]
+    assert hits[0].score == pytest.approx(2.0 * normalize_l2(0.0) + normalize_l2(0.5))
+    assert hits[1].score == pytest.approx(2.0 * normalize_l2(1.0))
+    assert hits[2].score == pytest.approx(normalize_l2(0.1))
 
 
 def test_query_executor_factory_exposes_create_method():
@@ -374,6 +414,30 @@ def test_query_executor_supports_builtin_rrf_reranker(tmp_path, monkeypatch):
     assert [hit.id for hit in hits] == ["2", "1", "3"]
     assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
     assert proxy.max_active == 1
+
+
+def test_query_executor_supports_weighted_reranker(tmp_path):
+    collection, schema = build_secondary_vector_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="title", vector=[0.0, 0.0], param=None),
+        ],
+        reranker=hannsdb.WeightedReRanker(
+            topn=3,
+            metric=hannsdb.MetricType.L2,
+            weights={"dense": 2.0},
+        ),
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["2", "3", "1"]
+    assert [hit.fields["group"] for hit in hits] == [1, 2, 1]
 
 
 def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
