@@ -430,6 +430,34 @@ fn collection_api_delete_masks_results() {
 }
 
 #[test]
+fn collection_api_delete_ignores_stale_trailing_ids_beyond_record_count() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_stale_trailing_ids");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[42, 84], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    let ids_path = root.join("collections").join("docs").join("ids.bin");
+    let _ = append_record_ids(&ids_path, &[42]).expect("append stale trailing id");
+
+    let deleted = db.delete("docs", &[42]).expect("delete one id");
+    assert_eq!(deleted, 1);
+
+    let info = db.get_collection_info("docs").expect("collection info");
+    assert_eq!(info.record_count, 2);
+    assert_eq!(info.deleted_count, 1);
+    assert_eq!(info.live_count, 1);
+
+    let tombstones = TombstoneMask::load_from_path(
+        &root.join("collections").join("docs").join("tombstones.json"),
+    )
+    .expect("load tombstones");
+    assert!(tombstones.is_deleted(0), "real in-range row 42 must be deleted");
+    assert!(!tombstones.is_deleted(1), "row 84 must remain live");
+}
+
+#[test]
 fn collection_api_reopen_recovery() {
     let root = unique_temp_dir("hannsdb_collection_api_reopen");
     {

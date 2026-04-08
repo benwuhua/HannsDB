@@ -785,10 +785,12 @@ impl HannsDb {
             let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
             let mut segment_changed = false;
+            let row_limit = segment_meta.record_count.min(stored_ids.len());
+            let stored_ids = &stored_ids[..row_limit];
             let ids_to_check = remaining_ids.iter().copied().collect::<Vec<_>>();
 
             for external_id in ids_to_check {
-                let Some(row_idx) = latest_row_index_for_id(&stored_ids, external_id) else {
+                let Some(row_idx) = latest_row_index_for_id(stored_ids, external_id) else {
                     continue;
                 };
                 remaining_ids.remove(&external_id);
