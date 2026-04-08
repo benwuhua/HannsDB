@@ -412,6 +412,89 @@ def test_real_collection_query_accepts_legacy_kwargs_with_query_by_id_and_output
     collection.destroy()
 
 
+def test_real_collection_query_accepts_legacy_kwargs_with_multiple_queries_and_output_fields(
+    tmp_path,
+):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="tag", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="11",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "tag": "shared"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="12",
+            vector=[-0.05, 0.06],
+            field_name="dense",
+            fields={"group": 1, "tag": "q1-only"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="13",
+            vector=[0.05, 0.06],
+            field_name="dense",
+            fields={"group": 2, "tag": "q2-only"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="14",
+            vector=[-0.05, 0.07],
+            field_name="dense",
+            fields={"group": 1, "tag": "q1-distractor"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="15",
+            vector=[0.05, 0.07],
+            field_name="dense",
+            fields={"group": 2, "tag": "q2-distractor"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    result = collection.query(
+        vectors=[
+            hannsdb.VectorQuery(field_name="dense", vector=[-0.05, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.05, 0.0], param=None),
+        ],
+        output_fields=["group"],
+        topk=3,
+        filter="",
+    )
+
+    assert len(result) == 3
+    assert result[0].id == "11"
+    assert {doc.id for doc in result} == {"11", "12", "13"}
+    assert len({doc.id for doc in result}) == len(result)
+    assert "14" not in {doc.id for doc in result}
+    assert "15" not in {doc.id for doc in result}
+    assert sorted(doc.field("group") for doc in result) == [1, 1, 2]
+    assert all(doc.fields == {"group": doc.field("group")} for doc in result)
+    assert all(not doc.has_field("tag") for doc in result)
+    assert result[0].score < result[1].score
+    assert result[0].score < result[2].score
+
+    collection.destroy()
+
+
 def test_real_collection_query_context_merges_multiple_queries_and_projects_output_fields(
     tmp_path,
 ):
