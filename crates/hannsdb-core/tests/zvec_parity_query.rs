@@ -1003,6 +1003,128 @@ fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_
 }
 
 #[test]
+fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_queries() {
+    let root = unique_temp_dir("hannsdb_typed_query_ground_truth");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                11,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                12,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![1.0_f32, 0.0],
+            ),
+            Document::new(
+                13,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.0_f32, 1.0],
+            ),
+            Document::new(
+                14,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![1.0_f32, 1.0],
+            ),
+            Document::new(
+                15,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![2.0_f32, 0.0],
+            ),
+            Document::new(
+                16,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![10.0_f32, 10.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    let query = vec![0.0_f32, 0.0];
+    let hits = db
+        .query_with_context(
+            "docs",
+            &QueryContext {
+                top_k: 3,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: query.clone(),
+                    param: None,
+                }],
+                query_by_id: None,
+                filter: Some("group == 1".to_string()),
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+            },
+        )
+        .expect("typed filtered query");
+
+    let mut expected = vec![
+        (
+            11_i64,
+            l2_distance(&query, &[0.0_f32, 0.0]),
+        ),
+        (
+            12_i64,
+            l2_distance(&query, &[1.0_f32, 0.0]),
+        ),
+        (
+            14_i64,
+            l2_distance(&query, &[1.0_f32, 1.0]),
+        ),
+    ];
+    expected.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    assert_eq!(hits.len(), expected.len());
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+    for (hit, (_, expected_distance)) in hits.iter().zip(expected.iter()) {
+        assert!(
+            (hit.distance - expected_distance).abs() < 1e-6,
+            "distance mismatch for id {}: expected {}, got {}",
+            hit.id,
+            expected_distance,
+            hit.distance
+        );
+        assert_eq!(
+            hit.fields.get("group"),
+            Some(&FieldValue::Int64(1)),
+            "filtered typed query should only return group == 1 rows"
+        );
+    }
+}
+
+fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let delta = x - y;
+            delta * delta
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
+#[test]
 fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
     let root = unique_temp_dir("hannsdb_typed_query_output_fields");
     let mut db = HannsDb::open(&root).expect("open db");
