@@ -10,7 +10,7 @@ __all__ = ["HnswIndexParam", "IVFIndexParam", "HnswQueryParam"]
 def _normalize_text(name, value):
     if value is None:
         return None
-    if type(value) is not str:
+    if not isinstance(value, str):
         raise TypeError(f"{name} must be a string or None")
     return value.strip().lower()
 
