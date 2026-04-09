@@ -538,9 +538,10 @@ async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
         .await
         .expect("read delete body");
     let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    let error = json["error"].as_str().expect("daemon error string");
     assert!(
-        json.get("error").is_some(),
-        "daemon error envelope should be returned"
+        error.contains("docs_does_not_exist_123"),
+        "error text should mention the missing collection"
     );
 }
 

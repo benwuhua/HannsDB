@@ -547,7 +547,7 @@ async fn delete_records_by_filter(
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: error.to_string(),
+                error: format!("collection not found: {collection}"),
             }),
         )
             .into_response(),
