@@ -55,6 +55,7 @@ pub struct DeleteRecordsRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteByFilterRequest {
     pub filter: String,
 }

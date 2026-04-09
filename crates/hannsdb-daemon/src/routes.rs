@@ -530,11 +530,8 @@ async fn delete_records_by_filter(
         }
     };
 
-    let result = state
-        .db
-        .lock()
-        .expect("daemon state mutex poisoned")
-        .delete_by_filter(&collection, &request.filter);
+    let mut db = state.db.lock().expect("daemon state mutex poisoned");
+    let result = db.delete_by_filter(&collection, &request.filter);
 
     match result {
         Ok(deleted) => (
@@ -544,13 +541,30 @@ async fn delete_records_by_filter(
             }),
         )
             .into_response(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("collection not found: {collection}"),
-            }),
-        )
-            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let collection_missing = db
+                .list_collections()
+                .map(|collections| !collections.iter().any(|name| name == &collection))
+                .unwrap_or(false);
+
+            if collection_missing {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("collection not found: {collection}"),
+                    }),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: error.to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {

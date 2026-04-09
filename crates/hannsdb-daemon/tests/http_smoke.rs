@@ -736,6 +736,41 @@ async fn delete_by_filter_route_returns_bad_request_for_missing_filter_field() {
 }
 
 #[tokio::test]
+async fn delete_by_filter_route_rejects_unknown_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "filter": "group == 1",
+                        "ids": ["42"],
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(
+        json.get("error").is_some(),
+        "daemon error envelope should be returned"
+    );
+}
+
+#[tokio::test]
 async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
@@ -761,6 +796,44 @@ async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
     assert!(
         error.contains("docs_does_not_exist_123"),
         "error text should mention the missing collection"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_internal_error_for_corrupted_collection_state() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    fs::remove_file(tempdir.path().join("wal.jsonl")).expect("remove wal");
+    fs::remove_file(
+        tempdir
+            .path()
+            .join("collections")
+            .join("docs")
+            .join("collection.json"),
+    )
+    .expect("remove collection metadata");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(
+        json.get("error").is_some(),
+        "daemon error envelope should be returned"
     );
 }
 
