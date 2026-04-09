@@ -788,6 +788,13 @@ fn search_records_typed(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
+    if request.include_vector {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "include_vector is not supported for typed search",
+        ));
+    }
+
     let include_fields =
         matches!(request.output_fields.as_deref(), Some(fields) if !fields.is_empty());
     let context = build_query_context(request)?;
