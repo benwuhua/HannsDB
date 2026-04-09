@@ -80,6 +80,13 @@ In `crates/hannsdb-daemon/src/routes.rs` add a handler that:
 
 The daemon must not parse or reinterpret the filter on its own. Core remains the only source of truth for filter syntax and latest-live delete semantics.
 
+The status mapping depends on the existing core contract:
+
+- `db.delete_by_filter(...)` must surface invalid filter syntax as `io::ErrorKind::InvalidInput`
+- `db.delete_by_filter(...)` must surface missing collection as `io::ErrorKind::NotFound`
+
+This slice only transports those semantics over HTTP; it does not define a second validation model.
+
 ## Error Semantics
 
 Return codes should follow existing daemon conventions:
@@ -89,11 +96,17 @@ Return codes should follow existing daemon conventions:
 - `404 NOT_FOUND` when the collection does not exist
 - `500 INTERNAL_SERVER_ERROR` for other I/O or internal failures
 
+Malformed JSON and missing required `filter` field should also return `400 BAD_REQUEST`.
+
+An empty or whitespace-only `filter` string is treated as invalid input and should therefore also return `400 BAD_REQUEST`. The daemon does not need its own filter parser for this; it may rely on the same core validation path as other invalid filter strings.
+
 All error responses continue using:
 
 ```json
 { "error": "..." }
 ```
+
+Unlike the existing plain `Json<T>` mutation routes, this slice should explicitly wrap JSON extractor failures into the daemon `ErrorResponse` envelope instead of leaving axum's default rejection body in place. That keeps malformed request handling aligned with the custom error shape already used by daemon search.
 
 ## Correctness Requirements
 
@@ -110,8 +123,10 @@ Add `http_smoke` coverage for:
 1. positive delete-by-filter on a real collection
 2. repeated delete-by-filter returning `deleted: 0`
 3. invalid filter returning `400` with daemon error envelope
-4. missing collection returning `404`
-5. a latest-live / shadowing scenario on multi-version data, to prove the daemon transport is delegating to the same core semantics rather than applying a flat-layout delete
+4. malformed JSON or missing `filter` field returning `400` with daemon error envelope
+5. missing collection returning `404`
+6. a latest-live / shadowing scenario on multi-version data, to prove the daemon transport is delegating to the same core semantics rather than applying a flat-layout delete
+7. explicit regression coverage that the existing `DELETE /collections/:collection/records` delete-by-id route still behaves unchanged
 
 ## Risks
 
