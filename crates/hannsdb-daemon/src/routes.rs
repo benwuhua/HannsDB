@@ -16,13 +16,13 @@ use hannsdb_core::query::{
 
 use crate::api::{
     CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
-    CreateCollectionResponse, CreateIndexResponse, DeleteRecordsRequest, DeleteRecordsResponse,
-    DropCollectionResponse, DropIndexResponse, ErrorResponse, FetchRecordResponse,
-    FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse, HealthResponse,
-    InsertRecordsRequest, InsertRecordsResponse, LegacySearchRequest, ListCollectionsResponse,
-    ScalarIndexRequest, ScalarIndexesResponse, SearchHitResponse, SearchRequest, SearchResponse,
-    SegmentsResponse, TypedSearchRequest, UpsertRecordsResponse, VectorIndexRequest,
-    VectorIndexesResponse,
+    CreateCollectionResponse, CreateIndexResponse, DeleteByFilterRequest, DeleteRecordsRequest,
+    DeleteRecordsResponse, DropCollectionResponse, DropIndexResponse, ErrorResponse,
+    FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse,
+    HealthResponse, InsertRecordsRequest, InsertRecordsResponse, LegacySearchRequest,
+    ListCollectionsResponse, ScalarIndexRequest, ScalarIndexesResponse, SearchHitResponse,
+    SearchRequest, SearchResponse, SegmentsResponse, TypedSearchRequest, UpsertRecordsResponse,
+    VectorIndexRequest, VectorIndexesResponse,
 };
 
 #[derive(Clone)]
@@ -62,6 +62,10 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
         .route(
             "/collections/:collection/records",
             post(insert_records).delete(delete_records),
+        )
+        .route(
+            "/collections/:collection/records/delete_by_filter",
+            post(delete_records_by_filter),
         )
         .route(
             "/collections/:collection/records/upsert",
@@ -475,6 +479,62 @@ async fn delete_records(
         .lock()
         .expect("daemon state mutex poisoned")
         .delete(&collection, &external_ids);
+
+    match result {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(DeleteRecordsResponse {
+                deleted: deleted as u64,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_records_by_filter(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    request: Result<Json<DeleteByFilterRequest>, JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: rejection.body_text(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .delete_by_filter(&collection, &request.filter);
 
     match result {
         Ok(deleted) => (

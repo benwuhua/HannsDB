@@ -54,6 +54,11 @@ pub struct DeleteRecordsRequest {
     pub ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DeleteByFilterRequest {
+    pub filter: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DeleteRecordsResponse {
     pub deleted: u64,
