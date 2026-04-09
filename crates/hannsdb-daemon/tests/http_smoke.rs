@@ -4,6 +4,9 @@ use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
 };
+use hannsdb_core::segment::{
+    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+};
 use hannsdb_daemon::routes::build_router;
 use serde_json::Value;
 use std::fs;
@@ -80,6 +83,149 @@ fn seed_delete_by_filter_collection(root: &std::path::Path) {
         ],
     )
     .expect("insert documents");
+}
+
+fn rewrite_collection_to_two_segment_layout(
+    root: &std::path::Path,
+    collection: &str,
+    dimension: usize,
+    second_segment_documents: &[Document],
+    deleted_second_segment_rows: &[usize],
+) {
+    let collection_dir = root.join("collections").join(collection);
+    let segments_dir = collection_dir.join("segments");
+    let seg1_dir = segments_dir.join("seg-0001");
+    let seg2_dir = segments_dir.join("seg-0002");
+    fs::create_dir_all(&seg1_dir).expect("create seg-0001 dir");
+    fs::create_dir_all(&seg2_dir).expect("create seg-0002 dir");
+
+    for file in [
+        "segment.json",
+        "records.bin",
+        "ids.bin",
+        "payloads.jsonl",
+        "tombstones.json",
+    ] {
+        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+    }
+
+    let mut ids = Vec::with_capacity(second_segment_documents.len());
+    let mut vectors = Vec::with_capacity(second_segment_documents.len() * dimension);
+    let mut payloads = Vec::with_capacity(second_segment_documents.len());
+    for document in second_segment_documents {
+        ids.push(document.id);
+        vectors.extend_from_slice(&document.vector);
+        payloads.push(document.fields.clone());
+    }
+
+    let inserted =
+        append_records(&seg2_dir.join("records.bin"), dimension, &vectors).expect("append records");
+    assert_eq!(inserted, second_segment_documents.len());
+    let _ = append_record_ids(&seg2_dir.join("ids.bin"), &ids).expect("append ids");
+    let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &payloads).expect("append payloads");
+
+    let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
+    for row_idx in deleted_second_segment_rows {
+        let marked = seg2_tombstone.mark_deleted(*row_idx);
+        assert!(marked, "row index must be valid in seg-0002 tombstone");
+    }
+    seg2_tombstone
+        .save_to_path(&seg2_dir.join("tombstones.json"))
+        .expect("save seg-0002 tombstones");
+
+    SegmentMetadata::new(
+        "seg-0002",
+        dimension,
+        second_segment_documents.len(),
+        seg2_tombstone.deleted_count(),
+    )
+    .save_to_path(&seg2_dir.join("segment.json"))
+    .expect("save seg-0002 metadata");
+
+    SegmentSet {
+        active_segment_id: "seg-0002".to_string(),
+        immutable_segment_ids: vec!["seg-0001".to_string()],
+    }
+    .save_to_path(&collection_dir.join("segment_set.json"))
+    .expect("save segment set");
+}
+
+fn seed_delete_by_filter_latest_live_shadowing_collection(root: &std::path::Path) {
+    let mut db = HannsDb::open(root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("version", FieldType::String),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                42,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("old-match".to_string()),
+                    ),
+                ],
+                vec![10.0, 10.0],
+            ),
+            Document::new(
+                43,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("stable-match".to_string()),
+                    ),
+                ],
+                vec![0.1, 0.0],
+            ),
+            Document::new(
+                44,
+                [
+                    ("group".to_string(), FieldValue::Int64(2)),
+                    (
+                        "version".to_string(),
+                        FieldValue::String("control".to_string()),
+                    ),
+                ],
+                vec![0.2, 0.0],
+            ),
+        ],
+    )
+    .expect("insert seg-0001 documents");
+
+    rewrite_collection_to_two_segment_layout(
+        root,
+        "docs",
+        2,
+        &[Document::new(
+            42,
+            [
+                ("group".to_string(), FieldValue::Int64(2)),
+                (
+                    "version".to_string(),
+                    FieldValue::String("latest-live".to_string()),
+                ),
+            ],
+            vec![0.0, 0.0],
+        )],
+        &[],
+    );
+
+    let wal_path = root.join("wal.jsonl");
+    if wal_path.exists() {
+        fs::remove_file(wal_path).expect("remove wal after segment rewrite");
+    }
 }
 
 #[tokio::test]
@@ -297,6 +443,77 @@ async fn delete_by_filter_route_deletes_matching_rows() {
     let documents = json["documents"].as_array().expect("documents array");
     assert_eq!(documents.len(), 1);
     assert_eq!(documents[0]["id"], "44");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_uses_latest_live_view() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_latest_live_shadowing_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::OK);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert_eq!(json["deleted"], 1);
+
+    let fetch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","43","44"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    let documents = json["documents"].as_array().expect("documents array");
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[0]["id"], "42");
+    assert_eq!(documents[0]["fields"]["group"], 2);
+    assert_eq!(documents[0]["fields"]["version"], "latest-live");
+    assert_eq!(documents[1]["id"], "44");
+
+    let second_delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send second delete-by-filter request");
+
+    assert_eq!(second_delete.status(), StatusCode::OK);
+    let body = to_bytes(second_delete.into_body(), usize::MAX)
+        .await
+        .expect("read second delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse second delete json");
+    assert_eq!(json["deleted"], 0);
 }
 
 #[tokio::test]
