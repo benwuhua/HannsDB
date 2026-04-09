@@ -85,7 +85,9 @@ fn seed_delete_by_filter_collection(root: &std::path::Path) {
     .expect("insert documents");
 }
 
-fn rewrite_collection_to_two_segment_layout(
+// This rewrite only supports the scalar-only layout used by the latest-live
+// delete_by_filter smoke fixture below.
+fn rewrite_delete_by_filter_latest_live_scalar_fixture_to_two_segments(
     root: &std::path::Path,
     collection: &str,
     dimension: usize,
@@ -204,7 +206,7 @@ fn seed_delete_by_filter_latest_live_shadowing_collection(root: &std::path::Path
     )
     .expect("insert seg-0001 documents");
 
-    rewrite_collection_to_two_segment_layout(
+    rewrite_delete_by_filter_latest_live_scalar_fixture_to_two_segments(
         root,
         "docs",
         2,
