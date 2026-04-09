@@ -1307,6 +1307,10 @@ fn parse_daemon_field_type(value: &str) -> Result<FieldType, String> {
     match value.to_ascii_lowercase().as_str() {
         "string" => Ok(FieldType::String),
         "int64" => Ok(FieldType::Int64),
+        "int32" => Ok(FieldType::Int32),
+        "uint32" => Ok(FieldType::UInt32),
+        "uint64" => Ok(FieldType::UInt64),
+        "float" => Ok(FieldType::Float),
         "float64" => Ok(FieldType::Float64),
         "bool" => Ok(FieldType::Bool),
         other => Err(format!("unsupported data type: {other}")),
@@ -1361,11 +1365,26 @@ fn json_value_to_field_value(value: serde_json::Value) -> Result<FieldValue, Str
     match value {
         serde_json::Value::String(value) => Ok(FieldValue::String(value)),
         serde_json::Value::Bool(value) => Ok(FieldValue::Bool(value)),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(FieldValue::Int64)
-            .or_else(|| value.as_f64().map(FieldValue::Float64))
-            .ok_or_else(|| "unsupported numeric field value".to_string()),
+        serde_json::Value::Number(value) => {
+            // Try integer types first (narrowest to widest), then floats.
+            if let Some(v) = value.as_i64() {
+                if let Ok(v32) = i32::try_from(v) {
+                    Ok(FieldValue::Int32(v32))
+                } else {
+                    Ok(FieldValue::Int64(v))
+                }
+            } else if let Some(v) = value.as_u64() {
+                if let Ok(v32) = u32::try_from(v) {
+                    Ok(FieldValue::UInt32(v32))
+                } else {
+                    Ok(FieldValue::UInt64(v))
+                }
+            } else if let Some(v) = value.as_f64() {
+                Ok(FieldValue::Float64(v))
+            } else {
+                Err("unsupported numeric field value".to_string())
+            }
+        }
         other => Err(format!("unsupported field value: {other}")),
     }
 }
@@ -1435,6 +1454,8 @@ fn build_query_context(request: TypedSearchRequest) -> io::Result<QueryContext> 
         include_vector: request.include_vector,
         group_by: request.group_by.map(|group_by| QueryGroupBy {
             field_name: group_by.field_name,
+            group_topk: group_by.group_topk.unwrap_or(0),
+            group_count: group_by.group_count.unwrap_or(0),
         }),
         reranker: request.reranker.and_then(|reranker| {
             // Map daemon reranker request to core QueryReranker enum.
@@ -1456,6 +1477,13 @@ fn field_value_to_json(value: FieldValue) -> serde_json::Value {
     match value {
         FieldValue::String(value) => serde_json::Value::String(value),
         FieldValue::Int64(value) => serde_json::Value::Number(value.into()),
+        FieldValue::Int32(value) => serde_json::Value::Number(value.into()),
+        FieldValue::UInt32(value) => serde_json::Value::Number(value.into()),
+        FieldValue::UInt64(value) => serde_json::Value::Number(value.into()),
+        FieldValue::Float(value) => serde_json::Value::Number(
+            serde_json::Number::from_f64(value as f64)
+                .expect("finite float field values should serialize"),
+        ),
         FieldValue::Float64(value) => serde_json::Value::Number(
             serde_json::Number::from_f64(value)
                 .expect("finite float field values should serialize"),

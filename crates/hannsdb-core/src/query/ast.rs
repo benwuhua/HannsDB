@@ -42,6 +42,8 @@ pub struct VectorQueryParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryGroupBy {
     pub field_name: String,
+    pub group_topk: usize,
+    pub group_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

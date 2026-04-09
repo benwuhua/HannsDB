@@ -501,8 +501,18 @@ fn parse_value(input: &str) -> io::Result<FieldValue> {
         _ => {}
     }
 
+    // Try integer types in order of narrowest to widest.
+    if let Ok(value) = input.parse::<i32>() {
+        return Ok(FieldValue::Int32(value));
+    }
     if let Ok(value) = input.parse::<i64>() {
         return Ok(FieldValue::Int64(value));
+    }
+    if let Ok(value) = input.parse::<u64>() {
+        return Ok(FieldValue::UInt64(value));
+    }
+    if let Ok(value) = input.parse::<f32>() {
+        return Ok(FieldValue::Float(value));
     }
     if let Ok(value) = input.parse::<f64>() {
         return Ok(FieldValue::Float64(value));
@@ -514,26 +524,73 @@ fn parse_value(input: &str) -> io::Result<FieldValue> {
     ))
 }
 
+/// Promote any numeric FieldValue to f64 for cross-type comparison.
+fn to_f64(value: &FieldValue) -> Option<f64> {
+    match value {
+        FieldValue::Int64(v) => Some(*v as f64),
+        FieldValue::Int32(v) => Some(*v as f64),
+        FieldValue::UInt32(v) => Some(*v as f64),
+        FieldValue::UInt64(v) => Some(*v as f64),
+        FieldValue::Float(v) => Some(*v as f64),
+        FieldValue::Float64(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Promote any integer FieldValue to i64 for cross-type integer comparison.
+fn to_i64(value: &FieldValue) -> Option<i64> {
+    match value {
+        FieldValue::Int64(v) => Some(*v),
+        FieldValue::Int32(v) => Some(*v as i64),
+        FieldValue::UInt32(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
 fn values_equal(left: &FieldValue, right: &FieldValue) -> bool {
     match (left, right) {
         (FieldValue::String(a), FieldValue::String(b)) => a == b,
         (FieldValue::Bool(a), FieldValue::Bool(b)) => a == b,
+        // Same-type numeric equality
         (FieldValue::Int64(a), FieldValue::Int64(b)) => a == b,
+        (FieldValue::Int32(a), FieldValue::Int32(b)) => a == b,
+        (FieldValue::UInt32(a), FieldValue::UInt32(b)) => a == b,
+        (FieldValue::UInt64(a), FieldValue::UInt64(b)) => a == b,
+        (FieldValue::Float(a), FieldValue::Float(b)) => a == b,
         (FieldValue::Float64(a), FieldValue::Float64(b)) => a == b,
-        (FieldValue::Int64(a), FieldValue::Float64(b)) => (*a as f64) == *b,
-        (FieldValue::Float64(a), FieldValue::Int64(b)) => *a == (*b as f64),
-        _ => false,
+        // Cross-type: try exact integer comparison first, then fall back to f64
+        _ => {
+            if let (Some(a), Some(b)) = (to_i64(left), to_i64(right)) {
+                return a == b;
+            }
+            if let (Some(a), Some(b)) = (to_f64(left), to_f64(right)) {
+                return a == b;
+            }
+            false
+        }
     }
 }
 
 fn compare_values(left: &FieldValue, right: &FieldValue) -> Option<Ordering> {
     match (left, right) {
         (FieldValue::String(a), FieldValue::String(b)) => Some(a.cmp(b)),
+        // Same-type numeric comparisons
         (FieldValue::Int64(a), FieldValue::Int64(b)) => Some(a.cmp(b)),
+        (FieldValue::Int32(a), FieldValue::Int32(b)) => Some(a.cmp(b)),
+        (FieldValue::UInt32(a), FieldValue::UInt32(b)) => Some(a.cmp(b)),
+        (FieldValue::UInt64(a), FieldValue::UInt64(b)) => Some(a.cmp(b)),
+        (FieldValue::Float(a), FieldValue::Float(b)) => a.partial_cmp(b),
         (FieldValue::Float64(a), FieldValue::Float64(b)) => a.partial_cmp(b),
-        (FieldValue::Int64(a), FieldValue::Float64(b)) => (*a as f64).partial_cmp(b),
-        (FieldValue::Float64(a), FieldValue::Int64(b)) => a.partial_cmp(&(*b as f64)),
-        _ => None,
+        // Cross-type: try exact integer comparison first, then fall back to f64
+        _ => {
+            if let (Some(a), Some(b)) = (to_i64(left), to_i64(right)) {
+                return Some(a.cmp(&b));
+            }
+            if let (Some(a), Some(b)) = (to_f64(left), to_f64(right)) {
+                return a.partial_cmp(&b);
+            }
+            None
+        }
     }
 }
 

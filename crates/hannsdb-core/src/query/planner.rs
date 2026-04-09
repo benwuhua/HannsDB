@@ -59,6 +59,8 @@ impl PlannedRecallSource {
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedGroupBy {
     pub(crate) field_name: String,
+    pub(crate) group_topk: usize,
+    pub(crate) group_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +469,8 @@ fn validate_group_by(
         }
         return Ok(PlannedGroupBy {
             field_name: field_name.to_string(),
+            group_topk: group_by.group_topk,
+            group_count: group_by.group_count,
         });
     }
 

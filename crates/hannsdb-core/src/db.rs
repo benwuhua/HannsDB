@@ -2444,6 +2444,10 @@ fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
     match value {
         FieldValue::String(s) => ScalarValue::String(s.clone()),
         FieldValue::Int64(v) => ScalarValue::Int64(*v),
+        FieldValue::Int32(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::UInt32(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::UInt64(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::Float(v) => ScalarValue::Float64(*v as f64),
         FieldValue::Float64(v) => ScalarValue::Float64(*v),
         FieldValue::Bool(b) => ScalarValue::Bool(*b),
     }

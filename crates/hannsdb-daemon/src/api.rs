@@ -124,6 +124,10 @@ pub struct TypedVectorQueryParamRequest {
 #[serde(deny_unknown_fields)]
 pub struct TypedQueryGroupByRequest {
     pub field_name: String,
+    #[serde(default)]
+    pub group_topk: Option<usize>,
+    #[serde(default)]
+    pub group_count: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]

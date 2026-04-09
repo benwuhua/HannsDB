@@ -17,6 +17,10 @@ use crate::descriptor::ScalarIndexDescriptor;
 pub enum ScalarValue {
     String(String),
     Int64(i64),
+    Int32(i32),
+    UInt32(u32),
+    UInt64(u64),
+    Float(f32),
     Float64(f64),
     Bool(bool),
 }
@@ -62,6 +66,26 @@ impl Ord for OrderedF64 {
 // InvertedScalarIndex
 // ---------------------------------------------------------------------------
 
+/// OrderedF32 -- total-order wrapper for f32 so it can be used in BTreeMap
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderedF32(pub f32);
+
+impl Eq for OrderedF32 {}
+
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvertedScalarIndex {
     String {
@@ -71,6 +95,22 @@ pub enum InvertedScalarIndex {
     Int64 {
         descriptor: ScalarIndexDescriptor,
         entries: BTreeMap<i64, BTreeSet<i64>>,
+    },
+    Int32 {
+        descriptor: ScalarIndexDescriptor,
+        entries: BTreeMap<i32, BTreeSet<i64>>,
+    },
+    UInt32 {
+        descriptor: ScalarIndexDescriptor,
+        entries: BTreeMap<u32, BTreeSet<i64>>,
+    },
+    UInt64 {
+        descriptor: ScalarIndexDescriptor,
+        entries: BTreeMap<u64, BTreeSet<i64>>,
+    },
+    Float {
+        descriptor: ScalarIndexDescriptor,
+        entries: BTreeMap<OrderedF32, BTreeSet<i64>>,
     },
     Float64 {
         descriptor: ScalarIndexDescriptor,
@@ -117,6 +157,10 @@ impl InvertedScalarIndex {
         let field_type = match first_value {
             Some(ScalarValue::String(_)) => "string",
             Some(ScalarValue::Int64(_)) => "int64",
+            Some(ScalarValue::Int32(_)) => "int32",
+            Some(ScalarValue::UInt32(_)) => "uint32",
+            Some(ScalarValue::UInt64(_)) => "uint64",
+            Some(ScalarValue::Float(_)) => "float",
             Some(ScalarValue::Float64(_)) => "float64",
             Some(ScalarValue::Bool(_)) => "bool",
             None => return Self::Empty { descriptor },
@@ -140,6 +184,45 @@ impl InvertedScalarIndex {
                     }
                 }
                 Self::Int64 { descriptor, entries }
+            }
+            "int32" => {
+                let mut entries: BTreeMap<i32, BTreeSet<i64>> = BTreeMap::new();
+                for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                    if let Some(ScalarValue::Int32(v)) = payload.get(field_name) {
+                        entries.entry(*v).or_default().insert(ext_id);
+                    }
+                }
+                Self::Int32 { descriptor, entries }
+            }
+            "uint32" => {
+                let mut entries: BTreeMap<u32, BTreeSet<i64>> = BTreeMap::new();
+                for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                    if let Some(ScalarValue::UInt32(v)) = payload.get(field_name) {
+                        entries.entry(*v).or_default().insert(ext_id);
+                    }
+                }
+                Self::UInt32 { descriptor, entries }
+            }
+            "uint64" => {
+                let mut entries: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
+                for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                    if let Some(ScalarValue::UInt64(v)) = payload.get(field_name) {
+                        entries.entry(*v).or_default().insert(ext_id);
+                    }
+                }
+                Self::UInt64 { descriptor, entries }
+            }
+            "float" => {
+                let mut entries: BTreeMap<OrderedF32, BTreeSet<i64>> = BTreeMap::new();
+                for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                    if let Some(ScalarValue::Float(v)) = payload.get(field_name) {
+                        entries
+                            .entry(OrderedF32(*v))
+                            .or_default()
+                            .insert(ext_id);
+                    }
+                }
+                Self::Float { descriptor, entries }
             }
             "float64" => {
                 let mut entries: BTreeMap<OrderedF64, BTreeSet<i64>> = BTreeMap::new();
@@ -192,6 +275,37 @@ impl InvertedScalarIndex {
             InvertedScalarIndex::Int64 { entries, .. } => {
                 if let ScalarValue::Int64(v) = value {
                     entries.get(v).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::Int32 { entries, .. } => {
+                if let ScalarValue::Int32(v) = value {
+                    entries.get(v).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::UInt32 { entries, .. } => {
+                if let ScalarValue::UInt32(v) = value {
+                    entries.get(v).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::UInt64 { entries, .. } => {
+                if let ScalarValue::UInt64(v) = value {
+                    entries.get(v).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::Float { entries, .. } => {
+                if let ScalarValue::Float(v) = value {
+                    entries
+                        .get(&OrderedF32(*v))
+                        .cloned()
+                        .unwrap_or_default()
                 } else {
                     BTreeSet::new()
                 }
@@ -254,6 +368,79 @@ impl InvertedScalarIndex {
                     BTreeSet::new()
                 }
             }
+            InvertedScalarIndex::Int32 { entries, .. } => {
+                if let ScalarValue::Int32(v) = value {
+                    let range = match op {
+                        RangeOp::Gt => entries.range((Bound::Excluded(*v), Bound::Unbounded)),
+                        RangeOp::Gte => entries.range((Bound::Included(*v), Bound::Unbounded)),
+                        RangeOp::Lt => entries.range((Bound::Unbounded, Bound::Excluded(*v))),
+                        RangeOp::Lte => entries.range((Bound::Unbounded, Bound::Included(*v))),
+                        _ => unreachable!("Eq and Ne handled above"),
+                    };
+                    let mut result = BTreeSet::new();
+                    for (_, ids) in range {
+                        result.extend(ids.iter().cloned());
+                    }
+                    result
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::UInt32 { entries, .. } => {
+                if let ScalarValue::UInt32(v) = value {
+                    let range = match op {
+                        RangeOp::Gt => entries.range((Bound::Excluded(*v), Bound::Unbounded)),
+                        RangeOp::Gte => entries.range((Bound::Included(*v), Bound::Unbounded)),
+                        RangeOp::Lt => entries.range((Bound::Unbounded, Bound::Excluded(*v))),
+                        RangeOp::Lte => entries.range((Bound::Unbounded, Bound::Included(*v))),
+                        _ => unreachable!("Eq and Ne handled above"),
+                    };
+                    let mut result = BTreeSet::new();
+                    for (_, ids) in range {
+                        result.extend(ids.iter().cloned());
+                    }
+                    result
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::UInt64 { entries, .. } => {
+                if let ScalarValue::UInt64(v) = value {
+                    let range = match op {
+                        RangeOp::Gt => entries.range((Bound::Excluded(*v), Bound::Unbounded)),
+                        RangeOp::Gte => entries.range((Bound::Included(*v), Bound::Unbounded)),
+                        RangeOp::Lt => entries.range((Bound::Unbounded, Bound::Excluded(*v))),
+                        RangeOp::Lte => entries.range((Bound::Unbounded, Bound::Included(*v))),
+                        _ => unreachable!("Eq and Ne handled above"),
+                    };
+                    let mut result = BTreeSet::new();
+                    for (_, ids) in range {
+                        result.extend(ids.iter().cloned());
+                    }
+                    result
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::Float { entries, .. } => {
+                if let ScalarValue::Float(v) = value {
+                    let key = OrderedF32(*v);
+                    let range = match op {
+                        RangeOp::Gt => entries.range((Bound::Excluded(key), Bound::Unbounded)),
+                        RangeOp::Gte => entries.range((Bound::Included(key), Bound::Unbounded)),
+                        RangeOp::Lt => entries.range((Bound::Unbounded, Bound::Excluded(key))),
+                        RangeOp::Lte => entries.range((Bound::Unbounded, Bound::Included(key))),
+                        _ => unreachable!("Eq and Ne handled above"),
+                    };
+                    let mut result = BTreeSet::new();
+                    for (_, ids) in range {
+                        result.extend(ids.iter().cloned());
+                    }
+                    result
+                } else {
+                    BTreeSet::new()
+                }
+            }
             InvertedScalarIndex::Float64 { entries, .. } => {
                 if let ScalarValue::Float64(v) = value {
                     let key = OrderedF64(*v);
@@ -289,6 +476,34 @@ impl InvertedScalarIndex {
                 ids
             }
             InvertedScalarIndex::Int64 { entries, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in entries.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
+            InvertedScalarIndex::Int32 { entries, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in entries.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
+            InvertedScalarIndex::UInt32 { entries, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in entries.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
+            InvertedScalarIndex::UInt64 { entries, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in entries.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
+            InvertedScalarIndex::Float { entries, .. } => {
                 let mut ids = BTreeSet::new();
                 for set in entries.values() {
                     ids.extend(set.iter().cloned());
@@ -336,6 +551,10 @@ impl InvertedScalarIndex {
         match self {
             InvertedScalarIndex::String { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Int64 { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::Int32 { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::UInt32 { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::UInt64 { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::Float { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Float64 { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Bool { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Empty { descriptor } => &descriptor.field_name,
@@ -347,6 +566,10 @@ impl InvertedScalarIndex {
         match self {
             InvertedScalarIndex::String { descriptor, .. } => descriptor,
             InvertedScalarIndex::Int64 { descriptor, .. } => descriptor,
+            InvertedScalarIndex::Int32 { descriptor, .. } => descriptor,
+            InvertedScalarIndex::UInt32 { descriptor, .. } => descriptor,
+            InvertedScalarIndex::UInt64 { descriptor, .. } => descriptor,
+            InvertedScalarIndex::Float { descriptor, .. } => descriptor,
             InvertedScalarIndex::Float64 { descriptor, .. } => descriptor,
             InvertedScalarIndex::Bool { descriptor, .. } => descriptor,
             InvertedScalarIndex::Empty { descriptor } => descriptor,

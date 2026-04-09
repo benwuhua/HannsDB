@@ -2272,3 +2272,192 @@ fn collection_api_filtered_query_context_uses_ann_with_post_filter() {
     assert_eq!(hits.len(), 2);
     assert!(hits.iter().all(|hit| hit.id == 1 || hit.id == 3));
 }
+
+
+#[test]
+fn collection_api_group_by_with_group_topk_and_group_count() {
+    use hannsdb_core::query::{QueryContext, QueryGroupBy, VectorQuery};
+
+    let root = unique_temp_dir("hannsdb_group_by_topk_count");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("category", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    // 10 docs across 3 categories, spread at different distances from origin.
+    let docs = vec![
+        // category "A" — 4 docs
+        Document::new(1, [("category".into(), FieldValue::String("A".into()))], vec![0.0, 0.0]),
+        Document::new(2, [("category".into(), FieldValue::String("A".into()))], vec![0.1, 0.0]),
+        Document::new(3, [("category".into(), FieldValue::String("A".into()))], vec![0.2, 0.0]),
+        Document::new(4, [("category".into(), FieldValue::String("A".into()))], vec![0.3, 0.0]),
+        // category "B" — 3 docs
+        Document::new(5, [("category".into(), FieldValue::String("B".into()))], vec![0.4, 0.0]),
+        Document::new(6, [("category".into(), FieldValue::String("B".into()))], vec![0.5, 0.0]),
+        Document::new(7, [("category".into(), FieldValue::String("B".into()))], vec![0.6, 0.0]),
+        // category "C" — 3 docs
+        Document::new(8, [("category".into(), FieldValue::String("C".into()))], vec![0.7, 0.0]),
+        Document::new(9, [("category".into(), FieldValue::String("C".into()))], vec![0.8, 0.0]),
+        Document::new(10, [("category".into(), FieldValue::String("C".into()))], vec![0.9, 0.0]),
+    ];
+    db.insert_documents("docs", &docs).expect("insert docs");
+
+    // group_topk=2, group_count=2, top_k=10
+    let ctx = QueryContext {
+        top_k: 10,
+        queries: vec![VectorQuery {
+            field_name: "vector".to_string(),
+            vector: vec![0.0, 0.0],
+            param: None,
+        }],
+        group_by: Some(QueryGroupBy {
+            field_name: "category".to_string(),
+            group_topk: 2,
+            group_count: 2,
+        }),
+        ..Default::default()
+    };
+
+    let hits = db.query_with_context("docs", &ctx).expect("group_by query");
+
+    // At most 2 groups, at most 2 docs per group => at most 4 hits.
+    assert!(hits.len() <= 4, "should have at most 4 hits, got {}", hits.len());
+
+    // Collect the categories present in results.
+    let categories: std::collections::HashSet<&str> = hits
+        .iter()
+        .filter_map(|hit| hit.fields.get("category").and_then(|v| match v {
+            FieldValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }))
+        .collect();
+    assert!(
+        categories.len() <= 2,
+        "should have at most 2 categories, got {}: {:?}",
+        categories.len(),
+        categories,
+    );
+
+    // Count per category in the results.
+    let mut per_cat: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for cat in &categories {
+        let count = hits
+            .iter()
+            .filter(|hit| {
+                hit.fields.get("category").and_then(|v| match v {
+                    FieldValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                }) == Some(*cat)
+            })
+            .count();
+        per_cat.insert(*cat, count);
+    }
+    for (cat, count) in &per_cat {
+        assert!(
+            *count <= 2,
+            "category '{}' should have at most 2 hits, got {}",
+            cat,
+            count,
+        );
+    }
+
+    // The first 2 categories by distance should be "A" and "B" (closest docs).
+    assert!(
+        categories.contains("A") && categories.contains("B"),
+        "closest categories should be A and B, got {:?}",
+        categories,
+    );
+}
+
+
+#[test]
+fn collection_api_new_field_types_int32_uint32_uint64_float() {
+    let root = unique_temp_dir("hannsdb_new_types");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("a_int32", FieldType::Int32),
+            ScalarFieldSchema::new("b_uint32", FieldType::UInt32),
+            ScalarFieldSchema::new("c_uint64", FieldType::UInt64),
+            ScalarFieldSchema::new("d_float", FieldType::Float),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![
+        Document::new(
+            1,
+            [
+                ("a_int32".into(), FieldValue::Int32(-10)),
+                ("b_uint32".into(), FieldValue::UInt32(100)),
+                ("c_uint64".into(), FieldValue::UInt64(999)),
+                ("d_float".into(), FieldValue::Float(1.5_f32)),
+            ],
+            vec![0.0, 0.0],
+        ),
+        Document::new(
+            2,
+            [
+                ("a_int32".into(), FieldValue::Int32(42)),
+                ("b_uint32".into(), FieldValue::UInt32(200)),
+                ("c_uint64".into(), FieldValue::UInt64(1000)),
+                ("d_float".into(), FieldValue::Float(2.5_f32)),
+            ],
+            vec![1.0, 1.0],
+        ),
+    ];
+    db.insert_documents("docs", &docs).expect("insert docs");
+
+    // Fetch and verify values
+    let fetched = db.fetch_documents("docs", &[1, 2]).expect("fetch");
+    assert_eq!(fetched.len(), 2);
+
+    let doc1 = fetched.iter().find(|d| d.id == 1).expect("doc 1");
+    assert_eq!(doc1.fields.get("a_int32"), Some(&FieldValue::Int32(-10)));
+    assert_eq!(doc1.fields.get("b_uint32"), Some(&FieldValue::UInt32(100)));
+    assert_eq!(doc1.fields.get("c_uint64"), Some(&FieldValue::UInt64(999)));
+    assert_eq!(doc1.fields.get("d_float"), Some(&FieldValue::Float(1.5_f32)));
+
+    let doc2 = fetched.iter().find(|d| d.id == 2).expect("doc 2");
+    assert_eq!(doc2.fields.get("a_int32"), Some(&FieldValue::Int32(42)));
+    assert_eq!(doc2.fields.get("b_uint32"), Some(&FieldValue::UInt32(200)));
+    assert_eq!(doc2.fields.get("c_uint64"), Some(&FieldValue::UInt64(1000)));
+    assert_eq!(doc2.fields.get("d_float"), Some(&FieldValue::Float(2.5_f32)));
+
+    // Filter on Int32
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 10, Some("a_int32 > 0"))
+        .expect("filter int32");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2);
+
+    // Filter on UInt32
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 10, Some("b_uint32 < 150"))
+        .expect("filter uint32");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 1);
+
+    // Filter on UInt64
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 10, Some("c_uint64 >= 1000"))
+        .expect("filter uint64");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2);
+
+    // Filter on Float
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 10, Some("d_float > 2.0"))
+        .expect("filter float");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2);
+}

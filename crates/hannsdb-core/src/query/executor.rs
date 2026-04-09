@@ -138,6 +138,8 @@ impl QueryExecutor {
             return Ok(collapse_hits_by_group(
                 hits,
                 &group_by.field_name,
+                group_by.group_topk,
+                group_by.group_count,
                 plan.top_k,
             ));
         }
@@ -251,24 +253,43 @@ fn compare_hits(left: &DocumentHit, right: &DocumentHit) -> Ordering {
 fn collapse_hits_by_group(
     hits: Vec<DocumentHit>,
     field_name: &str,
+    group_topk: usize,
+    group_count: usize,
     top_k: usize,
 ) -> Vec<DocumentHit> {
-    let mut grouped_hits = Vec::new();
-    let mut seen_groups = HashSet::new();
+    // group_topk == 0 means unlimited per group; treat as a very large number.
+    // Default behavior (group_topk == 0) keeps exactly 1 per group (legacy).
+    let per_group_limit = if group_topk == 0 { 1 } else { group_topk };
+
+    let mut per_group_count: HashMap<GroupByValueKey, usize> = HashMap::new();
+    let mut groups_seen: usize = 0;
+    let mut result = Vec::new();
+
     for hit in hits {
         let group_key = hit
             .fields
             .get(field_name)
             .map(GroupByValueKey::from_field_value)
             .unwrap_or(GroupByValueKey::Missing);
-        if seen_groups.insert(group_key) {
-            grouped_hits.push(hit);
-            if grouped_hits.len() == top_k {
-                break;
+
+        let count = per_group_count.entry(group_key.clone()).or_insert(0);
+        if *count == 0 {
+            // First hit for this group: check group_count limit.
+            if group_count > 0 && groups_seen >= group_count {
+                continue;
             }
+            groups_seen += 1;
+        }
+        if *count >= per_group_limit {
+            continue;
+        }
+        *count += 1;
+        result.push(hit);
+        if result.len() >= top_k {
+            break;
         }
     }
-    grouped_hits
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -285,6 +306,10 @@ impl GroupByValueKey {
         match value {
             FieldValue::String(value) => Self::String(value.clone()),
             FieldValue::Int64(value) => Self::Int64(*value),
+            FieldValue::Int32(value) => Self::Int64(*value as i64),
+            FieldValue::UInt32(value) => Self::Int64(*value as i64),
+            FieldValue::UInt64(value) => Self::Int64(*value as i64),
+            FieldValue::Float(value) => Self::Float64(FloatGroupKey::new(*value as f64)),
             FieldValue::Float64(value) => Self::Float64(FloatGroupKey::new(*value)),
             FieldValue::Bool(value) => Self::Bool(*value),
         }

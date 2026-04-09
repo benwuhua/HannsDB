@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum FieldType {
     String,
     Int64,
+    Int32,
+    UInt32,
+    UInt64,
+    Float,
     Float64,
     Bool,
     VectorFp32,
@@ -15,6 +19,10 @@ pub enum FieldType {
 pub enum FieldValue {
     String(String),
     Int64(i64),
+    Int32(i32),
+    UInt32(u32),
+    UInt64(u64),
+    Float(f32),
     Float64(f64),
     Bool(bool),
 }

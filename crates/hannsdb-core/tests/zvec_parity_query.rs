@@ -1095,9 +1095,7 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "group".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )
@@ -1159,9 +1157,7 @@ fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "group".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )
@@ -1226,9 +1222,7 @@ fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "score".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "score".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )
@@ -1266,9 +1260,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "missing".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "missing".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )
@@ -1293,9 +1285,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "vector".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "vector".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )
@@ -1330,9 +1320,7 @@ fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy {
-                    field_name: "group".to_string(),
-                }),
+                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
                 reranker: None,
             },
         )

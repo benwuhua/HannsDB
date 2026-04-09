@@ -56,6 +56,10 @@ pub struct OptimizeOption {}
 pub enum DataType {
     String,
     Int64,
+    Int32,
+    UInt32,
+    UInt64,
+    Float,
     Float64,
     Bool,
     VectorFp32,
@@ -213,6 +217,10 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             let data_type = match field.data_type {
                 DataType::String => CoreFieldType::String,
                 DataType::Int64 => CoreFieldType::Int64,
+                DataType::Int32 => CoreFieldType::Int32,
+                DataType::UInt32 => CoreFieldType::UInt32,
+                DataType::UInt64 => CoreFieldType::UInt64,
+                DataType::Float => CoreFieldType::Float,
                 DataType::Float64 => CoreFieldType::Float64,
                 DataType::Bool => CoreFieldType::Bool,
                 DataType::VectorFp32 => {
@@ -385,6 +393,16 @@ fn py_query_context_to_core(
         value if value.is_none() => None,
         value => Some(CoreQueryGroupBy {
             field_name: value.getattr("field_name")?.extract::<String>()?,
+            group_topk: value
+                .getattr("group_topk")
+                .ok()
+                .and_then(|v| v.extract::<usize>().ok())
+                .unwrap_or(0),
+            group_count: value
+                .getattr("group_count")
+                .ok()
+                .and_then(|v| v.extract::<usize>().ok())
+                .unwrap_or(0),
         }),
     };
 
@@ -846,6 +864,14 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
             FieldValue::String(value)
         } else if let Ok(value) = value.extract::<i64>() {
             FieldValue::Int64(value)
+        } else if let Ok(value) = value.extract::<i32>() {
+            FieldValue::Int32(value)
+        } else if let Ok(value) = value.extract::<u32>() {
+            FieldValue::UInt32(value)
+        } else if let Ok(value) = value.extract::<u64>() {
+            FieldValue::UInt64(value)
+        } else if let Ok(value) = value.extract::<f32>() {
+            FieldValue::Float(value)
         } else if let Ok(value) = value.extract::<f64>() {
             FieldValue::Float64(value)
         } else {
@@ -881,6 +907,10 @@ fn fields_to_py_dict<'py>(
         match value {
             FieldValue::String(value) => dict.set_item(name, value)?,
             FieldValue::Int64(value) => dict.set_item(name, *value)?,
+            FieldValue::Int32(value) => dict.set_item(name, *value)?,
+            FieldValue::UInt32(value) => dict.set_item(name, *value)?,
+            FieldValue::UInt64(value) => dict.set_item(name, *value)?,
+            FieldValue::Float(value) => dict.set_item(name, *value)?,
             FieldValue::Float64(value) => dict.set_item(name, *value)?,
             FieldValue::Bool(value) => dict.set_item(name, *value)?,
         }
@@ -943,6 +973,10 @@ fn parse_data_type(value: &str) -> PyResult<DataType> {
     match value.to_ascii_lowercase().as_str() {
         "string" => Ok(DataType::String),
         "int64" => Ok(DataType::Int64),
+        "int32" => Ok(DataType::Int32),
+        "uint32" => Ok(DataType::UInt32),
+        "uint64" => Ok(DataType::UInt64),
+        "float" => Ok(DataType::Float),
         "float64" => Ok(DataType::Float64),
         "bool" => Ok(DataType::Bool),
         "vectorfp32" | "vector_fp32" => Ok(DataType::VectorFp32),
@@ -1016,6 +1050,14 @@ impl PyDataType {
     const String: &'static str = "string";
     #[classattr]
     const Int64: &'static str = "int64";
+    #[classattr]
+    const Int32: &'static str = "int32";
+    #[classattr]
+    const UInt32: &'static str = "uint32";
+    #[classattr]
+    const UInt64: &'static str = "uint64";
+    #[classattr]
+    const Float: &'static str = "float";
     #[classattr]
     const Float64: &'static str = "float64";
     #[classattr]
@@ -1191,6 +1233,10 @@ impl PyFieldSchema {
         match self.inner.data_type {
             DataType::String => "string",
             DataType::Int64 => "int64",
+            DataType::Int32 => "int32",
+            DataType::UInt32 => "uint32",
+            DataType::UInt64 => "uint64",
+            DataType::Float => "float",
             DataType::Float64 => "float64",
             DataType::Bool => "bool",
             DataType::VectorFp32 => "vector_fp32",
@@ -1269,6 +1315,10 @@ impl PyVectorSchema {
         match self.inner.data_type {
             DataType::String => "string",
             DataType::Int64 => "int64",
+            DataType::Int32 => "int32",
+            DataType::UInt32 => "uint32",
+            DataType::UInt64 => "uint64",
+            DataType::Float => "float",
             DataType::Float64 => "float64",
             DataType::Bool => "bool",
             DataType::VectorFp32 => "vector_fp32",
@@ -1700,6 +1750,10 @@ impl PyCollection {
         let core_type = match dt {
             DataType::String => hannsdb_core::document::FieldType::String,
             DataType::Int64 => hannsdb_core::document::FieldType::Int64,
+            DataType::Int32 => hannsdb_core::document::FieldType::Int32,
+            DataType::UInt32 => hannsdb_core::document::FieldType::UInt32,
+            DataType::UInt64 => hannsdb_core::document::FieldType::UInt64,
+            DataType::Float => hannsdb_core::document::FieldType::Float,
             DataType::Float64 => hannsdb_core::document::FieldType::Float64,
             DataType::Bool => hannsdb_core::document::FieldType::Bool,
             DataType::VectorFp32 => {
