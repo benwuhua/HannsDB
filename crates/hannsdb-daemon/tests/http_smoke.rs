@@ -718,7 +718,7 @@ async fn delete_by_filter_route_returns_bad_request_for_missing_filter_field() {
                 .method("POST")
                 .uri("/collections/docs/records/delete_by_filter")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"unexpected":"value"}"#))
+                .body(Body::from(r#"{}"#))
                 .expect("build request"),
         )
         .await
@@ -831,9 +831,10 @@ async fn delete_by_filter_route_returns_internal_error_for_corrupted_collection_
         .await
         .expect("read delete body");
     let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    let error = json["error"].as_str().expect("daemon error string");
     assert!(
-        json.get("error").is_some(),
-        "daemon error envelope should be returned"
+        !error.contains("collection not found: docs"),
+        "collection-internal corruption should not be misreported as a missing collection"
     );
 }
 
