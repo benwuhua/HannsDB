@@ -1,6 +1,7 @@
 mod collection;
 mod index;
 mod manifest;
+pub mod schema_mutation;
 mod version;
 
 pub use collection::CollectionMetadata;
