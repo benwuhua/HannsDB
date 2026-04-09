@@ -1589,10 +1589,12 @@ impl PyCollection {
         self.inner_mut()?.delete(&ids).map_err(io_to_py_err)
     }
 
-    fn delete_by_filter(&mut self, _filter: String) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "delete_by_filter is not supported yet",
-        ))
+    fn delete_by_filter(&mut self, filter: String) -> PyResult<usize> {
+        let collection_name = self.inner_ref()?.collection_name.clone();
+        self.inner_mut()?
+            .db
+            .delete_by_filter(&collection_name, &filter)
+            .map_err(io_to_py_err)
     }
 
     #[pyo3(signature = (field_name, option=None))]

@@ -330,11 +330,100 @@ def test_real_collection_single_id_fetch_and_delete_parity(tmp_path):
     collection.destroy()
 
 
-def test_real_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
-    collection = hannsdb.create_and_open(str(tmp_path), build_schema())
+def test_real_collection_delete_by_filter_deletes_matching_rows(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="1",
+            vectors={"dense": [1.0, 2.0]},
+            fields={"session_id": "abc"},
+        ),
+        hannsdb.Doc(
+            id="2",
+            vectors={"dense": [3.0, 4.0]},
+            fields={"session_id": "abc"},
+        ),
+        hannsdb.Doc(
+            id="3",
+            vectors={"dense": [5.0, 6.0]},
+            fields={"session_id": "def"},
+        ),
+    ]
 
-    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
-        collection.delete_by_filter("session_id = 'abc'")
+    assert collection.insert(docs) == 3
+
+    deleted = collection.delete_by_filter('session_id == "abc"')
+
+    assert isinstance(deleted, int)
+    assert deleted == 2
+    assert [doc.id for doc in collection.fetch(["1", "2", "3"])] == ["3"]
+
+    collection.destroy()
+
+
+def test_real_collection_delete_by_filter_second_call_returns_zero(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="1",
+            vectors={"dense": [1.0, 2.0]},
+            fields={"session_id": "abc"},
+        ),
+        hannsdb.Doc(
+            id="2",
+            vectors={"dense": [3.0, 4.0]},
+            fields={"session_id": "abc"},
+        ),
+    ]
+
+    assert collection.insert(docs) == 2
+    assert collection.delete_by_filter('session_id == "abc"') == 2
+    assert collection.delete_by_filter('session_id == "abc"') == 0
+
+    collection.destroy()
+
+
+def test_real_collection_delete_by_filter_invalid_filter_propagates(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+
+    with pytest.raises(ValueError, match="unsupported filter clause|filter"):
+        collection.delete_by_filter('session_id = "abc"')
 
     collection.destroy()
 
@@ -3007,15 +3096,17 @@ def test_collection_surface_single_id_helpers_delegate_via_list(monkeypatch):
     ]
 
 
-def test_collection_delete_by_filter_raises_before_core_delegation(monkeypatch):
+def test_collection_delete_by_filter_delegates_to_core(monkeypatch):
     schema = build_schema()
+    calls = []
 
     class FakeCore:
         path = "/tmp/hannsdb"
         collection_name = "docs"
 
         def delete_by_filter(self, filter):
-            raise AssertionError("core delete_by_filter should not be called")
+            calls.append(("delete_by_filter", filter))
+            return 7
 
     class FakeFactory:
         def build(self):
@@ -3025,8 +3116,10 @@ def test_collection_delete_by_filter_raises_before_core_delegation(monkeypatch):
 
     collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
 
-    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
-        collection.delete_by_filter("session_id = 'abc'")
+    deleted = collection.delete_by_filter('session_id == "abc"')
+
+    assert deleted == 7
+    assert calls == [("delete_by_filter", 'session_id == "abc"')]
 
 
 @pytest.mark.parametrize(

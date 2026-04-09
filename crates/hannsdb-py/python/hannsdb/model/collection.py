@@ -431,7 +431,7 @@ class Collection:
         return self._core.delete(ids)
 
     def delete_by_filter(self, filter: str):
-        raise NotImplementedError("delete_by_filter is not supported yet")
+        return self._core.delete_by_filter(filter)
 
     def add_column(self, field_name, option=None):
         raise NotImplementedError("add_column is not supported yet")

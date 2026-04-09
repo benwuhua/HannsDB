@@ -94,10 +94,11 @@ def test_native_collection_defaults_option_when_omitted(tmp_path):
     collection.destroy()
 
 
-def test_native_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
+def test_native_collection_delete_by_filter_deletes_matching_rows(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
         vectors=[
             hannsdb.VectorSchema(
                 name="dense",
@@ -112,8 +113,59 @@ def test_native_collection_delete_by_filter_is_explicitly_unsupported(tmp_path):
         schema._get_native(),
     )
 
-    with pytest.raises(NotImplementedError, match="delete_by_filter.*not supported yet"):
-        collection.delete_by_filter("session_id = 'abc'")
+    assert collection.insert(
+        [
+            hannsdb._native.Doc(
+                id="1",
+                field_name="dense",
+                fields={"session_id": "abc"},
+                vectors={"dense": [1.0, 2.0]},
+            ),
+            hannsdb._native.Doc(
+                id="2",
+                field_name="dense",
+                fields={"session_id": "abc"},
+                vectors={"dense": [3.0, 4.0]},
+            ),
+            hannsdb._native.Doc(
+                id="3",
+                field_name="dense",
+                fields={"session_id": "def"},
+                vectors={"dense": [5.0, 6.0]},
+            ),
+        ]
+    ) == 3
+
+    deleted = collection.delete_by_filter('session_id == "abc"')
+
+    assert isinstance(deleted, int)
+    assert deleted == 2
+    assert [doc.id for doc in collection.fetch(["1", "2", "3"])] == ["3"]
+
+    collection.destroy()
+
+
+def test_native_collection_delete_by_filter_invalid_filter_propagates(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="session_id", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        schema._get_native(),
+    )
+
+    with pytest.raises(ValueError, match="unsupported filter clause|filter"):
+        collection.delete_by_filter('session_id = "abc"')
 
     collection.destroy()
 
