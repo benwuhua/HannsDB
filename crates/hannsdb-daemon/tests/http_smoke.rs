@@ -1,7 +1,9 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use hannsdb_core::db::HannsDb;
-use hannsdb_core::document::{CollectionSchema, Document, VectorFieldSchema};
+use hannsdb_core::document::{
+    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+};
 use hannsdb_daemon::routes::build_router;
 use serde_json::Value;
 use std::fs;
@@ -40,6 +42,40 @@ fn seed_non_primary_query_by_id_collection(root: &std::path::Path) {
                 Vec::new(),
                 vec![50.0, 50.0],
                 [("title".to_string(), vec![10.0, 10.0])],
+            ),
+        ],
+    )
+    .expect("insert documents");
+}
+
+fn seed_delete_by_filter_collection(root: &std::path::Path) {
+    let mut db = HannsDb::open(root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                42,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0, 0.0],
+            ),
+            Document::new(
+                43,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.1, 0.0],
+            ),
+            Document::new(
+                44,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0, 1.0],
             ),
         ],
     )
@@ -213,6 +249,360 @@ async fn records_insert_search_delete_flow_works() {
         .expect("read body");
     let json: Value = serde_json::from_slice(&body).expect("parse json");
     assert_eq!(json["hits"][0]["id"], "84");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_deletes_matching_rows() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::OK);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert_eq!(json["deleted"], 2);
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","43","44"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    let documents = json["documents"].as_array().expect("documents array");
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["id"], "44");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_zero_for_no_matches() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 99"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::OK);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert_eq!(json["deleted"], 0);
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_second_call_returns_zero() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send first delete-by-filter request");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("read first delete body");
+    let first_json: Value = serde_json::from_slice(&first_body).expect("parse first delete json");
+    assert_eq!(first_json["deleted"], 2);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send second delete-by-filter request");
+
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("read second delete body");
+    let second_json: Value =
+        serde_json::from_slice(&second_body).expect("parse second delete json");
+    assert_eq!(second_json["deleted"], 0);
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_bad_request_for_invalid_filter() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group = 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(json.get("error").is_some(), "daemon error envelope should be returned");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_bad_request_for_empty_filter() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":""}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(json.get("error").is_some(), "daemon error envelope should be returned");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_bad_request_for_whitespace_only_filter() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"   "}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(json.get("error").is_some(), "daemon error envelope should be returned");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_wraps_malformed_json_in_daemon_error_envelope() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":1"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(json.get("error").is_some(), "daemon error envelope should be returned");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_bad_request_for_missing_filter_field() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    seed_delete_by_filter_collection(tempdir.path());
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"unexpected":"value"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert!(json.get("error").is_some(), "daemon error envelope should be returned");
+}
+
+#[tokio::test]
+async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/missing/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+
+    assert_eq!(delete.status(), StatusCode::NOT_FOUND);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    let error = json["error"].as_str().expect("daemon error string");
+    assert!(
+        error.contains("collection"),
+        "error text should mention the missing collection"
+    );
+}
+
+#[tokio::test]
+async fn delete_records_route_still_deletes_by_explicit_ids() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete request");
+    assert_eq!(delete.status(), StatusCode::OK);
+    let delete_body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let delete_json: Value = serde_json::from_slice(&delete_body).expect("parse delete json");
+    assert_eq!(delete_json["deleted"], 1);
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","84"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    let documents = json["documents"].as_array().expect("documents array");
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["id"], "84");
 }
 
 #[tokio::test]
