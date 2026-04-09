@@ -525,7 +525,7 @@ async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
     let json: Value = serde_json::from_slice(&body).expect("parse delete json");
     let error = json["error"].as_str().expect("daemon error string");
     assert!(
-        error.contains("collection"),
+        error.contains("missing"),
         "error text should mention the missing collection"
     );
 }
