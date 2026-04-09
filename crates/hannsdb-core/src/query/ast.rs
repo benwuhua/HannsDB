@@ -44,7 +44,8 @@ pub struct QueryGroupBy {
     pub field_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryReranker {
-    pub model: String,
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryReranker {
+    Rrf { rank_constant: u64 },
+    Weighted { weights: std::collections::BTreeMap<String, f64> },
 }

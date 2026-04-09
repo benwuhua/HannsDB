@@ -602,7 +602,7 @@ async fn delete_by_filter_route_returns_bad_request_for_invalid_filter() {
                 .method("POST")
                 .uri("/collections/docs/records/delete_by_filter")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"filter":"group = 1"}"#))
+                .body(Body::from(r#"{"filter":"group ??? 1"}"#))
                 .expect("build request"),
         )
         .await

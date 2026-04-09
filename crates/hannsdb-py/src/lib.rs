@@ -355,12 +355,30 @@ fn py_query_context_to_core(
         .extract::<Option<Vec<String>>>()?;
     let include_vector = context.getattr("include_vector")?.extract::<bool>()?;
 
-    let reranker = context.getattr("reranker")?;
-    if !reranker.is_none() {
-        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "unsupported: reranker is not supported on the Python facade yet",
-        ));
-    }
+    let reranker_attr = context.getattr("reranker")?;
+    let reranker = if reranker_attr.is_none() {
+        None
+    } else {
+        let reranker_type = reranker_attr.getattr("__class__")?;
+        let type_name = reranker_type.getattr("__name__")?.extract::<String>()?;
+        match type_name.as_str() {
+            "RrfReRanker" => {
+                let rank_constant = reranker_attr.getattr("rank_constant")?.extract::<u64>()?;
+                Some(CoreQueryReranker::Rrf { rank_constant })
+            }
+            "WeightedReRanker" => {
+                let weights = reranker_attr.getattr("weights")?.extract::<std::collections::HashMap<String, f64>>()?;
+                Some(CoreQueryReranker::Weighted {
+                    weights: weights.into_iter().collect(),
+                })
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("unsupported reranker type: {type_name}"),
+                ));
+            }
+        }
+    };
 
     let group_by_attr = context.getattr("group_by")?;
     let group_by = match group_by_attr {
@@ -379,7 +397,7 @@ fn py_query_context_to_core(
         output_fields,
         include_vector,
         group_by,
-        reranker: None,
+        reranker,
     })
 }
 
@@ -513,14 +531,19 @@ pub fn create_and_open(
 ) -> std::io::Result<Collection> {
     let path = path.into();
     let root = std::path::Path::new(&path);
-    let mut db = hannsdb_core::db::HannsDb::open(root)?;
+    let option = option.unwrap_or_default();
+    let mut db = if option.read_only {
+        hannsdb_core::db::HannsDb::open_read_only(root)?
+    } else {
+        hannsdb_core::db::HannsDb::open(root)?
+    };
     let core_schema = core_schema_from_schema(&schema)?;
     db.create_collection_with_schema(&schema.name, &core_schema)?;
     Ok(Collection {
         path,
         collection_name: schema.name,
         primary_vector_name: core_schema.primary_vector_name().to_string(),
-        option: option.unwrap_or_default(),
+        option,
         db,
     })
 }
@@ -531,7 +554,12 @@ pub fn open(
 ) -> std::io::Result<Collection> {
     let path = path.into();
     let root = std::path::Path::new(&path);
-    let db = hannsdb_core::db::HannsDb::open(root)?;
+    let option = option.unwrap_or_default();
+    let db = if option.read_only {
+        hannsdb_core::db::HannsDb::open_read_only(root)?
+    } else {
+        hannsdb_core::db::HannsDb::open(root)?
+    };
     let manifest =
         hannsdb_core::catalog::ManifestMetadata::load_from_path(&root.join("manifest.json"))?;
     let collection_name = manifest.collections.first().cloned().ok_or_else(|| {
@@ -551,7 +579,7 @@ pub fn open(
         path,
         collection_name,
         primary_vector_name: metadata.primary_vector,
-        option: option.unwrap_or_default(),
+        option,
         db,
     })
 }
@@ -1475,6 +1503,53 @@ impl PyVectorQuery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reranker Python classes
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "RrfReRanker", module = "hannsdb")]
+#[derive(Clone)]
+struct PyRrfReRanker {
+    rank_constant: u64,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyRrfReRanker {
+    #[new]
+    #[pyo3(signature = (rank_constant=60))]
+    fn new(rank_constant: u64) -> Self {
+        Self { rank_constant }
+    }
+
+    #[getter]
+    fn rank_constant(&self) -> u64 {
+        self.rank_constant
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "WeightedReRanker", module = "hannsdb")]
+#[derive(Clone)]
+struct PyWeightedReRanker {
+    weights: std::collections::HashMap<String, f64>,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyWeightedReRanker {
+    #[new]
+    fn new(weights: std::collections::HashMap<String, f64>) -> Self {
+        Self { weights }
+    }
+
+    #[getter]
+    fn weights(&self) -> std::collections::HashMap<String, f64> {
+        self.weights.clone()
+    }
+}
+
 #[cfg(feature = "python-binding")]
 #[pyclass(name = "Collection", module = "hannsdb")]
 struct PyCollection {
@@ -1642,19 +1717,19 @@ impl PyCollection {
     }
 
     fn drop_column(&mut self, field_name: String) -> PyResult<()> {
-        let _ = field_name;
-        Err(PyNotImplementedError::new_err(
-            "drop_column is not supported yet",
-        ))
+        let inner = self.inner_ref()?;
+        self.inner_mut()?
+            .db
+            .drop_column(&inner.collection_name, &field_name)
+            .map_err(io_to_py_err)
     }
 
-    #[pyo3(signature = (field_name, option=None))]
-    fn alter_column(&mut self, field_name: String, option: Option<Py<PyAny>>) -> PyResult<()> {
-        let _ = field_name;
-        let _ = option;
-        Err(PyNotImplementedError::new_err(
-            "alter_column is not supported yet",
-        ))
+    fn alter_column(&mut self, field_name: String, new_name: String) -> PyResult<()> {
+        let inner = self.inner_ref()?;
+        self.inner_mut()?
+            .db
+            .alter_column(&inner.collection_name, &field_name, &new_name)
+            .map_err(io_to_py_err)
     }
 
     #[pyo3(signature = (vectors, output_fields=None, topk=100, filter=None))]
@@ -1908,6 +1983,8 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyCollectionSchema>()?;
     module.add_class::<PyDoc>()?;
     module.add_class::<PyVectorQuery>()?;
+    module.add_class::<PyRrfReRanker>()?;
+    module.add_class::<PyWeightedReRanker>()?;
     module.add_class::<PyCollectionStats>()?;
     module.add_class::<PyCollection>()?;
     module.add_function(wrap_pyfunction!(py_init, module)?)?;

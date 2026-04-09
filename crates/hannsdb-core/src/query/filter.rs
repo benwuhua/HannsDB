@@ -18,6 +18,15 @@ pub enum FilterExpr {
         op: ComparisonOp,
         value: FieldValue,
     },
+    InList {
+        field: String,
+        negated: bool,
+        values: Vec<FieldValue>,
+    },
+    NullCheck {
+        field: String,
+        negated: bool,
+    },
 }
 
 impl FilterExpr {
@@ -44,6 +53,17 @@ impl FilterExpr {
                         Some(Ordering::Less | Ordering::Equal)
                     ),
                 }
+            }
+            FilterExpr::InList { field, negated, values } => {
+                let Some(actual) = fields.get(field) else {
+                    return *negated; // missing field: non-negated → false, negated → true
+                };
+                let found = values.iter().any(|v| values_equal(actual, v));
+                if *negated { !found } else { found }
+            }
+            FilterExpr::NullCheck { field, negated } => {
+                let is_null = !fields.contains_key(field);
+                if *negated { !is_null } else { is_null }
             }
         }
     }
@@ -168,36 +188,67 @@ fn parse_primary(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
     }
 }
 
-// clause = field op value
-// Returns a FilterExpr::Clause variant.
+// clause = field op value | field "in" "(" values ")" | field "not" "in" "(" values ")"
+//        | field "is" "null" | field "is" "not" "null"
 fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
     skip_whitespace(input, pos);
 
-    // 1. Read field name (runs until we hit a comparison operator token).
-    let field_start = *pos;
-    let field_end = find_op_pos(input, *pos).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no comparison operator found in clause",
-        )
-    })?;
-    let field = input[field_start..field_end].trim().to_string();
+    // 1. Read field name. We need to look ahead to determine the clause type.
+    //    Field names end at whitespace followed by a keyword (and/or/not/in/is)
+    //    or at a comparison operator.
+    let field = read_field_name(input, pos);
     if field.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "empty field name in filter clause",
         ));
     }
-    *pos = field_end;
 
-    // 2. Read operator.
+    skip_whitespace(input, pos);
+
+    // 2. Look ahead to determine clause type.
     let rest = &input[*pos..];
-    let (op, op_len) = parse_op(rest)?;
+
+    // Check for "is null" / "is not null"
+    if peek_keyword(rest, 0, "is") {
+        *pos += 2; // skip "is"
+        skip_whitespace(input, pos);
+        let rest2 = &input[*pos..];
+        if peek_keyword(rest2, 0, "not") {
+            *pos += 3; // skip "not"
+            skip_whitespace(input, pos);
+            expect_keyword(input, pos, "null")?;
+            return Ok(FilterExpr::NullCheck { field, negated: true });
+        }
+        expect_keyword(input, pos, "null")?;
+        return Ok(FilterExpr::NullCheck { field, negated: false });
+    }
+
+    // Check for "not in (...)"
+    if peek_keyword(rest, 0, "not") {
+        let saved = *pos;
+        *pos += 3; // skip "not"
+        skip_whitespace(input, pos);
+        if peek_keyword(&input[*pos..], 0, "in") {
+            *pos += 2; // skip "in"
+            let values = parse_in_list_values(input, pos)?;
+            return Ok(FilterExpr::InList { field, negated: true, values });
+        }
+        // Not "not in" — backtrack
+        *pos = saved;
+    }
+
+    // Check for "in (...)"
+    if peek_keyword(rest, 0, "in") {
+        *pos += 2; // skip "in"
+        let values = parse_in_list_values(input, pos)?;
+        return Ok(FilterExpr::InList { field, negated: false, values });
+    }
+
+    // 3. Default: comparison clause (field op value)
+    let (op, op_len) = parse_op(&input[*pos..])?;
     *pos += op_len;
 
-    // 3. Read value (runs until whitespace-then-keyword, whitespace-then-op,
-    //    or end-of-string, but we use a simpler strategy: scan forward for the
-    //    next keyword / paren / end).
     skip_whitespace(input, pos);
     let value_str = read_value_token(input, *pos);
     if value_str.is_empty() {
@@ -212,23 +263,117 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
     Ok(FilterExpr::Clause { field, op, value })
 }
 
-// Find the position of the next comparison operator starting at `pos`.
-fn find_op_pos(input: &str, pos: usize) -> Option<usize> {
+/// Read a field name: runs until whitespace or a comparison operator.
+fn read_field_name(input: &str, pos: &mut usize) -> String {
     let bytes = input.as_bytes();
+    let start = *pos;
+    while *pos < bytes.len() {
+        let c = bytes[*pos];
+        if c.is_ascii_whitespace() || c == b'>' || c == b'<' || c == b'=' || c == b'!' {
+            break;
+        }
+        *pos += 1;
+    }
+    let name = input[start..*pos].trim().to_string();
+
+    // If the name itself is a keyword (in/is/not/and/or), it could be:
+    // - a real field named that (unlikely but valid)
+    // - But for our grammar, we never have fields named after keywords.
+    // Since field names run to whitespace, "group in" will read "group" then
+    // stop at the space before "in". This should be fine.
+    name
+}
+
+/// Parse parenthesized comma-separated values for `in (...)`.
+fn parse_in_list_values(input: &str, pos: &mut usize) -> io::Result<Vec<FieldValue>> {
+    skip_whitespace(input, pos);
+    let rest = &input[*pos..];
+    if !rest.starts_with('(') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected '(' after 'in' in filter expression",
+        ));
+    }
+    *pos += 1; // skip '('
+
+    let mut values = Vec::new();
+    loop {
+        skip_whitespace(input, pos);
+        let rest = &input[*pos..];
+        if rest.starts_with(')') {
+            *pos += 1;
+            break;
+        }
+        if !values.is_empty() {
+            if !rest.starts_with(',') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected ',' or ')' in value list",
+                ));
+            }
+            *pos += 1; // skip ','
+            skip_whitespace(input, pos);
+        }
+        let token = read_list_value_token(input, *pos);
+        if token.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected value in 'in' list",
+            ));
+        }
+        *pos += token.len();
+        values.push(parse_value(token.trim())?);
+    }
+    Ok(values)
+}
+
+/// Read a value token inside a parenthesized list.
+/// Stops at ',' or ')' or end-of-input.
+fn read_list_value_token(input: &str, pos: usize) -> &str {
+    let bytes = input.as_bytes();
+    if pos >= bytes.len() {
+        return "";
+    }
+
+    // Quoted string
+    if bytes[pos] == b'"' {
+        let mut i = pos + 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                return &input[pos..=i];
+            }
+            i += 1;
+        }
+        return &input[pos..];
+    }
+
+    // Unquoted: scan until ',' or ')' or end
     let mut i = pos;
     while i < bytes.len() {
         let c = bytes[i];
-        if c == b'>' || c == b'<' || c == b'=' || c == b'!' {
-            // Make sure it's not a stray '!' without '='
-            if c == b'!' && (i + 1 >= bytes.len() || bytes[i + 1] != b'=') {
-                i += 1;
-                continue;
-            }
-            return Some(i);
+        if c == b',' || c == b')' {
+            break;
         }
         i += 1;
     }
-    None
+    &input[pos..i]
+}
+
+/// Expect a keyword at the current position and advance past it.
+fn expect_keyword(input: &str, pos: &mut usize, kw: &str) -> io::Result<()> {
+    let rest = &input[*pos..];
+    if !rest.starts_with(kw) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected '{kw}' in filter expression"),
+        ));
+    }
+    *pos += kw.len();
+    Ok(())
 }
 
 // Parse comparison operator at the start of `input`.
@@ -237,6 +382,7 @@ fn parse_op(input: &str) -> io::Result<(ComparisonOp, usize)> {
         (">=", ComparisonOp::Gte),
         ("<=", ComparisonOp::Lte),
         ("==", ComparisonOp::Eq),
+        ("=", ComparisonOp::Eq),
         ("!=", ComparisonOp::Ne),
         (">", ComparisonOp::Gt),
         ("<", ComparisonOp::Lt),
@@ -595,5 +741,94 @@ mod tests {
     // helper to avoid confusing variable names
     fn expr2_matches(expr: &FilterExpr, fields: &BTreeMap<String, FieldValue>) -> bool {
         expr.matches(fields)
+    }
+
+    // -- in / not in tests --
+
+    #[test]
+    fn in_list_matches() {
+        let expr = parse_filter("status in (\"active\", \"pending\")").unwrap();
+        let f1 = field_map(vec![("status", FieldValue::String("active".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("status", FieldValue::String("pending".into()))]);
+        assert!(expr.matches(&f2));
+        let f3 = field_map(vec![("status", FieldValue::String("closed".into()))]);
+        assert!(!expr.matches(&f3));
+    }
+
+    #[test]
+    fn in_list_integers() {
+        let expr = parse_filter("group in (1, 2, 3)").unwrap();
+        let f1 = field_map(vec![("group", FieldValue::Int64(2))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("group", FieldValue::Int64(5))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn not_in_list() {
+        let expr = parse_filter("status not in (\"closed\", \"archived\")").unwrap();
+        let f1 = field_map(vec![("status", FieldValue::String("active".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("status", FieldValue::String("closed".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn in_list_missing_field() {
+        let expr = parse_filter("missing in (1, 2)").unwrap();
+        let fields = field_map(vec![("other", FieldValue::Int64(1))]);
+        assert!(!expr.matches(&fields));
+    }
+
+    #[test]
+    fn not_in_list_missing_field() {
+        let expr = parse_filter("missing not in (1, 2)").unwrap();
+        let fields = field_map(vec![("other", FieldValue::Int64(1))]);
+        assert!(expr.matches(&fields)); // negated: missing → true
+    }
+
+    #[test]
+    fn in_list_combined_with_and() {
+        let expr = parse_filter("status in (\"active\") and score > 10").unwrap();
+        let f1 = field_map(vec![
+            ("status", FieldValue::String("active".into())),
+            ("score", FieldValue::Int64(20)),
+        ]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![
+            ("status", FieldValue::String("active".into())),
+            ("score", FieldValue::Int64(5)),
+        ]);
+        assert!(!expr.matches(&f2));
+    }
+
+    // -- is null / is not null tests --
+
+    #[test]
+    fn is_null_matches() {
+        let expr = parse_filter("nickname is null").unwrap();
+        let f1: BTreeMap<String, FieldValue> = BTreeMap::new();
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("nickname", FieldValue::String("bob".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn is_not_null_matches() {
+        let expr = parse_filter("nickname is not null").unwrap();
+        let f1: BTreeMap<String, FieldValue> = BTreeMap::new();
+        assert!(!expr.matches(&f1));
+        let f2 = field_map(vec![("nickname", FieldValue::String("bob".into()))]);
+        assert!(expr.matches(&f2));
+    }
+
+    #[test]
+    fn is_null_combined_with_and() {
+        let expr = parse_filter("nickname is null and score > 5").unwrap();
+        let f1 = field_map(vec![("score", FieldValue::Int64(10))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("nickname", FieldValue::String("x".into())), ("score", FieldValue::Int64(10))]);
+        assert!(!expr.matches(&f2));
     }
 }

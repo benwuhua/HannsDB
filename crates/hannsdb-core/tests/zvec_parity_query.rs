@@ -832,7 +832,7 @@ fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_brutefo
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_mixed_metric_typed_recall_sources() {
+fn zvec_parity_query_context_accepts_mixed_metric_typed_recall_sources() {
     let root = unique_temp_dir("hannsdb_typed_query_mixed_metric_recall");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -858,7 +858,7 @@ fn zvec_parity_query_context_rejects_mixed_metric_typed_recall_sources() {
     )
     .expect("register descriptor-backed secondary vector index");
 
-    let err = db
+    let result = db
         .query_with_context(
             "docs",
             &QueryContext {
@@ -884,13 +884,9 @@ fn zvec_parity_query_context_rejects_mixed_metric_typed_recall_sources() {
                 reranker: None,
             },
         )
-        .expect_err("mixed metric typed recall should be rejected");
+        .expect("mixed metric typed recall should now be accepted");
 
-    assert_eq!(err.kind(), ErrorKind::Unsupported);
-    assert!(
-        err.to_string().contains("mixed metrics"),
-        "unexpected error message: {err}"
-    );
+    assert!(result.is_empty(), "empty collection should return no hits");
 }
 
 #[test]
@@ -1353,7 +1349,7 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
     db.create_collection("docs", 2, "l2")
         .expect("create collection");
 
-    let err = db
+    let hits = db
         .query_with_context(
             "docs",
             &QueryContext {
@@ -1369,15 +1365,13 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
                 output_fields: None,
                 include_vector: false,
                 group_by: None,
-                reranker: Some(QueryReranker {
-                    model: "cross-encoder".to_string(),
-                }),
+                reranker: Some(QueryReranker::Rrf { rank_constant: 60 }),
             },
         )
-        .expect_err("reranker should be rejected in the first slice");
+        .expect("reranker with single vector should succeed");
 
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("reranker"));
+    // RRF with a single field just returns the same results as unranked search
+    assert!(!hits.is_empty());
 }
 
 #[test]

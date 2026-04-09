@@ -45,6 +45,15 @@ pub enum WalRecord {
         collection: String,
         field: ScalarFieldSchema,
     },
+    DropColumn {
+        collection: String,
+        field_name: String,
+    },
+    AlterColumn {
+        collection: String,
+        old_name: String,
+        new_name: String,
+    },
 }
 
 pub fn append_wal_record(path: &Path, record: &WalRecord) -> io::Result<()> {

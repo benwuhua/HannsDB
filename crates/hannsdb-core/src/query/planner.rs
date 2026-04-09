@@ -19,6 +19,7 @@ pub(crate) struct LegacySingleVectorPlan {
     pub(crate) vector: Vec<f32>,
     pub(crate) ef_search: Option<usize>,
     pub(crate) output_fields: Option<Vec<String>>,
+    pub(crate) filter: Option<FilterExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ pub(crate) struct BruteForceQueryPlan {
     pub(crate) recall_sources: Vec<PlannedRecallSource>,
     pub(crate) group_by: Option<PlannedGroupBy>,
     pub(crate) output_fields: Option<Vec<String>>,
+    pub(crate) reranker: Option<super::QueryReranker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,16 @@ pub(crate) struct PlannedRecallSource {
     pub(crate) kind: RecallSourceKind,
     pub(crate) vector: Vec<f32>,
     pub(crate) metric: String,
+}
+
+impl PlannedRecallSource {
+    /// Returns a unique key for this recall source (field_name for explicit, id_field for query_by_id).
+    pub(crate) fn field_key(&self) -> String {
+        match &self.kind {
+            RecallSourceKind::ExplicitVector { field_name } => field_name.clone(),
+            RecallSourceKind::QueryById { id, field_name } => format!("{}_{}", field_name, id),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -64,19 +76,14 @@ impl QueryPlanner {
         context: &QueryContext,
         query_by_id_documents: &[Document],
     ) -> io::Result<QueryPlan> {
-        if context.reranker.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "reranker is not supported on the typed query path yet",
-            ));
-        }
-
         let filter = context
             .filter
             .as_deref()
             .map(str::trim)
             .filter(|filter| !filter.is_empty())
             .map(str::to_owned);
+
+        let parsed_filter = filter.as_deref().map(parse_filter).transpose()?;
 
         let uses_ef_search = context.queries.iter().any(|query| {
             query
@@ -88,7 +95,6 @@ impl QueryPlanner {
         let is_single_vector_fast_path = context.group_by.is_none()
             && context.queries.len() == 1
             && context.query_by_id.is_none()
-            && filter.is_none()
             && resolve_vector_descriptor_for_field(
                 collection,
                 index_catalog,
@@ -111,10 +117,11 @@ impl QueryPlanner {
                 vector: query.vector.clone(),
                 ef_search: query.param.as_ref().and_then(|param| param.ef_search),
                 output_fields: context.output_fields.clone(),
+                filter: parsed_filter,
             }));
         }
 
-        let filter = filter.as_deref().map(parse_filter).transpose()?;
+        let filter = parsed_filter;
 
         let mut recall_sources = Vec::new();
         for query in &context.queries {
@@ -206,16 +213,6 @@ impl QueryPlanner {
             }
         }
 
-        if let Some(metric) = mixed_metric_error(&recall_sources) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "mixed metrics are not supported on the typed brute-force path yet: {}",
-                    metric
-                ),
-            ));
-        }
-
         let mode = if recall_sources.is_empty() {
             if filter.is_some() {
                 BruteForceExecutionMode::FilterOnlyScan
@@ -242,6 +239,7 @@ impl QueryPlanner {
             recall_sources,
             group_by,
             output_fields: context.output_fields.clone(),
+            reranker: context.reranker.clone(),
         }))
     }
 }
@@ -431,23 +429,6 @@ fn resolve_vector_metric(
         .or_else(|| vector_schema.metric())
         .unwrap_or(collection.metric.as_str());
     Ok(metric.to_ascii_lowercase())
-}
-
-fn mixed_metric_error(recall_sources: &[PlannedRecallSource]) -> Option<String> {
-    let first = recall_sources.first()?.metric.to_ascii_lowercase();
-    let mut distinct = vec![first.clone()];
-    for source in &recall_sources[1..] {
-        let metric = source.metric.to_ascii_lowercase();
-        if !distinct.iter().any(|existing| existing == &metric) {
-            distinct.push(metric);
-        }
-    }
-
-    if distinct.len() > 1 {
-        Some(distinct.join(", "))
-    } else {
-        None
-    }
 }
 
 fn validate_group_by(

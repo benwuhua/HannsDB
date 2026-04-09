@@ -126,10 +126,13 @@ pub struct TypedQueryGroupByRequest {
     pub field_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypedQueryRerankerRequest {
-    pub model: String,
+    #[serde(default)]
+    pub rank_constant: Option<u64>,
+    #[serde(default)]
+    pub weights: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +185,11 @@ pub struct FlushCollectionResponse {
 #[derive(Debug, Serialize)]
 pub struct CompactCollectionResponse {
     pub compacted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OptimizeCollectionResponse {
+    pub optimized: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,4 +282,21 @@ pub struct AddColumnRequest {
 #[derive(Debug, Serialize)]
 pub struct AddColumnResponse {
     pub added: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DropColumnResponse {
+    pub dropped: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlterColumnRequest {
+    pub new_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlterColumnResponse {
+    pub old_name: String,
+    pub new_name: String,
 }

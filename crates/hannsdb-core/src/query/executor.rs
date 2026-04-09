@@ -11,9 +11,18 @@ use crate::segment::{
 };
 
 use super::planner::{BruteForceExecutionMode, BruteForceQueryPlan};
+use super::rerank::{fuse, PerFieldResults};
 use super::search::distance_by_metric;
 
 pub(crate) struct QueryExecutor;
+
+/// Per-document per-field distances collected for reranking.
+struct CollectedDoc {
+    id: i64,
+    fields: BTreeMap<String, FieldValue>,
+    per_field_distance: HashMap<String, f32>,
+    best_distance: Option<f32>,
+}
 
 impl QueryExecutor {
     pub(crate) fn execute(
@@ -25,7 +34,8 @@ impl QueryExecutor {
             return Ok(Vec::new());
         }
 
-        let mut best_hits = HashMap::new();
+        let use_reranker = plan.reranker.is_some();
+        let mut collected: HashMap<i64, CollectedDoc> = HashMap::new();
         let mut shadowed_ids = HashSet::new();
         let needs_secondary_vectors = plan.recall_sources.iter().any(|source| match &source.kind {
             super::planner::RecallSourceKind::ExplicitVector { field_name } => {
@@ -73,30 +83,56 @@ impl QueryExecutor {
                     }
                 }
 
-                let Some(distance) = (match plan.mode {
-                    BruteForceExecutionMode::Recall => best_distance(
-                        plan,
-                        vector,
-                        vectors.as_deref(),
-                        row_idx,
-                        &collection.primary_vector,
-                    )?,
-                    BruteForceExecutionMode::FilterOnlyScan => Some(0.0),
-                }) else {
-                    continue;
-                };
+                let per_field_distance = compute_per_field_distances(
+                    plan,
+                    vector,
+                    vectors.as_deref(),
+                    row_idx,
+                    &collection.primary_vector,
+                )?;
 
-                let candidate = DocumentHit {
+                if per_field_distance.is_empty() && plan.mode == BruteForceExecutionMode::Recall {
+                    continue;
+                }
+
+                let best_distance = per_field_distance
+                    .values()
+                    .copied()
+                    .into_iter()
+                    .reduce(f32::min);
+
+                collected.insert(
                     id,
-                    distance,
-                    fields: fields.clone(),
-                    vectors: BTreeMap::new(),
-                };
-                insert_best_hit(&mut best_hits, candidate);
+                    CollectedDoc {
+                        id,
+                        fields: fields.clone(),
+                        per_field_distance,
+                        best_distance,
+                    },
+                );
             }
         }
 
-        let mut hits = best_hits.into_values().collect::<Vec<_>>();
+        if use_reranker {
+            return Ok(apply_reranker(collected, plan));
+        }
+
+        // Default: best-distance merge (existing behavior)
+        let mut hits = collected
+            .into_values()
+            .filter_map(|doc| {
+                let distance = match doc.best_distance {
+                    Some(d) => d,
+                    None => 0.0, // FilterOnlyScan
+                };
+                Some(DocumentHit {
+                    id: doc.id,
+                    distance,
+                    fields: doc.fields,
+                    vectors: BTreeMap::new(),
+                })
+            })
+            .collect::<Vec<_>>();
         hits.sort_by(compare_hits);
         if let Some(group_by) = plan.group_by.as_ref() {
             return Ok(collapse_hits_by_group(
@@ -113,14 +149,14 @@ impl QueryExecutor {
     }
 }
 
-fn best_distance(
+fn compute_per_field_distances(
     plan: &BruteForceQueryPlan,
     primary_vector: &[f32],
     secondary_vectors: Option<&[BTreeMap<String, Vec<f32>>]>,
     row_idx: usize,
     primary_vector_name: &str,
-) -> io::Result<Option<f32>> {
-    let mut best = None;
+) -> io::Result<HashMap<String, f32>> {
+    let mut distances = HashMap::new();
     for source in &plan.recall_sources {
         let candidate_vector = match &source.kind {
             super::planner::RecallSourceKind::QueryById { field_name, .. }
@@ -138,13 +174,58 @@ fn best_distance(
             continue;
         };
         let distance = distance_by_metric(&source.vector, candidate_vector, &source.metric)?;
-        match best {
-            Some(current) if distance >= current => {}
-            _ => best = Some(distance),
+        distances.insert(source.field_key(), distance);
+    }
+    Ok(distances)
+}
+
+fn apply_reranker(
+    collected: HashMap<i64, CollectedDoc>,
+    plan: &BruteForceQueryPlan,
+) -> Vec<DocumentHit> {
+    let reranker = plan.reranker.as_ref().expect("reranker must be present");
+
+    // Build per-field ranked lists
+    let mut per_field: PerFieldResults = HashMap::new();
+    let mut metrics: BTreeMap<String, String> = BTreeMap::new();
+
+    for source in &plan.recall_sources {
+        let field_key = source.field_key();
+        metrics.insert(field_key.clone(), source.metric.clone());
+    }
+
+    // Collect all (id, distance) per field, then sort
+    for doc in collected.values() {
+        for (field_key, distance) in &doc.per_field_distance {
+            per_field
+                .entry(field_key.clone())
+                .or_default()
+                .push((doc.id, *distance));
         }
     }
 
-    Ok(best)
+    // Sort each field's list by distance ascending
+    for list in per_field.values_mut() {
+        list.sort_by(|a, b| a.1.total_cmp(&b.1));
+    }
+
+    let fused = fuse(&per_field, reranker, &metrics, plan.top_k);
+
+    // Build hits from fused results
+    fused
+        .into_iter()
+        .filter_map(|(id, _fused_score)| {
+            let doc = collected.get(&id)?;
+            // Use the best_distance for display; fused_score is the rerank score
+            let distance = doc.best_distance.unwrap_or(0.0);
+            Some(DocumentHit {
+                id,
+                distance,
+                fields: doc.fields.clone(),
+                vectors: BTreeMap::new(),
+            })
+        })
+        .collect()
 }
 
 fn candidate_vector_for_field<'a>(
@@ -158,18 +239,6 @@ fn candidate_vector_for_field<'a>(
         Some(primary_vector)
     } else {
         secondary_vectors.and_then(|vectors| vectors[row_idx].get(field_name).map(Vec::as_slice))
-    }
-}
-
-fn insert_best_hit(best_hits: &mut HashMap<i64, DocumentHit>, candidate: DocumentHit) {
-    match best_hits.get_mut(&candidate.id) {
-        Some(existing) if compare_hits(&candidate, existing) == Ordering::Less => {
-            *existing = candidate;
-        }
-        None => {
-            best_hits.insert(candidate.id, candidate);
-        }
-        _ => {}
     }
 }
 

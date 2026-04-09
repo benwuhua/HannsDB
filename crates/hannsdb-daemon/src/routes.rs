@@ -15,15 +15,18 @@ use hannsdb_core::query::{
 };
 
 use crate::api::{
-    AddColumnRequest, AddColumnResponse, CollectionInfoResponse, CompactCollectionResponse,
+    AddColumnRequest, AddColumnResponse, AlterColumnRequest, AlterColumnResponse,
+    CollectionInfoResponse, CompactCollectionResponse,
     CreateCollectionRequest,
     CreateCollectionResponse, CreateIndexResponse, DeleteByFilterRequest, DeleteRecordsRequest,
-    DeleteRecordsResponse, DropCollectionResponse, DropIndexResponse, ErrorResponse,
+    DeleteRecordsResponse, DropCollectionResponse, DropColumnResponse, DropIndexResponse,
+    ErrorResponse,
     FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse,
     HealthResponse, InsertRecordsRequest, InsertRecordsResponse, LegacySearchRequest,
-    ListCollectionsResponse, ScalarIndexRequest, ScalarIndexesResponse, SearchHitResponse,
-    SearchRequest, SearchResponse, SegmentsResponse, TypedSearchRequest, UpsertRecordsResponse,
-    UpdateRecordsRequest, UpdateRecordsResponse, VectorIndexRequest, VectorIndexesResponse,
+    ListCollectionsResponse, OptimizeCollectionResponse, ScalarIndexRequest, ScalarIndexesResponse,
+    SearchHitResponse, SearchRequest, SearchResponse, SegmentsResponse, TypedSearchRequest,
+    UpsertRecordsResponse, UpdateRecordsRequest, UpdateRecordsResponse, VectorIndexRequest,
+    VectorIndexesResponse,
 };
 
 #[derive(Clone)]
@@ -61,6 +64,10 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
             get(get_collection_segments),
         )
         .route(
+            "/collections/:collection/admin/optimize",
+            post(optimize_collection),
+        )
+        .route(
             "/collections/:collection/records",
             post(insert_records).delete(delete_records),
         )
@@ -84,6 +91,10 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
         .route(
             "/collections/:collection/schema/columns",
             post(add_column_to_collection),
+        )
+        .route(
+            "/collections/:collection/schema/columns/:field_name",
+            delete(drop_column_from_collection).patch(alter_column_in_collection),
         )
         .route(
             "/collections/:collection/indexes/vector",
@@ -308,6 +319,38 @@ async fn compact_collection(
             StatusCode::NOT_IMPLEMENTED,
             Json(ErrorResponse {
                 error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn optimize_collection(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Response {
+    let db = state.db.lock().expect("daemon state mutex poisoned");
+    let result = db.optimize_collection(&collection);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(OptimizeCollectionResponse {
+                optimized: collection,
             }),
         )
             .into_response(),
@@ -1393,8 +1436,18 @@ fn build_query_context(request: TypedSearchRequest) -> io::Result<QueryContext> 
         group_by: request.group_by.map(|group_by| QueryGroupBy {
             field_name: group_by.field_name,
         }),
-        reranker: request.reranker.map(|reranker| QueryReranker {
-            model: reranker.model,
+        reranker: request.reranker.and_then(|reranker| {
+            // Map daemon reranker request to core QueryReranker enum.
+            // For now, only RRF is supported via daemon.
+            if let Some(rank_constant) = reranker.rank_constant {
+                Some(QueryReranker::Rrf { rank_constant })
+            } else if !reranker.weights.is_empty() {
+                Some(QueryReranker::Weighted {
+                    weights: reranker.weights,
+                })
+            } else {
+                None
+            }
         }),
     })
 }
@@ -1408,5 +1461,84 @@ fn field_value_to_json(value: FieldValue) -> serde_json::Value {
                 .expect("finite float field values should serialize"),
         ),
         FieldValue::Bool(value) => serde_json::Value::Bool(value),
+    }
+}
+
+async fn drop_column_from_collection(
+    State(state): State<DaemonState>,
+    AxumPath((collection, field_name)): AxumPath<(String, String)>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .drop_column(&collection, &field_name);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DropColumnResponse {
+                dropped: field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn alter_column_in_collection(
+    State(state): State<DaemonState>,
+    AxumPath((collection, field_name)): AxumPath<(String, String)>,
+    Json(request): Json<AlterColumnRequest>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .alter_column(&collection, &field_name, &request.new_name);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AlterColumnResponse {
+                old_name: field_name,
+                new_name: request.new_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }

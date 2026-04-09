@@ -721,11 +721,11 @@ fn collection_api_delete_by_filter_invalid_filter_errors() {
         .expect("create collection");
 
     let err = db
-        .delete_by_filter("docs", "group = 1")
+        .delete_by_filter("docs", "group ??? 1")
         .expect_err("invalid filter must error");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(
-        err.to_string().contains("unsupported filter clause"),
+        err.to_string().contains("expected comparison operator"),
         "error should come from the existing filter parser"
     );
 }
@@ -1985,4 +1985,290 @@ fn add_column_wal_replay_preserves_new_field() {
     let db2 = HannsDb::open(&temp).expect("reopen for replay");
     let fetched = db2.fetch_documents("docs", &[1]).expect("fetch");
     assert_eq!(fetched[0].fields.get("tag"), Some(&FieldValue::String("x".into())));
+}
+
+#[test]
+fn drop_column_removes_field_from_schema() {
+    let temp = unique_temp_dir("drop_column");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("label", FieldType::String),
+            ScalarFieldSchema::new("score", FieldType::Int64),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+
+    db.drop_column("docs", "score").expect("drop column");
+
+    let fetched = db.fetch_documents("docs", &[]).expect("fetch");
+    assert!(fetched.is_empty());
+
+    // Can add a new field with the same name after dropping
+    db.add_column(
+        "docs",
+        ScalarFieldSchema::new("score", FieldType::Float64),
+    )
+    .expect("re-add");
+}
+
+#[test]
+fn drop_column_nonexistent_returns_not_found() {
+    let temp = unique_temp_dir("drop_column_missing");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    db.create_collection("docs", 2, "l2").expect("create");
+
+    let err = db.drop_column("docs", "nonexistent").expect_err("should fail");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn alter_column_renames_field() {
+    let temp = unique_temp_dir("alter_column");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("label", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            1,
+            vec![("label".to_string(), FieldValue::String("alpha".into()))],
+            vec![0.0, 0.0],
+        )],
+    )
+    .expect("insert");
+
+    db.alter_column("docs", "label", "name").expect("rename");
+
+    // The schema field is renamed, but existing payload data still has the old key.
+    let fetched = db.fetch_documents("docs", &[1]).expect("fetch");
+    assert_eq!(
+        fetched[0].fields.get("label"),
+        Some(&FieldValue::String("alpha".into())),
+        "existing payload data should still use the old key"
+    );
+
+    // The old name is no longer in the schema so we can add it as a new field.
+    db.add_column("docs", ScalarFieldSchema::new("label", FieldType::Int64))
+        .expect("old name should be available after rename");
+}
+
+#[test]
+fn alter_column_nonexistent_returns_not_found() {
+    let temp = unique_temp_dir("alter_column_missing");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    db.create_collection("docs", 2, "l2").expect("create");
+
+    let err = db
+        .alter_column("docs", "nonexistent", "new_name")
+        .expect_err("should fail");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn alter_column_conflicting_new_name_returns_already_exists() {
+    let temp = unique_temp_dir("alter_column_conflict");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("a", FieldType::String),
+            ScalarFieldSchema::new("b", FieldType::Int64),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+
+    let err = db
+        .alter_column("docs", "a", "b")
+        .expect_err("should fail");
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+}
+
+#[test]
+fn drop_column_wal_replay_preserves_removal() {
+    let temp = unique_temp_dir("drop_column_wal");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("tag", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+    db.drop_column("docs", "tag").expect("drop column");
+
+    let mut db2 = HannsDb::open(&temp).expect("reopen");
+    db2.add_column(
+        "docs",
+        ScalarFieldSchema::new("tag", FieldType::String),
+    )
+    .expect("re-add after replay");
+}
+
+#[test]
+fn alter_column_wal_replay_preserves_rename() {
+    let temp = unique_temp_dir("alter_column_wal");
+    let mut db = HannsDb::open(&temp).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("old_name", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+    db.alter_column("docs", "old_name", "new_name")
+        .expect("rename");
+
+    let mut db2 = HannsDb::open(&temp).expect("reopen");
+    db2.add_column(
+        "docs",
+        ScalarFieldSchema::new("old_name", FieldType::Int64),
+    )
+    .expect("re-add old name");
+}
+
+#[test]
+fn collection_api_read_only_rejects_mutations() {
+    let root = unique_temp_dir("hannsdb_read_only");
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+        db.insert("docs", &[1], &[0.0_f32, 0.0]).expect("insert");
+    }
+
+    let mut db = HannsDb::open_read_only(&root).expect("open read-only");
+
+    // Reads should work
+    let hits = db.search("docs", &[0.0, 0.0], 1).expect("search");
+    assert_eq!(hits.len(), 1);
+
+    // Mutations should fail
+    let err = db
+        .insert("docs", &[2], &[1.0, 1.0])
+        .expect_err("insert should fail");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+    let err = db
+        .delete("docs", &[1])
+        .expect_err("delete should fail");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn collection_api_filtered_search_uses_ann_path_with_post_filter() {
+    let root = unique_temp_dir("hannsdb_filtered_ann_pushdown");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("color", FieldType::String),
+            ScalarFieldSchema::new("score", FieldType::Int64),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    // Insert docs with different "color" values
+    let docs = vec![
+        Document::new(
+            1,
+            [
+                ("color".to_string(), FieldValue::String("red".to_string())),
+                ("score".to_string(), FieldValue::Int64(10)),
+            ],
+            vec![0.0, 0.0],
+        ),
+        Document::new(
+            2,
+            [
+                ("color".to_string(), FieldValue::String("blue".to_string())),
+                ("score".to_string(), FieldValue::Int64(20)),
+            ],
+            vec![1.0, 1.0],
+        ),
+        Document::new(
+            3,
+            [
+                ("color".to_string(), FieldValue::String("red".to_string())),
+                ("score".to_string(), FieldValue::Int64(30)),
+            ],
+            vec![0.1, 0.1],
+        ),
+    ];
+    db.insert_documents("docs", &docs).expect("insert docs");
+
+    // Build ANN index
+    db.optimize_collection("docs").expect("optimize builds ANN cache");
+
+    // Filtered query: only "red" docs near origin
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 10, Some("color == \"red\""))
+        .expect("filtered query should succeed");
+
+    // Should only return red docs (ids 1 and 3), ordered by distance
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].id, 1);
+    assert_eq!(hits[1].id, 3);
+    // Blue doc (id=2) should be filtered out
+    assert!(!hits.iter().any(|hit| hit.id == 2));
+}
+
+#[test]
+fn collection_api_filtered_query_context_uses_ann_with_post_filter() {
+    use hannsdb_core::query::{QueryContext, VectorQuery};
+
+    let root = unique_temp_dir("hannsdb_filtered_ann_context");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(1, [("group".into(), FieldValue::Int64(1))], vec![0.0, 0.0]),
+            Document::new(2, [("group".into(), FieldValue::Int64(2))], vec![0.5, 0.5]),
+            Document::new(3, [("group".into(), FieldValue::Int64(1))], vec![0.1, 0.1]),
+        ],
+    )
+    .expect("insert");
+
+    db.optimize_collection("docs").expect("optimize");
+
+    let ctx = QueryContext {
+        top_k: 10,
+        queries: vec![VectorQuery {
+            field_name: "vector".to_string(),
+            vector: vec![0.0, 0.0],
+            param: None,
+        }],
+        filter: Some("group == 1".to_string()),
+        ..Default::default()
+    };
+
+    let hits = db.query_with_context("docs", &ctx).expect("query");
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.id == 1 || hit.id == 3));
 }

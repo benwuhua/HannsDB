@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hannsdb_index::adapter::{AdapterError, VectorIndexBackend};
 use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind};
 use hannsdb_index::factory::DefaultIndexFactory;
+use hannsdb_index::scalar::{InvertedScalarIndex, RangeOp, ScalarValue};
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
@@ -15,7 +16,7 @@ use crate::document::{
 };
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
-    FilterExpr,
+    ComparisonOp, FilterExpr,
     QueryContext, QueryExecutor, QueryPlan, QueryPlanner, SearchHit,
 };
 use crate::segment::{
@@ -29,8 +30,14 @@ const DEFAULT_EF_SEARCH: usize = 32;
 const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 const INDEX_CATALOG_FILE: &str = "indexes.json";
 
+#[cfg(feature = "knowhere-backend")]
+fn ann_blob_path(collection_dir: &Path, field_name: &str) -> PathBuf {
+    collection_dir.join("ann").join(format!("{field_name}.bin"))
+}
+
 pub struct HannsDb {
     root: PathBuf,
+    read_only: bool,
     collection_handles: RwLock<HashMap<String, Arc<CollectionHandle>>>,
 }
 
@@ -89,10 +96,19 @@ pub struct CollectionHandle {
     version_set: RwLock<VersionSet>,
     index_registry: Arc<IndexRegistry>,
     search_cache: Mutex<HashMap<String, CachedSearchState>>,
+    scalar_cache: Mutex<HashMap<String, InvertedScalarIndex>>,
 }
 
 impl HannsDb {
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_internal(root, false)
+    }
+
+    pub fn open_read_only(root: &Path) -> io::Result<Self> {
+        Self::open_internal(root, true)
+    }
+
+    fn open_internal(root: &Path, read_only: bool) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         fs::create_dir_all(root.join("collections"))?;
 
@@ -105,10 +121,21 @@ impl HannsDb {
 
         let mut db = Self {
             root: root.to_path_buf(),
+            read_only,
             collection_handles: RwLock::new(HashMap::new()),
         };
         db.replay_wal_if_needed()?;
         Ok(db)
+    }
+
+    fn require_write(&self) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "database is opened in read-only mode",
+            ));
+        }
+        Ok(())
     }
 
     pub fn open_collection_handle(&self, name: &str) -> io::Result<Arc<CollectionHandle>> {
@@ -162,6 +189,7 @@ impl HannsDb {
         name: &str,
         schema: &CollectionSchema,
     ) -> io::Result<()> {
+        self.require_write()?;
         self.create_collection_with_schema_internal(name, schema, true)
     }
 
@@ -234,6 +262,7 @@ impl HannsDb {
         collection: &str,
         field: ScalarFieldSchema,
     ) -> io::Result<()> {
+        self.require_write()?;
         self.add_column_internal(collection, field, true)
     }
 
@@ -263,7 +292,79 @@ impl HannsDb {
         Ok(())
     }
 
+    pub fn drop_column(&mut self, collection: &str, field_name: &str) -> io::Result<()> {
+        self.require_write()?;
+        self.drop_column_internal(collection, field_name, true)
+    }
+
+    fn drop_column_internal(
+        &mut self,
+        collection: &str,
+        field_name: &str,
+        log_wal: bool,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::DropColumn {
+                    collection: collection.to_string(),
+                    field_name: field_name.to_string(),
+                },
+            )?;
+        }
+
+        crate::catalog::schema_mutation::remove_field_from_schema(&mut meta.fields, field_name)?;
+        meta.save_to_path(&paths.collection_meta)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
+    pub fn alter_column(
+        &mut self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> io::Result<()> {
+        self.require_write()?;
+        self.alter_column_internal(collection, old_name, new_name, true)
+    }
+
+    fn alter_column_internal(
+        &mut self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+        log_wal: bool,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::AlterColumn {
+                    collection: collection.to_string(),
+                    old_name: old_name.to_string(),
+                    new_name: new_name.to_string(),
+                },
+            )?;
+        }
+
+        crate::catalog::schema_mutation::rename_field_in_schema(
+            &mut meta.fields,
+            old_name,
+            new_name,
+        )?;
+        meta.save_to_path(&paths.collection_meta)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
     pub fn drop_collection(&mut self, name: &str) -> io::Result<()> {
+        self.require_write()?;
         self.drop_collection_internal(name, true)
     }
 
@@ -330,7 +431,7 @@ impl HannsDb {
         let mut catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         catalog.upsert_vector_index(descriptor);
         catalog.save_to_path(&paths.index_catalog)?;
-        invalidate_persisted_hnsw_blob(&paths.dir)?;
+        invalidate_ann_blobs(&paths.dir)?;
         self.invalidate_search_cache(collection);
         Ok(())
     }
@@ -349,7 +450,7 @@ impl HannsDb {
             ));
         }
         catalog.save_to_path(&paths.index_catalog)?;
-        invalidate_persisted_hnsw_blob(&paths.dir)?;
+        invalidate_ann_blobs(&paths.dir)?;
         self.invalidate_search_cache(collection);
         Ok(())
     }
@@ -419,6 +520,7 @@ impl HannsDb {
     }
 
     pub fn compact_collection(&mut self, name: &str) -> io::Result<()> {
+        self.require_write()?;
         self.compact_collection_internal(name, true)
     }
 
@@ -559,6 +661,7 @@ impl HannsDb {
         external_ids: &[i64],
         vectors: &[f32],
     ) -> io::Result<usize> {
+        self.require_write()?;
         self.insert_internal(collection, external_ids, vectors, true)
     }
 
@@ -655,6 +758,7 @@ impl HannsDb {
         collection: &str,
         documents: &[Document],
     ) -> io::Result<usize> {
+        self.require_write()?;
         self.insert_documents_internal(collection, documents, true)
     }
 
@@ -718,6 +822,7 @@ impl HannsDb {
         collection: &str,
         documents: &[Document],
     ) -> io::Result<usize> {
+        self.require_write()?;
         self.upsert_documents_internal(collection, documents, true)
     }
 
@@ -786,6 +891,7 @@ impl HannsDb {
         collection: &str,
         updates: &[DocumentUpdate],
     ) -> io::Result<usize> {
+        self.require_write()?;
         self.update_documents_internal(collection, updates, true)
     }
 
@@ -863,10 +969,12 @@ impl HannsDb {
     }
 
     pub fn delete(&mut self, collection: &str, external_ids: &[i64]) -> io::Result<usize> {
+        self.require_write()?;
         self.delete_internal(collection, external_ids, true)
     }
 
     pub fn delete_by_filter(&mut self, collection: &str, filter: &str) -> io::Result<usize> {
+        self.require_write()?;
         let filter_expr = parse_filter(filter)?;
         let matching_ids = self.collect_latest_live_filtered_ids(collection, &filter_expr)?;
         if matching_ids.is_empty() {
@@ -874,7 +982,7 @@ impl HannsDb {
         }
 
         let matching_ids = matching_ids.into_iter().collect::<Vec<_>>();
-        self.delete(collection, &matching_ids)
+        self.delete_internal(collection, &matching_ids, true)
     }
 
     fn delete_internal(
@@ -1139,6 +1247,15 @@ impl HannsDb {
                 collection,
                 field,
             } => self.add_column_internal(collection, field.clone(), false),
+            WalRecord::DropColumn {
+                collection,
+                field_name,
+            } => self.drop_column_internal(collection, field_name, false),
+            WalRecord::AlterColumn {
+                collection,
+                old_name,
+                new_name,
+            } => self.alter_column_internal(collection, old_name, new_name, false),
         }
     }
 }
@@ -1158,6 +1275,7 @@ impl CollectionHandle {
             version_set: RwLock::new(version_set),
             index_registry,
             search_cache: Mutex::new(HashMap::new()),
+            scalar_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1195,14 +1313,28 @@ impl CollectionHandle {
         )?;
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
+                // When a filter is present, overfetch from ANN to compensate for
+                // rows that will be discarded by the post-filter.
+                const FILTER_OVERFETCH_FACTOR: usize = 4;
+                let search_k = if plan.filter.is_some() {
+                    plan.top_k.saturating_mul(FILTER_OVERFETCH_FACTOR)
+                } else {
+                    plan.top_k
+                };
                 let mut hits = self.query_documents_for_field_with_ef_internal(
                     &collection_meta,
                     &plan.field_name,
                     &plan.vector,
-                    plan.top_k,
+                    search_k,
                     plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
                     context.include_vector,
                 )?;
+
+                if let Some(filter) = &plan.filter {
+                    hits.retain(|hit| filter.matches(&hit.fields));
+                    hits.truncate(plan.top_k);
+                }
+
                 project_document_hits(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
             }
@@ -1220,35 +1352,112 @@ impl CollectionHandle {
 
     pub fn optimize(&self) -> io::Result<()> {
         let _index_registry = Arc::clone(&self.index_registry);
-        let field_name = self.collection_primary_vector_name()?;
-        let mut state = self.load_search_state_for_field(&field_name)?;
-        let mut hnsw_bytes = None;
-        state.optimized_ann = Some(build_optimized_ann_state(&state, Some(&mut hnsw_bytes))?);
-        #[cfg(feature = "knowhere-backend")]
-        {
-            let paths = self.collection_paths();
-            if let Some(bytes) = hnsw_bytes {
-                if let Err(e) = fs::write(paths.dir.join(HNSW_INDEX_FILE), &bytes) {
-                    log::warn!("Failed to persist HNSW index: {e}");
-                } else {
-                    log::info!(
-                        "Persisted HNSW index ({} bytes) for collection '{}'",
-                        bytes.len(),
-                        self.name
-                    );
-                }
-            } else {
-                let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-                if hnsw_path.exists() {
-                    let _ = fs::remove_file(hnsw_path);
-                }
-            }
-        }
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+
         let mut cache = self
             .search_cache
             .lock()
             .expect("search cache mutex poisoned");
-        cache.insert(state.field_name.clone(), state);
+
+        for vector_schema in &collection_meta.vectors {
+            let field_name = &vector_schema.name;
+            let Some(descriptor) = resolve_vector_descriptor_for_field(
+                &collection_meta,
+                &index_catalog,
+                field_name,
+            )?
+            else {
+                continue;
+            };
+
+            let mut state = self.load_search_state_for_field(field_name)?;
+            let mut blob_bytes = None;
+            state.optimized_ann = Some(build_optimized_ann_state(&state, Some(&mut blob_bytes))?);
+
+            #[cfg(feature = "knowhere-backend")]
+            if let Some(bytes) = blob_bytes {
+                let blob_path = ann_blob_path(&paths.dir, field_name);
+                if let Some(parent) = blob_path.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        log::warn!(
+                            "Failed to create ANN dir for field '{}': {e}",
+                            field_name
+                        );
+                        cache.insert(state.field_name.clone(), state);
+                        continue;
+                    }
+                }
+                if let Err(e) = fs::write(&blob_path, &bytes) {
+                    log::warn!("Failed to persist ANN index for '{}': {e}", field_name);
+                } else {
+                    log::info!(
+                        "Persisted ANN index ({} bytes) for field '{}' in collection '{}'",
+                        bytes.len(),
+                        field_name,
+                        self.name
+                    );
+                }
+            }
+
+            cache.insert(state.field_name.clone(), state);
+
+            // Suppress unused-variable warnings when knowhere-backend is off
+            let _ = (&descriptor, &blob_bytes);
+        }
+
+        // Build scalar indexes for fields that have descriptors in the catalog.
+        if !index_catalog.scalar_indexes.is_empty() {
+            let segment_paths = self.segment_manager.segment_paths()?;
+            let mut all_payloads: Vec<BTreeMap<String, FieldValue>> = Vec::new();
+            let mut all_ids: Vec<i64> = Vec::new();
+            for segment in &segment_paths {
+                let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+                let payloads =
+                    load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+                for (row_idx, ext_id) in stored_ids.iter().enumerate() {
+                    if tombstone.is_deleted(row_idx) {
+                        continue;
+                    }
+                    all_payloads.push(payloads[row_idx].clone());
+                    all_ids.push(*ext_id);
+                }
+            }
+
+            // Convert FieldValue payloads to ScalarValue payloads once.
+            let scalar_payloads: Vec<BTreeMap<String, ScalarValue>> = all_payloads
+                .iter()
+                .map(|map| {
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), field_value_to_scalar(v)))
+                        .collect()
+                })
+                .collect();
+
+            let mut scalar_cache = self
+                .scalar_cache
+                .lock()
+                .expect("scalar cache mutex poisoned");
+            for scalar_descriptor in &index_catalog.scalar_indexes {
+                let field_name = &scalar_descriptor.field_name;
+                let index = InvertedScalarIndex::build_from_payloads(
+                    scalar_descriptor.clone(),
+                    field_name,
+                    &scalar_payloads,
+                    &all_ids,
+                );
+                log::info!(
+                    "Built scalar index for field '{}' in collection '{}' ({} indexed IDs)",
+                    field_name,
+                    self.name,
+                    index.all_indexed_ids().len(),
+                );
+                scalar_cache.insert(field_name.clone(), index);
+            }
+        }
+
         Ok(())
     }
 
@@ -1556,6 +1765,11 @@ impl CollectionHandle {
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let segment_paths = self.segment_manager.segment_paths()?;
 
+        // Try to extract candidate IDs from scalar indexes.
+        // For now we handle the simplest case: a single Eq or InList clause
+        // on a field that has a scalar index.
+        let indexed_candidates = self.try_scalar_index_candidates(&filter_expr);
+
         let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
         for segment in segment_paths {
             let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
@@ -1574,13 +1788,23 @@ impl CollectionHandle {
                 if tombstone.is_deleted(row_idx) {
                     continue;
                 }
+                let ext_id = stored_ids[row_idx];
+
+                // If the scalar index gave us a candidate set, skip rows
+                // whose external ID is not in the set.
+                if let Some(ref candidates) = indexed_candidates {
+                    if !candidates.contains(&ext_id) {
+                        continue;
+                    }
+                }
+
                 let fields = &payloads[row_idx];
                 if !filter_expr.matches(fields) {
                     continue;
                 }
                 let candidate = RankedDocumentHit {
                     hit: DocumentHit {
-                        id: stored_ids[row_idx],
+                        id: ext_id,
                         distance: distance_by_metric(query, vector, &collection_meta.metric)?,
                         fields: fields.clone(),
                         vectors: BTreeMap::new(),
@@ -1608,6 +1832,87 @@ impl CollectionHandle {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(hits)
+    }
+
+    /// Attempt to use scalar indexes to narrow down candidate IDs.
+    ///
+    /// Returns `Some(set)` if an index-accelerated candidate set was produced,
+    /// or `None` if no scalar index could be applied (fall back to brute-force).
+    fn try_scalar_index_candidates(&self, filter_expr: &FilterExpr) -> Option<BTreeSet<i64>> {
+        let scalar_cache = self.scalar_cache.lock().ok()?;
+        if scalar_cache.is_empty() {
+            return None;
+        }
+
+        match filter_expr {
+            FilterExpr::Clause { field, op, value } => {
+                let index = scalar_cache.get(field)?;
+                let scalar_value = field_value_to_scalar(value);
+                match op {
+                    ComparisonOp::Eq => Some(index.lookup_eq(&scalar_value)),
+                    ComparisonOp::Ne => {
+                        Some(index.lookup_range(RangeOp::Ne, &scalar_value))
+                    }
+                    ComparisonOp::Gt => {
+                        Some(index.lookup_range(RangeOp::Gt, &scalar_value))
+                    }
+                    ComparisonOp::Gte => {
+                        Some(index.lookup_range(RangeOp::Gte, &scalar_value))
+                    }
+                    ComparisonOp::Lt => {
+                        Some(index.lookup_range(RangeOp::Lt, &scalar_value))
+                    }
+                    ComparisonOp::Lte => {
+                        Some(index.lookup_range(RangeOp::Lte, &scalar_value))
+                    }
+                }
+            }
+            FilterExpr::InList {
+                field,
+                negated,
+                values,
+            } => {
+                let index = scalar_cache.get(field)?;
+                let scalar_values: Vec<ScalarValue> =
+                    values.iter().map(field_value_to_scalar).collect();
+                Some(index.lookup_in(&scalar_values, *negated))
+            }
+            // AND: intersect candidates from each sub-expression.
+            FilterExpr::And(exprs) => {
+                let mut result: Option<BTreeSet<i64>> = None;
+                for expr in exprs {
+                    let sub = self.try_scalar_index_candidates(expr);
+                    match (result.take(), sub) {
+                        (None, Some(s)) => result = Some(s),
+                        (Some(r), Some(s)) => {
+                            let intersection: BTreeSet<i64> =
+                                r.intersection(&s).cloned().collect();
+                            result = Some(intersection);
+                        }
+                        (prior, None) => result = prior,
+                    }
+                }
+                result
+            }
+            // OR: union candidates from each sub-expression.
+            FilterExpr::Or(exprs) => {
+                let mut result: Option<BTreeSet<i64>> = None;
+                for expr in exprs {
+                    let sub = self.try_scalar_index_candidates(expr);
+                    match (result.take(), sub) {
+                        (None, Some(s)) => result = Some(s),
+                        (Some(r), Some(s)) => {
+                            let union: BTreeSet<i64> = r.union(&s).cloned().collect();
+                            result = Some(union);
+                        }
+                        (prior, None) => result = prior,
+                    }
+                }
+                result
+            }
+            // NOT and NullCheck are harder to accelerate; fall back.
+            _ => None,
+        }
     }
 
     fn collection_paths(&self) -> CollectionPaths {
@@ -1685,16 +1990,9 @@ impl CollectionHandle {
             return Ok(state);
         }
 
-        let primary_name = self.collection_primary_vector_name()?;
-        let mut state = if field_name == primary_name {
-            self.try_load_persisted_ann_state()?
-                .unwrap_or(self.load_search_state_for_field(field_name)?)
-        } else {
-            self.load_search_state_for_field(field_name)?
-        };
-        if field_name != primary_name {
-            attach_lazy_optimized_ann_for_secondary_field(&mut state)?;
-        }
+        let state = self
+            .try_load_persisted_ann_state(field_name)?
+            .unwrap_or(self.load_search_state_for_field(field_name)?);
 
         let mut cache = self
             .search_cache
@@ -1707,46 +2005,78 @@ impl CollectionHandle {
         Ok(state)
     }
 
-    fn try_load_persisted_ann_state(&self) -> io::Result<Option<CachedSearchState>> {
+    fn try_load_persisted_ann_state(
+        &self,
+        field_name: &str,
+    ) -> io::Result<Option<CachedSearchState>> {
         #[cfg(not(feature = "knowhere-backend"))]
         {
+            let _ = field_name;
             return Ok(None);
         }
 
         #[cfg(feature = "knowhere-backend")]
         {
             let paths = self.collection_paths();
-            let hnsw_path = paths.dir.join(HNSW_INDEX_FILE);
-            if !hnsw_path.exists() {
-                return Ok(None);
-            }
-
             let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
             let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
-            let primary_index =
-                resolve_primary_vector_descriptor(&collection_meta, &index_catalog)?;
-            if primary_index.kind != VectorIndexKind::Hnsw {
+            let descriptor = resolve_vector_descriptor_for_field(
+                &collection_meta,
+                &index_catalog,
+                field_name,
+            )?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "no descriptor for field")
+            })?;
+
+            if descriptor.kind != VectorIndexKind::Hnsw {
                 return Ok(None);
             }
-            let metric = collection_meta.metric.clone();
-            let metric_lc = primary_index
+
+            // Try new per-field path first
+            let new_path = ann_blob_path(&paths.dir, field_name);
+            // Fall back to legacy single-file path for primary field
+            let primary_name = &collection_meta.primary_vector;
+            let legacy_path = paths.dir.join(HNSW_INDEX_FILE);
+            let is_primary = field_name == primary_name;
+
+            let blob_path = if new_path.exists() {
+                new_path
+            } else if is_primary && legacy_path.exists() {
+                legacy_path
+            } else {
+                return Ok(None);
+            };
+
+            let vector_schema = collection_meta
+                .vectors
+                .iter()
+                .find(|v| v.name == field_name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("vector field '{}' not found", field_name),
+                    )
+                })?;
+
+            let metric_lc = descriptor
                 .metric
                 .clone()
-                .unwrap_or_else(|| metric.clone())
+                .unwrap_or_else(|| collection_meta.metric.clone())
                 .to_ascii_lowercase();
 
-            match fs::read(&hnsw_path).and_then(|bytes| {
+            match fs::read(&blob_path).and_then(|bytes| {
                 DefaultIndexFactory::default()
-                    .create_vector_index(collection_meta.dimension, &primary_index, Some(&bytes))
+                    .create_vector_index(vector_schema.dimension, &descriptor, Some(&bytes))
                     .map_err(adapter_error_to_io)
             }) {
                 Ok(backend) => {
-                    let mut state =
-                        self.load_search_state_for_field(&collection_meta.primary_vector)?;
+                    let mut state = self.load_search_state_for_field(field_name)?;
                     log::info!(
-                        "Loaded persisted HNSW index for '{}' from '{}'",
+                        "Loaded persisted ANN index for field '{}' in '{}' from '{}'",
+                        field_name,
                         self.name,
-                        hnsw_path.display()
+                        blob_path.display()
                     );
                     let ann_external_ids = Arc::clone(&state.external_ids);
                     state.optimized_ann = Some(OptimizedAnnState {
@@ -1758,9 +2088,10 @@ impl CollectionHandle {
                 }
                 Err(e) => {
                     log::warn!(
-                        "Fast persisted HNSW load failed for '{}' from '{}': {e}",
+                        "Failed to load persisted ANN for field '{}' in '{}' from '{}': {e}",
+                        field_name,
                         self.name,
-                        hnsw_path.display()
+                        blob_path.display()
                     );
                     Ok(None)
                 }
@@ -1785,20 +2116,6 @@ impl CollectionHandle {
         *snapshot = version_set;
         Ok(())
     }
-}
-
-fn attach_lazy_optimized_ann_for_secondary_field(state: &mut CachedSearchState) -> io::Result<()> {
-    if state.optimized_ann.is_some()
-        || !matches!(
-            state.descriptor.kind,
-            VectorIndexKind::Hnsw | VectorIndexKind::Ivf
-        )
-    {
-        return Ok(());
-    }
-
-    state.optimized_ann = Some(build_optimized_ann_state(state, None)?);
-    Ok(())
 }
 
 fn project_document_hits(hits: &mut [DocumentHit], output_fields: Option<&[String]>) {
@@ -2113,10 +2430,22 @@ fn collection_name_for_wal_record(record: &WalRecord) -> &str {
         | WalRecord::UpsertDocuments { collection, .. }
         | WalRecord::Delete { collection, .. }
         | WalRecord::UpdateDocuments { collection, .. }
-        | WalRecord::AddColumn { collection, .. } => collection,
+        | WalRecord::AddColumn { collection, .. }
+        | WalRecord::DropColumn { collection, .. }
+        | WalRecord::AlterColumn { collection, .. } => collection,
         WalRecord::CompactCollection {
             collection_name, ..
         } => collection_name,
+    }
+}
+
+/// Convert a core `FieldValue` into the index crate's `ScalarValue`.
+fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
+    match value {
+        FieldValue::String(s) => ScalarValue::String(s.clone()),
+        FieldValue::Int64(v) => ScalarValue::Int64(*v),
+        FieldValue::Float64(v) => ScalarValue::Float64(*v),
+        FieldValue::Bool(b) => ScalarValue::Bool(*b),
     }
 }
 
@@ -2479,13 +2808,17 @@ fn validate_vector_index_descriptor(
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
 }
 
-fn invalidate_persisted_hnsw_blob(collection_dir: &Path) -> io::Result<()> {
-    let hnsw_path = collection_dir.join(HNSW_INDEX_FILE);
-    match fs::remove_file(&hnsw_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+fn invalidate_ann_blobs(collection_dir: &Path) -> io::Result<()> {
+    let ann_dir = collection_dir.join("ann");
+    if ann_dir.exists() {
+        fs::remove_dir_all(&ann_dir)?;
     }
+    // Also clean up legacy single-file blob if it exists
+    let old_path = collection_dir.join(HNSW_INDEX_FILE);
+    if old_path.exists() {
+        fs::remove_file(&old_path)?;
+    }
+    Ok(())
 }
 
 fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::Result<()> {
@@ -2747,7 +3080,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn secondary_indexed_field_fast_path_warms_cache_with_lazy_optimized_ann() {
+    fn secondary_indexed_field_search_returns_correct_results_without_optimize() {
         let tempdir = tempdir().expect("tempdir");
         let db = seeded_db_with_secondary_hnsw_indexed_collection(tempdir.path());
         let handle = db
@@ -2769,8 +3102,8 @@ mod tests {
             .expect("search cache mutex poisoned");
         let state = cache.get("title").expect("cached secondary search state");
         assert!(
-            state.optimized_ann.is_some(),
-            "secondary indexed fast path should warm an in-memory ANN runtime"
+            state.optimized_ann.is_none(),
+            "secondary field should not have ANN runtime until optimize() is called or persisted blob is loaded"
         );
     }
 
@@ -2800,7 +3133,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_ivf_indexed_field_fast_path_warms_cache_with_lazy_optimized_ann() {
+    fn secondary_ivf_indexed_field_search_returns_correct_results_without_optimize() {
         let tempdir = tempdir().expect("tempdir");
         let db = seeded_db_with_secondary_ivf_indexed_collection(tempdir.path());
         let handle = db
@@ -2822,8 +3155,8 @@ mod tests {
             .expect("search cache mutex poisoned");
         let state = cache.get("title").expect("cached secondary search state");
         assert!(
-            state.optimized_ann.is_some(),
-            "secondary IVF fast path should warm an in-memory ANN runtime"
+            state.optimized_ann.is_none(),
+            "secondary IVF field should not have ANN runtime until optimize() is called or persisted blob is loaded"
         );
     }
 
