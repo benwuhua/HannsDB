@@ -433,14 +433,14 @@ class Collection:
     def delete_by_filter(self, filter: str):
         return self._core.delete_by_filter(filter)
 
-    def add_column(self, field_name, option=None):
-        raise NotImplementedError("add_column is not supported yet")
+    def add_column(self, field_name, data_type="string", nullable=False, array=False):
+        return self._core.add_column(field_name, data_type, nullable, array)
 
     def drop_column(self, field_name):
-        raise NotImplementedError("drop_column is not supported yet")
+        return self._core.drop_column(field_name)
 
-    def alter_column(self, field_name, option=None):
-        raise NotImplementedError("alter_column is not supported yet")
+    def alter_column(self, field_name, new_name):
+        return self._core.alter_column(field_name, new_name)
 
     def optimize(self, option=None):
         if option is None:
@@ -460,7 +460,7 @@ class Collection:
         if kind == "vector":
             return self.create_vector_index(field_name, index_param)
         if index_param is not None:
-            raise NotImplementedError("scalar index params are not supported")
+            return self.create_scalar_index(field_name)
         return self.create_scalar_index(field_name)
 
     def drop_index(self, field_name):
