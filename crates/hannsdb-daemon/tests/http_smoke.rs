@@ -435,7 +435,7 @@ async fn delete_by_filter_route_returns_bad_request_for_whitespace_only_filter()
                 .method("POST")
                 .uri("/collections/docs/records/delete_by_filter")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"filter":"   "}"#))
+                .body(Body::from(serde_json::json!({"filter":"   "}).to_string()))
                 .expect("build request"),
         )
         .await
@@ -510,7 +510,7 @@ async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/collections/missing/records/delete_by_filter")
+                .uri("/collections/docs_does_not_exist_123/records/delete_by_filter")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"filter":"group == 1"}"#))
                 .expect("build request"),
@@ -525,7 +525,7 @@ async fn delete_by_filter_route_returns_not_found_for_missing_collection() {
     let json: Value = serde_json::from_slice(&body).expect("parse delete json");
     let error = json["error"].as_str().expect("daemon error string");
     assert!(
-        error.contains("missing"),
+        error.contains("docs_does_not_exist_123"),
         "error text should mention the missing collection"
     );
 }
