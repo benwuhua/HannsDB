@@ -56,7 +56,7 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
 
     let fetched = db.fetch_documents("docs", &[7]).expect("fetch inserted doc");
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].vector, vec![0.1, 0.2]);
+    assert_eq!(fetched[0].primary_vector(), &[0.1, 0.2]);
     assert_eq!(
         fetched[0].vectors.get("title"),
         Some(&vec![0.3, 0.4])
@@ -76,7 +76,7 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
 
     let fetched = db.fetch_documents("docs", &[7]).expect("fetch upserted doc");
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].vector, vec![1.1, 1.2]);
+    assert_eq!(fetched[0].primary_vector(), &[1.1, 1.2]);
     assert_eq!(
         fetched[0].vectors.get("title"),
         Some(&vec![1.3, 1.4])
@@ -98,7 +98,7 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
         .fetch_documents("docs", &[7])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].vector, vec![1.1, 1.2]);
+    assert_eq!(replayed[0].primary_vector(), &[1.1, 1.2]);
     assert_eq!(
         replayed[0].vectors.get("title"),
         Some(&vec![1.3, 1.4])
@@ -134,7 +134,7 @@ fn multi_vector_document_reopen_rebuilds_truncated_vectors_sidecar() {
         replayed[0].vectors.get("title"),
         Some(&vec![0.3, 0.4])
     );
-    assert_eq!(replayed[0].vector, vec![0.1, 0.2]);
+    assert_eq!(replayed[0].primary_vector(), &[0.1, 0.2]);
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn single_vector_document_reopen_rebuilds_truncated_vectors_sidecar() {
         .fetch_documents("docs", &[11])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].vector, vec![0.5, 0.6]);
+    assert_eq!(replayed[0].primary_vector(), &[0.5, 0.6]);
     assert!(replayed[0].vectors.is_empty());
     assert_eq!(
         replayed[0].fields.get("session_id"),
@@ -243,7 +243,7 @@ fn legacy_insert_reopen_rebuilds_truncated_vectors_sidecar() {
         .fetch_documents("docs", &[21])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].vector, vec![0.7, 0.8]);
+    assert_eq!(replayed[0].primary_vector(), &[0.7, 0.8]);
     assert!(replayed[0].vectors.is_empty());
 }
 
@@ -271,7 +271,7 @@ fn multi_vector_document_legacy_insert_keeps_vectors_sidecar_aligned() {
     assert_eq!(fetched.len(), 2);
     assert_eq!(fetched[0].vectors.get("title"), Some(&vec![0.3, 0.4]));
     assert!(fetched[1].vectors.is_empty());
-    assert_eq!(fetched[1].vector, vec![1.0, 1.1]);
+    assert_eq!(fetched[1].primary_vector(), &[1.0, 1.1]);
 }
 
 #[test]

@@ -38,7 +38,7 @@ fn write_segment(
     let mut payloads = Vec::with_capacity(documents.len());
     for d in documents {
         ids.push(d.id);
-        vectors.extend_from_slice(&d.vector);
+        vectors.extend_from_slice(d.primary_vector());
         payloads.push(d.fields.clone());
     }
 

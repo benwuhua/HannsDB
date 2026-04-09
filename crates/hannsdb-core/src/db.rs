@@ -10,7 +10,9 @@ use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, Ve
 use hannsdb_index::factory::DefaultIndexFactory;
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
-use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
+use crate::document::{
+    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, VectorIndexSchema,
+};
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
     FilterExpr,
@@ -224,6 +226,40 @@ impl HannsDb {
         }
 
         self.invalidate_search_cache(name);
+        Ok(())
+    }
+
+    pub fn add_column(
+        &mut self,
+        collection: &str,
+        field: ScalarFieldSchema,
+    ) -> io::Result<()> {
+        self.add_column_internal(collection, field, true)
+    }
+
+    fn add_column_internal(
+        &mut self,
+        collection: &str,
+        field: ScalarFieldSchema,
+        log_wal: bool,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        crate::catalog::schema_mutation::add_field_to_schema(&mut meta.fields, field.clone())?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::AddColumn {
+                    collection: collection.to_string(),
+                    field,
+                },
+            )?;
+        }
+
+        meta.save_to_path(&paths.collection_meta)?;
+        self.invalidate_search_cache(collection);
         Ok(())
     }
 
@@ -660,6 +696,7 @@ impl HannsDb {
             &paths,
             collection_meta.dimension,
             segment_meta.record_count,
+            &collection_meta.primary_vector,
             documents,
         )?;
         segment_meta.record_count += inserted;
@@ -722,6 +759,7 @@ impl HannsDb {
             &paths,
             collection_meta.dimension,
             segment_meta.record_count,
+            &collection_meta.primary_vector,
             documents,
         )?;
         segment_meta.record_count += inserted;
@@ -736,6 +774,83 @@ impl HannsDb {
         tombstone.save_to_path(&paths.tombstones)?;
         self.invalidate_search_cache(collection);
         Ok(inserted)
+    }
+
+    /// Partially update existing documents.
+    ///
+    /// For each `DocumentUpdate`, fields/vectors set to `Some(..)` replace the
+    /// current value; `None` means "keep current". The old row is tombstoned
+    /// and a merged row is appended.
+    pub fn update_documents(
+        &mut self,
+        collection: &str,
+        updates: &[DocumentUpdate],
+    ) -> io::Result<usize> {
+        self.update_documents_internal(collection, updates, true)
+    }
+
+    fn update_documents_internal(
+        &mut self,
+        collection: &str,
+        updates: &[DocumentUpdate],
+        log_wal: bool,
+    ) -> io::Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        // Fetch existing documents.
+        let ids: Vec<i64> = updates.iter().map(|u| u.id).collect();
+        let existing = self.fetch_documents(collection, &ids)?;
+        if existing.is_empty() {
+            return Ok(0);
+        }
+
+        let existing_map: HashMap<i64, Document> = existing
+            .into_iter()
+            .map(|doc| (doc.id, doc))
+            .collect();
+
+        // Merge updates into full documents.
+        let merged: Vec<Document> = updates
+            .iter()
+            .filter_map(|update| {
+                let existing = existing_map.get(&update.id)?;
+                let mut fields = existing.fields.clone();
+                for (key, value) in &update.fields {
+                    match value {
+                        Some(v) => { fields.insert(key.clone(), v.clone()); }
+                        None => { fields.remove(key); }
+                    }
+                }
+                let mut vectors = existing.vectors.clone();
+                for (key, value) in &update.vectors {
+                    match value {
+                        Some(v) => { vectors.insert(key.clone(), v.clone()); }
+                        None => { vectors.remove(key); }
+                    }
+                }
+                Some(Document { id: update.id, fields, vectors })
+            })
+            .collect();
+
+        if merged.is_empty() {
+            return Ok(0);
+        }
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::UpdateDocuments {
+                    collection: collection.to_string(),
+                    updates: updates.to_vec(),
+                },
+            )?;
+        }
+
+        // Delegate to upsert (which does tombstone+append), but skip its own
+        // WAL write since we already logged the UpdateDocuments record.
+        self.upsert_documents_internal(collection, &merged, false)
     }
 
     pub fn fetch_documents(
@@ -1014,6 +1129,16 @@ impl HannsDb {
             WalRecord::CompactCollection {
                 collection_name, ..
             } => self.compact_collection_internal(collection_name, false),
+            WalRecord::UpdateDocuments {
+                collection,
+                updates,
+            } => self
+                .update_documents_internal(collection, updates, false)
+                .map(|_| ()),
+            WalRecord::AddColumn {
+                collection,
+                field,
+            } => self.add_column_internal(collection, field.clone(), false),
         }
     }
 }
@@ -1242,7 +1367,7 @@ impl CollectionHandle {
                                     .expect("collection metadata must exist when include_vector")
                                     .primary_vector
                                     .as_str(),
-                            )
+                            ).clone()
                         } else {
                             BTreeMap::new()
                         };
@@ -1293,7 +1418,7 @@ impl CollectionHandle {
             .zip(documents)
             .map(|(hit, document)| {
                 let vectors = if include_vector {
-                    document.vectors_with_primary(collection_meta.primary_vector.as_str())
+                    document.vectors_with_primary(collection_meta.primary_vector.as_str()).clone()
                 } else {
                     BTreeMap::new()
                 };
@@ -1372,11 +1497,15 @@ impl CollectionHandle {
                     }
                     let start = row_idx * collection_meta.dimension;
                     let end = start + collection_meta.dimension;
+                    let mut doc_vectors = vectors[row_idx].clone();
+                    doc_vectors.insert(
+                        collection_meta.primary_vector.clone(),
+                        records[start..end].to_vec(),
+                    );
                     found = Some(Document {
                         id: *external_id,
                         fields: payloads[row_idx].clone(),
-                        vector: records[start..end].to_vec(),
-                        vectors: vectors[row_idx].clone(),
+                        vectors: doc_vectors,
                     });
                     break;
                 }
@@ -1408,7 +1537,7 @@ impl CollectionHandle {
         }
 
         for (hit, document) in hits.iter_mut().zip(documents) {
-            hit.vectors = document.vectors_with_primary(collection_meta.primary_vector.as_str());
+            hit.vectors = document.vectors_with_primary(collection_meta.primary_vector.as_str()).clone();
         }
         Ok(())
     }
@@ -1982,7 +2111,9 @@ fn collection_name_for_wal_record(record: &WalRecord) -> &str {
         | WalRecord::Insert { collection, .. }
         | WalRecord::InsertDocuments { collection, .. }
         | WalRecord::UpsertDocuments { collection, .. }
-        | WalRecord::Delete { collection, .. } => collection,
+        | WalRecord::Delete { collection, .. }
+        | WalRecord::UpdateDocuments { collection, .. }
+        | WalRecord::AddColumn { collection, .. } => collection,
         WalRecord::CompactCollection {
             collection_name, ..
         } => collection_name,
@@ -2100,25 +2231,22 @@ fn validate_documents(
                 format!("duplicate external id in batch: {}", document.id),
             ));
         }
-        if document.vector.len() != collection_meta.dimension {
+        let primary_vector = document.vectors.get(collection_meta.primary_vector.as_str()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "document is missing primary vector '{}'",
+                    collection_meta.primary_vector
+                ),
+            )
+        })?;
+        if primary_vector.len() != collection_meta.dimension {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "document vector dimension mismatch: expected {}, got {}",
                     collection_meta.dimension,
-                    document.vector.len()
-                ),
-            ));
-        }
-        if document
-            .vectors
-            .contains_key(collection_meta.primary_vector.as_str())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "document secondary vectors cannot contain primary vector '{}'",
-                    collection_meta.primary_vector
+                    primary_vector.len()
                 ),
             ));
         }
@@ -2153,6 +2281,7 @@ fn append_documents(
     paths: &CollectionPaths,
     dimension: usize,
     existing_rows: usize,
+    primary_vector_name: &str,
     documents: &[Document],
 ) -> io::Result<usize> {
     ensure_vector_rows(&paths.vectors, existing_rows)?;
@@ -2162,9 +2291,20 @@ fn append_documents(
     let mut vectors = Vec::with_capacity(documents.len());
     for document in documents {
         ids.push(document.id);
-        records.extend_from_slice(&document.vector);
+        let primary = document.vectors.get(primary_vector_name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "document {} is missing primary vector '{}'",
+                    document.id, primary_vector_name
+                ),
+            )
+        })?;
+        records.extend_from_slice(primary);
         payloads.push(document.fields.clone());
-        vectors.push(document.vectors.clone());
+        let mut secondary = document.vectors.clone();
+        secondary.remove(primary_vector_name);
+        vectors.push(secondary);
     }
 
     let inserted = append_records(&paths.records, dimension, &records)?;
@@ -2741,21 +2881,24 @@ mod tests {
         db.insert_documents(
             "docs",
             &[
-                Document::with_vectors(
+                Document::with_named_vectors(
                     1,
                     [],
+                    "dense",
                     vec![5.0_f32, 5.0],
                     [("title".to_string(), vec![0.0_f32, 0.0])],
                 ),
-                Document::with_vectors(
+                Document::with_named_vectors(
                     2,
                     [],
+                    "dense",
                     vec![0.0_f32, 0.0],
                     [("title".to_string(), vec![2.0_f32, 0.0])],
                 ),
-                Document::with_vectors(
+                Document::with_named_vectors(
                     3,
                     [],
+                    "dense",
                     vec![1.0_f32, 1.0],
                     [("title".to_string(), vec![1.0_f32, 0.0])],
                 ),

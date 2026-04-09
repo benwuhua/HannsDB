@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hannsdb_core::catalog::ManifestMetadata;
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
-    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
-    VectorIndexSchema,
+    CollectionSchema, Document, DocumentUpdate, FieldType, FieldValue, ScalarFieldSchema,
+    VectorFieldSchema, VectorIndexSchema,
 };
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
@@ -61,7 +61,7 @@ fn rewrite_collection_to_two_segment_layout(
     let mut second_payloads = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         second_ids.push(document.id);
-        second_vectors.extend_from_slice(&document.vector);
+        second_vectors.extend_from_slice(document.primary_vector());
         second_payloads.push(document.fields.clone());
     }
 
@@ -1723,4 +1723,266 @@ fn collection_api_rejects_invalid_schema_secondary_vector_index_config() {
         .create_collection_with_schema("docs", &schema)
         .expect_err("invalid schema-defined secondary index config should fail");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn update_documents_partially_modifies_fields_and_vectors() {
+    let temp = unique_temp_dir("update_partial");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("label", FieldType::String),
+            ScalarFieldSchema::new("score", FieldType::Int64),
+        ],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                1,
+                [
+                    ("label".to_string(), FieldValue::String("alpha".into())),
+                    ("score".to_string(), FieldValue::Int64(10)),
+                ],
+                vec![0.0, 0.0],
+            ),
+            Document::new(
+                2,
+                [
+                    ("label".to_string(), FieldValue::String("beta".into())),
+                    ("score".to_string(), FieldValue::Int64(20)),
+                ],
+                vec![1.0, 1.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+
+    // Update doc 1: change score only, keep label and vector.
+    let updated = db
+        .update_documents(
+            "docs",
+            &[DocumentUpdate {
+                id: 1,
+                fields: {
+                    let mut m = BTreeMap::new();
+                    m.insert("score".to_string(), Some(FieldValue::Int64(99)));
+                    m
+                },
+                vectors: BTreeMap::new(),
+            }],
+        )
+        .expect("update documents");
+    assert_eq!(updated, 1);
+
+    let fetched = db.fetch_documents("docs", &[1]).expect("fetch");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].fields.get("label"), Some(&FieldValue::String("alpha".into())));
+    assert_eq!(fetched[0].fields.get("score"), Some(&FieldValue::Int64(99)));
+    assert_eq!(fetched[0].primary_vector(), &[0.0_f32, 0.0]);
+
+    // Update doc 2: change both vector and label.
+    let updated2 = db
+        .update_documents(
+            "docs",
+            &[DocumentUpdate {
+                id: 2,
+                fields: {
+                    let mut m = BTreeMap::new();
+                    m.insert("label".to_string(), Some(FieldValue::String("gamma".into())));
+                    m
+                },
+                vectors: {
+                    let mut m = BTreeMap::new();
+                    m.insert("vector".to_string(), Some(vec![0.5, 0.5]));
+                    m
+                },
+            }],
+        )
+        .expect("update doc 2");
+    assert_eq!(updated2, 1);
+
+    let fetched2 = db.fetch_documents("docs", &[2]).expect("fetch 2");
+    assert_eq!(fetched2[0].fields.get("label"), Some(&FieldValue::String("gamma".into())));
+    assert_eq!(fetched2[0].fields.get("score"), Some(&FieldValue::Int64(20)));
+    assert_eq!(fetched2[0].primary_vector(), &[0.5_f32, 0.5]);
+
+    let stats = db.get_collection_info("docs").expect("stats");
+    assert_eq!(stats.record_count, 4); // 2 original + 2 appended
+    assert_eq!(stats.deleted_count, 2); // 2 tombstoned originals
+    assert_eq!(stats.live_count, 2);
+}
+
+#[test]
+fn update_documents_returns_zero_for_nonexistent_id() {
+    let temp = unique_temp_dir("update_nonexistent");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new("vector", 2, "l2", Vec::new());
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let updated = db
+        .update_documents(
+            "docs",
+            &[DocumentUpdate {
+                id: 999,
+                fields: BTreeMap::new(),
+                vectors: BTreeMap::new(),
+            }],
+        )
+        .expect("update nonexistent");
+    assert_eq!(updated, 0);
+}
+
+#[test]
+fn update_documents_wal_replay_preserves_updates() {
+    let temp = unique_temp_dir("update_wal_replay");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("val", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[Document::new(1, [("val".to_string(), FieldValue::Int64(10))], vec![0.0, 0.0])],
+    )
+    .expect("insert");
+
+    db.update_documents(
+        "docs",
+        &[DocumentUpdate {
+            id: 1,
+            fields: {
+                let mut m = BTreeMap::new();
+                m.insert("val".to_string(), Some(FieldValue::Int64(42)));
+                m
+            },
+            vectors: BTreeMap::new(),
+        }],
+    )
+    .expect("update");
+
+    // Replay WAL on a fresh open.
+    let db2 = HannsDb::open(&temp).expect("reopen db");
+    let fetched = db2.fetch_documents("docs", &[1]).expect("fetch after replay");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].fields.get("val"), Some(&FieldValue::Int64(42)));
+}
+
+#[test]
+fn add_column_extends_schema_and_old_rows_return_none() {
+    let temp = unique_temp_dir("add_column");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("label", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            1,
+            [("label".to_string(), FieldValue::String("alpha".into()))],
+            vec![0.0, 0.0],
+        )],
+    )
+    .expect("insert");
+
+    // Add a new column after data already exists.
+    db.add_column(
+        "docs",
+        ScalarFieldSchema::new("score", FieldType::Int64),
+    )
+    .expect("add column");
+
+    // Old row should not have "score".
+    let fetched = db.fetch_documents("docs", &[1]).expect("fetch old");
+    assert_eq!(fetched[0].fields.get("label"), Some(&FieldValue::String("alpha".into())));
+    assert_eq!(fetched[0].fields.get("score"), None);
+
+    // New insert with the new field works.
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            2,
+            [
+                ("label".to_string(), FieldValue::String("beta".into())),
+                ("score".to_string(), FieldValue::Int64(42)),
+            ],
+            vec![1.0, 1.0],
+        )],
+    )
+    .expect("insert with new field");
+
+    let fetched2 = db.fetch_documents("docs", &[2]).expect("fetch new");
+    assert_eq!(fetched2[0].fields.get("score"), Some(&FieldValue::Int64(42)));
+}
+
+#[test]
+fn add_column_rejects_duplicate_field_name() {
+    let temp = unique_temp_dir("add_column_dup");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("label", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let err = db
+        .add_column("docs", ScalarFieldSchema::new("label", FieldType::Int64))
+        .expect_err("duplicate field should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+#[test]
+fn add_column_wal_replay_preserves_new_field() {
+    let temp = unique_temp_dir("add_column_wal");
+    let mut db = HannsDb::open(&temp).expect("open db");
+
+    let schema = CollectionSchema::new("vector", 2, "l2", Vec::new());
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create");
+
+    db.add_column(
+        "docs",
+        ScalarFieldSchema::new("tag", FieldType::String),
+    )
+    .expect("add column");
+
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            1,
+            [("tag".to_string(), FieldValue::String("x".into()))],
+            vec![0.0, 0.0],
+        )],
+    )
+    .expect("insert with new field");
+
+    let db2 = HannsDb::open(&temp).expect("reopen for replay");
+    let fetched = db2.fetch_documents("docs", &[1]).expect("fetch");
+    assert_eq!(fetched[0].fields.get("tag"), Some(&FieldValue::String("x".into())));
 }

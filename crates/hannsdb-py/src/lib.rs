@@ -384,10 +384,9 @@ fn py_query_context_to_core(
 }
 
 fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Result<CoreDocument> {
-    let primary_vector = doc
+    let _primary_vector = doc
         .vectors
         .get(primary_vector_name)
-        .cloned()
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -395,21 +394,17 @@ fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Resu
             )
         })?;
 
-    let mut vectors = doc.vectors.clone();
-    vectors.remove(primary_vector_name);
-
-    Ok(CoreDocument::with_vectors(
-        parse_doc_id(&doc.id)?,
-        doc.fields.clone(),
-        primary_vector,
-        vectors,
-    ))
+    Ok(CoreDocument {
+        id: parse_doc_id(&doc.id)?,
+        fields: doc.fields.clone(),
+        vectors: doc.vectors.clone(),
+    })
 }
 
 fn doc_from_core_document(document: CoreDocument, primary_vector_name: &str) -> Doc {
     let id = document.id.to_string();
     let fields = document.fields.clone();
-    let vectors = document.vectors_with_primary(primary_vector_name);
+    let vectors = document.vectors_with_primary(primary_vector_name).clone();
     Doc {
         id,
         score: None,
@@ -1589,6 +1584,26 @@ impl PyCollection {
         self.inner_mut()?.delete(&ids).map_err(io_to_py_err)
     }
 
+    fn update(&mut self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
+        let inner = self.inner_mut()?;
+        let updates: Vec<hannsdb_core::document::DocumentUpdate> = docs
+            .into_iter()
+            .map(|doc| {
+                let doc = doc.borrow(py);
+                let mut fields = BTreeMap::new();
+                for (key, value) in &doc.inner.fields {
+                    fields.insert(key.clone(), Some(value.clone()));
+                }
+                hannsdb_core::document::DocumentUpdate {
+                    id: parse_doc_id(&doc.inner.id).map_err(io_to_py_err)?,
+                    fields,
+                    vectors: BTreeMap::new(),
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        inner.db.update_documents(&inner.collection_name, &updates).map_err(io_to_py_err)
+    }
+
     fn delete_by_filter(&mut self, filter: String) -> PyResult<usize> {
         let collection_name = self.inner_ref()?.collection_name.clone();
         self.inner_mut()?
@@ -1597,13 +1612,33 @@ impl PyCollection {
             .map_err(io_to_py_err)
     }
 
-    #[pyo3(signature = (field_name, option=None))]
-    fn add_column(&mut self, field_name: String, option: Option<Py<PyAny>>) -> PyResult<()> {
-        let _ = field_name;
-        let _ = option;
-        Err(PyNotImplementedError::new_err(
-            "add_column is not supported yet",
-        ))
+    #[pyo3(signature = (field_name, data_type, nullable=false, array=false))]
+    fn add_column(
+        &mut self,
+        field_name: String,
+        data_type: String,
+        nullable: bool,
+        array: bool,
+    ) -> PyResult<()> {
+        let inner = self.inner_ref()?;
+        let dt = parse_data_type(&data_type)?;
+        let core_type = match dt {
+            DataType::String => hannsdb_core::document::FieldType::String,
+            DataType::Int64 => hannsdb_core::document::FieldType::Int64,
+            DataType::Float64 => hannsdb_core::document::FieldType::Float64,
+            DataType::Bool => hannsdb_core::document::FieldType::Bool,
+            DataType::VectorFp32 => {
+                return Err(PyValueError::new_err(
+                    "add_column does not support vector_fp32 type",
+                ))
+            }
+        };
+        let field = hannsdb_core::document::ScalarFieldSchema::new(field_name, core_type)
+            .with_flags(nullable, array);
+        self.inner_mut()?
+            .db
+            .add_column(&inner.collection_name, field)
+            .map_err(io_to_py_err)
     }
 
     fn drop_column(&mut self, field_name: String) -> PyResult<()> {

@@ -241,26 +241,53 @@ pub fn default_primary_vector_name() -> String {
     "vector".to_string()
 }
 
+/// Partial update descriptor for an existing document.
+///
+/// `Some` values replace the existing field/vector; `None` means "keep current".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentUpdate {
+    pub id: i64,
+    pub fields: BTreeMap<String, Option<FieldValue>>,
+    pub vectors: BTreeMap<String, Option<Vec<f32>>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub id: i64,
     pub fields: BTreeMap<String, FieldValue>,
-    pub vector: Vec<f32>,
     #[serde(default)]
     pub vectors: BTreeMap<String, Vec<f32>>,
 }
 
 impl Document {
+    /// Creates a document with a primary vector stored under the default key "vector".
+    /// For collections where the primary vector has a different name, use `with_primary_vector_name`.
     pub fn new(
         id: i64,
         fields: impl IntoIterator<Item = (String, FieldValue)>,
         vector: Vec<f32>,
     ) -> Self {
+        let mut vectors = BTreeMap::new();
+        vectors.insert("vector".to_string(), vector);
         Self {
             id,
             fields: fields.into_iter().collect(),
-            vector,
-            vectors: BTreeMap::new(),
+            vectors,
+        }
+    }
+
+    pub fn with_primary_vector_name(
+        id: i64,
+        fields: impl IntoIterator<Item = (String, FieldValue)>,
+        primary_vector_name: &str,
+        vector: Vec<f32>,
+    ) -> Self {
+        let mut vectors = BTreeMap::new();
+        vectors.insert(primary_vector_name.to_string(), vector);
+        Self {
+            id,
+            fields: fields.into_iter().collect(),
+            vectors,
         }
     }
 
@@ -268,23 +295,50 @@ impl Document {
         id: i64,
         fields: impl IntoIterator<Item = (String, FieldValue)>,
         vector: Vec<f32>,
-        vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
+        secondary_vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
     ) -> Self {
+        let mut vectors = BTreeMap::new();
+        vectors.insert("vector".to_string(), vector);
+        for (name, vec) in secondary_vectors {
+            vectors.insert(name, vec);
+        }
         Self {
             id,
             fields: fields.into_iter().collect(),
-            vector,
-            vectors: vectors.into_iter().collect(),
+            vectors,
+        }
+    }
+
+    pub fn with_named_vectors(
+        id: i64,
+        fields: impl IntoIterator<Item = (String, FieldValue)>,
+        primary_vector_name: &str,
+        vector: Vec<f32>,
+        secondary_vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
+    ) -> Self {
+        let mut vectors = BTreeMap::new();
+        vectors.insert(primary_vector_name.to_string(), vector);
+        for (name, vec) in secondary_vectors {
+            vectors.insert(name, vec);
+        }
+        Self {
+            id,
+            fields: fields.into_iter().collect(),
+            vectors,
         }
     }
 
     pub fn primary_vector(&self) -> &[f32] {
-        &self.vector
+        self.vectors
+            .get("vector")
+            .expect("document must have primary vector")
     }
 
-    pub fn vectors_with_primary(&self, primary_vector_name: &str) -> BTreeMap<String, Vec<f32>> {
-        let mut vectors = self.vectors.clone();
-        vectors.insert(primary_vector_name.to_string(), self.vector.clone());
-        vectors
+    pub fn primary_vector_for(&self, primary_vector_name: &str) -> Option<&[f32]> {
+        self.vectors.get(primary_vector_name).map(Vec::as_slice)
+    }
+
+    pub fn vectors_with_primary(&self, _primary_vector_name: &str) -> &BTreeMap<String, Vec<f32>> {
+        &self.vectors
     }
 }

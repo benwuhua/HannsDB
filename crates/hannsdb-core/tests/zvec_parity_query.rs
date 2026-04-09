@@ -63,7 +63,7 @@ fn rewrite_collection_to_two_segment_layout(
     let mut payloads = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         ids.push(document.id);
-        vectors.extend_from_slice(&document.vector);
+        vectors.extend_from_slice(document.primary_vector());
         payloads.push(document.fields.clone());
     }
 
@@ -130,7 +130,7 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
     let mut vector_sidecars = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         ids.push(document.id);
-        vectors.extend_from_slice(&document.vector);
+        vectors.extend_from_slice(document.primary_vector());
         payloads.push(document.fields.clone());
         vector_sidecars.push(document.vectors.clone());
     }

@@ -97,7 +97,7 @@ fn rewrite_collection_to_two_segment_layout(
     let mut second_payloads = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         second_ids.push(document.id);
-        second_vectors.extend_from_slice(&document.vector);
+        second_vectors.extend_from_slice(document.primary_vector());
         second_payloads.push(document.fields.clone());
     }
 
@@ -215,7 +215,7 @@ fn wal_recovery_document_records_keep_typed_fields_and_vectors() {
         WalRecord::UpsertDocuments { documents, .. } => {
             assert_eq!(documents.len(), 1);
             assert_eq!(documents[0].id, 42);
-            assert_eq!(documents[0].vector, vec![0.1, 0.2]);
+            assert_eq!(documents[0].primary_vector(), &[0.1, 0.2]);
             assert_eq!(
                 documents[0].fields.get("session_id"),
                 Some(&FieldValue::String("s1".to_string()))
@@ -373,7 +373,7 @@ fn wal_recovery_open_replays_logged_operations_into_missing_storage() {
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("s1".to_string()))
     );
-    assert_eq!(fetched[0].vector, vec![0.1, 0.2]);
+    assert_eq!(fetched[0].primary_vector(), &[0.1, 0.2]);
 }
 
 #[test]
@@ -458,7 +458,7 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
         .expect("fetch replayed document");
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].id, 11);
-    assert_eq!(live[0].vector, vec![0.9, 0.8]);
+    assert_eq!(live[0].primary_vector(), &[0.9, 0.8]);
     assert_eq!(
         live[0].fields.get("session_id"),
         Some(&FieldValue::String("s2".to_string()))
@@ -483,7 +483,7 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
         .expect("fetch replayed document after recovery");
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].id, 11);
-    assert_eq!(replayed[0].vector, vec![0.9, 0.8]);
+    assert_eq!(replayed[0].primary_vector(), &[0.9, 0.8]);
     assert_eq!(
         replayed[0].fields.get("session_id"),
         Some(&FieldValue::String("s2".to_string()))
@@ -556,7 +556,7 @@ fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view()
         .expect("fetch replayed document after cleanup");
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].id, 11);
-    assert_eq!(replayed[0].vector, vec![0.4, 0.6]);
+    assert_eq!(replayed[0].primary_vector(), &[0.4, 0.6]);
     assert_eq!(
         replayed[0].fields.get("session_id"),
         Some(&FieldValue::String("s3".to_string()))

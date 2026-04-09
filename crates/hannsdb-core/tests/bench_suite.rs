@@ -69,7 +69,7 @@ fn write_segment_for_bench(
     let mut payloads = Vec::with_capacity(documents.len());
     for d in documents {
         ids.push(d.id);
-        vectors.extend_from_slice(&d.vector);
+        vectors.extend_from_slice(d.primary_vector());
         payloads.push(d.fields.clone());
     }
     append_records(&segment_dir.join("records.bin"), dimension, &vectors).expect("write records");

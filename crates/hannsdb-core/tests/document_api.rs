@@ -38,7 +38,7 @@ fn document_api_document_model_preserves_typed_scalar_fields() {
     );
 
     assert_eq!(doc.id, 7);
-    assert_eq!(doc.vector, vec![0.25_f32, 0.75]);
+    assert_eq!(doc.primary_vector(), &[0.25_f32, 0.75]);
     assert_eq!(doc.fields.get("active"), Some(&FieldValue::Bool(true)));
     assert_eq!(
         doc.fields.get("name"),
@@ -144,7 +144,7 @@ fn document_api_insert_and_fetch_roundtrip_preserves_fields_and_vector() {
         .expect("fetch documents");
     assert_eq!(fetched.len(), 2);
     assert_eq!(fetched[0].id, 9);
-    assert_eq!(fetched[0].vector, vec![1.0_f32, 1.0]);
+    assert_eq!(fetched[0].primary_vector(), &[1.0_f32, 1.0]);
     assert_eq!(
         fetched[0].fields.get("active"),
         Some(&FieldValue::Bool(true))
@@ -230,7 +230,7 @@ fn document_api_upsert_replaces_existing_row_for_fetch_and_search() {
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("new".to_string()))
     );
-    assert_eq!(fetched[0].vector, vec![0.0_f32, 0.0]);
+    assert_eq!(fetched[0].primary_vector(), &[0.0_f32, 0.0]);
 
     let hits = db.search("docs", &[0.0_f32, 0.0], 1).expect("search docs");
     assert_eq!(hits.len(), 1);

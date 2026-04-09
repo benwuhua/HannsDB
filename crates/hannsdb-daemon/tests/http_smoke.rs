@@ -116,7 +116,7 @@ fn rewrite_delete_by_filter_latest_live_scalar_fixture_to_two_segments(
     let mut payloads = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         ids.push(document.id);
-        vectors.extend_from_slice(&document.vector);
+        vectors.extend_from_slice(document.primary_vector());
         payloads.push(document.fields.clone());
     }
 

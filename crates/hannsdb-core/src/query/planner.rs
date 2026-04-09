@@ -167,23 +167,19 @@ impl QueryPlanner {
             }
 
             for (id, document) in query_by_id.iter().zip(query_by_id_documents) {
-                let vector = if query_by_id_field_name == collection.primary_vector {
-                    document.vector.as_slice()
-                } else {
-                    document
-                        .vectors
-                        .get(&query_by_id_field_name)
-                        .map(Vec::as_slice)
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "stored query_by_id document {} is missing vector field '{}'",
-                                    id, query_by_id_field_name
-                                ),
-                            )
-                        })?
-                };
+                let vector = document
+                    .vectors
+                    .get(&query_by_id_field_name)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "stored query_by_id document {} is missing vector field '{}'",
+                                id, query_by_id_field_name
+                            ),
+                        )
+                    })?;
                 if vector.len() != query_by_id_vector_schema.dimension {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
