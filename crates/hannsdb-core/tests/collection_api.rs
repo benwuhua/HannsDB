@@ -506,6 +506,61 @@ fn collection_api_delete_by_filter_uses_latest_live_view_across_segments() {
     let second_docs = vec![
         Document::new(
             10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.1_f32, 0.0],
+        ),
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(3))],
+            vec![0.2_f32, 0.0],
+        ),
+    ];
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[]);
+
+    let deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("delete by filter");
+    assert_eq!(deleted, 1);
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20, 30])
+        .expect("fetch after delete");
+    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![20, 30]);
+}
+
+#[test]
+fn collection_api_delete_by_filter_newer_nonmatching_row_shadows_older_matching_row_returns_zero()
+{
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_latest_live_negative");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let first_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![1.0_f32, 1.0],
+        ),
+    ];
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let second_docs = vec![
+        Document::new(
+            10,
             vec![("group".to_string(), FieldValue::Int64(2))],
             vec![0.1_f32, 0.0],
         ),
