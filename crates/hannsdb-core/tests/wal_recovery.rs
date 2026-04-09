@@ -268,6 +268,73 @@ fn wal_recovery_mutating_core_operations_append_records() {
 }
 
 #[test]
+fn wal_recovery_delete_by_filter_appends_one_delete_record() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+
+    let schema = sample_schema();
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![sample_document(11), sample_document(22)];
+    db.insert_documents("docs", &docs)
+        .expect("insert documents");
+
+    let deleted = db
+        .delete_by_filter("docs", "session_id == \"s1\"")
+        .expect("delete by filter");
+    assert_eq!(deleted, 2);
+
+    let records = load_wal_records(&root.join("wal.jsonl")).expect("load wal records");
+    assert_eq!(records.len(), 3);
+    assert_eq!(
+        records[2],
+        WalRecord::Delete {
+            collection: "docs".to_string(),
+            ids: vec![11, 22],
+        }
+    );
+}
+
+#[test]
+fn wal_recovery_replays_delete_by_filter_outcome() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+
+    let schema = sample_schema();
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![sample_document(11), sample_document(22)];
+    db.insert_documents("docs", &docs)
+        .expect("insert documents");
+
+    let deleted = db
+        .delete_by_filter("docs", "session_id == \"s1\"")
+        .expect("delete by filter");
+    assert_eq!(deleted, 2);
+    drop(db);
+
+    fs::remove_file(collection_dir(root, "docs").join("tombstones.json"))
+        .expect("remove tombstones");
+
+    let reopened = HannsDb::open(root).expect("reopen should replay wal");
+    let info = reopened
+        .get_collection_info("docs")
+        .expect("collection info after replay");
+    assert_eq!(info.record_count, 2);
+    assert_eq!(info.deleted_count, 2);
+    assert_eq!(info.live_count, 0);
+
+    let replayed = reopened
+        .fetch_documents("docs", &[11, 22])
+        .expect("fetch after replay");
+    assert!(replayed.is_empty(), "delete_by_filter outcome must survive WAL replay");
+}
+
+#[test]
 fn wal_recovery_open_replays_logged_operations_into_missing_storage() {
     let temp = tempfile::tempdir().expect("tempdir");
     let wal_path = temp.path().join("wal.jsonl");

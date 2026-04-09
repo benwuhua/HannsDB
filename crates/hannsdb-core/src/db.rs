@@ -13,6 +13,7 @@ use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{CollectionSchema, Document, FieldValue, VectorIndexSchema};
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
+    FilterExpr,
     QueryContext, QueryExecutor, QueryPlan, QueryPlanner, SearchHit,
 };
 use crate::segment::{
@@ -750,6 +751,17 @@ impl HannsDb {
         self.delete_internal(collection, external_ids, true)
     }
 
+    pub fn delete_by_filter(&mut self, collection: &str, filter: &str) -> io::Result<usize> {
+        let filter_expr = parse_filter(filter)?;
+        let matching_ids = self.collect_latest_live_filtered_ids(collection, &filter_expr)?;
+        if matching_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let matching_ids = matching_ids.into_iter().collect::<Vec<_>>();
+        self.delete(collection, &matching_ids)
+    }
+
     fn delete_internal(
         &mut self,
         collection: &str,
@@ -812,6 +824,49 @@ impl HannsDb {
 
         self.invalidate_search_cache(collection);
         Ok(newly_deleted)
+    }
+
+    fn collect_latest_live_filtered_ids(
+        &self,
+        collection: &str,
+        filter_expr: &FilterExpr,
+    ) -> io::Result<BTreeSet<i64>> {
+        let paths = self.collection_paths(collection);
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
+
+        let mut seen_ids = HashSet::new();
+        let mut matching_ids = BTreeSet::new();
+
+        for segment in segment_paths {
+            let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            let row_limit = segment_meta.record_count
+                .min(stored_ids.len())
+                .min(records.len() / collection_meta.dimension);
+            if row_limit == 0 {
+                continue;
+            }
+
+            for row_idx in (0..row_limit).rev() {
+                let external_id = stored_ids[row_idx];
+                if !seen_ids.insert(external_id) {
+                    continue;
+                }
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                if filter_expr.matches(&payloads[row_idx]) {
+                    matching_ids.insert(external_id);
+                }
+            }
+        }
+
+        Ok(matching_ids)
     }
 
     pub fn search(

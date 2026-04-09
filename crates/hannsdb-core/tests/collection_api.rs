@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -427,6 +428,251 @@ fn collection_api_delete_masks_results() {
         .expect("search vectors");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 84);
+}
+
+#[test]
+fn collection_api_delete_by_filter_deletes_matching_live_rows() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_positive");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![1.0_f32, 1.0],
+        ),
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![2.0_f32, 2.0],
+        ),
+    ];
+    db.insert_documents("docs", &docs)
+        .expect("insert documents");
+
+    let deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("delete by filter");
+    assert_eq!(deleted, 2);
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20, 30])
+        .expect("fetch after delete");
+    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![30]);
+}
+
+#[test]
+fn collection_api_delete_by_filter_uses_latest_live_view_across_segments() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_latest_live");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let first_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![1.0_f32, 1.0],
+        ),
+    ];
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let second_docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![0.1_f32, 0.0],
+        ),
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(3))],
+            vec![0.2_f32, 0.0],
+        ),
+    ];
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[]);
+
+    let deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("delete by filter");
+    assert_eq!(deleted, 0);
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20, 30])
+        .expect("fetch after delete");
+    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![10, 20, 30]);
+}
+
+#[test]
+fn collection_api_delete_by_filter_newer_tombstone_shadows_older_matching_row() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_tombstone_shadow");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let first_docs = vec![Document::new(
+        10,
+        vec![("group".to_string(), FieldValue::Int64(1))],
+        vec![0.0_f32, 0.0],
+    )];
+    db.insert_documents("docs", &first_docs)
+        .expect("insert seg-0001 docs");
+
+    let second_docs = vec![Document::new(
+        10,
+        vec![("group".to_string(), FieldValue::Int64(1))],
+        vec![0.1_f32, 0.0],
+    )];
+    rewrite_collection_to_two_segment_layout(&root, "docs", 2, &second_docs, &[0]);
+
+    let deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("delete by filter");
+    assert_eq!(deleted, 0);
+
+    let fetched = db
+        .fetch_documents("docs", &[10])
+        .expect("fetch after delete");
+    assert!(fetched.is_empty(), "newer tombstone must shadow older matching row");
+}
+
+#[test]
+fn collection_api_delete_by_filter_no_match_returns_zero() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_no_match");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![1.0_f32, 1.0],
+        ),
+    ];
+    db.insert_documents("docs", &docs)
+        .expect("insert documents");
+
+    let deleted = db
+        .delete_by_filter("docs", "group == 999")
+        .expect("delete by filter");
+    assert_eq!(deleted, 0);
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20])
+        .expect("fetch after delete");
+    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![10, 20]);
+}
+
+#[test]
+fn collection_api_delete_by_filter_second_call_returns_zero() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_repeat");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let docs = vec![
+        Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        ),
+        Document::new(
+            20,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![1.0_f32, 1.0],
+        ),
+        Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(2))],
+            vec![2.0_f32, 2.0],
+        ),
+    ];
+    db.insert_documents("docs", &docs)
+        .expect("insert documents");
+
+    let first_deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("first delete by filter");
+    assert_eq!(first_deleted, 2);
+
+    let second_deleted = db
+        .delete_by_filter("docs", "group == 1")
+        .expect("second delete by filter");
+    assert_eq!(second_deleted, 0);
+}
+
+#[test]
+fn collection_api_delete_by_filter_invalid_filter_errors() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_invalid");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let err = db
+        .delete_by_filter("docs", "group = 1")
+        .expect_err("invalid filter must error");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("unsupported filter clause"),
+        "error should come from the existing filter parser"
+    );
 }
 
 #[test]
