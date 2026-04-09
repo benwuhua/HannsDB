@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{CollectionSchema, Document};
+use crate::document::{CollectionSchema, Document, DocumentUpdate, ScalarFieldSchema};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WalRecord {
@@ -36,6 +36,14 @@ pub enum WalRecord {
     CompactCollection {
         collection_name: String,
         compacted_segment_id: String,
+    },
+    UpdateDocuments {
+        collection: String,
+        updates: Vec<DocumentUpdate>,
+    },
+    AddColumn {
+        collection: String,
+        field: ScalarFieldSchema,
     },
 }
 

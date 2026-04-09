@@ -9,20 +9,21 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hannsdb_core::db::HannsDb;
-use hannsdb_core::document::{Document, FieldValue};
+use hannsdb_core::document::{Document, DocumentUpdate, FieldValue, FieldType, ScalarFieldSchema};
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
 };
 
 use crate::api::{
-    CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
+    AddColumnRequest, AddColumnResponse, CollectionInfoResponse, CompactCollectionResponse,
+    CreateCollectionRequest,
     CreateCollectionResponse, CreateIndexResponse, DeleteByFilterRequest, DeleteRecordsRequest,
     DeleteRecordsResponse, DropCollectionResponse, DropIndexResponse, ErrorResponse,
     FetchRecordResponse, FetchRecordsRequest, FetchRecordsResponse, FlushCollectionResponse,
     HealthResponse, InsertRecordsRequest, InsertRecordsResponse, LegacySearchRequest,
     ListCollectionsResponse, ScalarIndexRequest, ScalarIndexesResponse, SearchHitResponse,
     SearchRequest, SearchResponse, SegmentsResponse, TypedSearchRequest, UpsertRecordsResponse,
-    VectorIndexRequest, VectorIndexesResponse,
+    UpdateRecordsRequest, UpdateRecordsResponse, VectorIndexRequest, VectorIndexesResponse,
 };
 
 #[derive(Clone)]
@@ -72,10 +73,18 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
             post(upsert_records),
         )
         .route(
+            "/collections/:collection/records/update",
+            post(update_records),
+        )
+        .route(
             "/collections/:collection/records/fetch",
             post(fetch_records),
         )
         .route("/collections/:collection/search", post(search_records))
+        .route(
+            "/collections/:collection/schema/columns",
+            post(add_column_to_collection),
+        )
         .route(
             "/collections/:collection/indexes/vector",
             get(list_vector_indexes).post(create_vector_index),
@@ -462,6 +471,100 @@ async fn upsert_records(
     }
 }
 
+async fn update_records(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(request): Json<UpdateRecordsRequest>,
+) -> Response {
+    let external_ids = match parse_external_ids(&request.ids) {
+        Ok(ids) => ids,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+
+    if !request.fields.is_empty() && request.fields.len() != external_ids.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "fields count must match id count".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut updates = Vec::with_capacity(external_ids.len());
+    for (i, id) in external_ids.iter().enumerate() {
+        let fields = if request.fields.is_empty() {
+            BTreeMap::new()
+        } else {
+            match request.fields[i]
+                .iter()
+                .map(|(k, v)| {
+                    v.as_ref()
+                        .map(|val| json_value_to_field_value(val.clone()).map(|fv| (k.clone(), Some(fv))))
+                        .unwrap_or(Ok((k.clone(), None)))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()
+            {
+                Ok(f) => f,
+                Err(error) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+                }
+            }
+        };
+
+        let vectors = request
+            .vectors
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        updates.push(DocumentUpdate {
+            id: *id,
+            fields,
+            vectors,
+        });
+    }
+
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .update_documents(&collection, &updates);
+
+    match result {
+        Ok(updated) => (
+            StatusCode::OK,
+            Json(UpdateRecordsResponse {
+                updated: updated as u64,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn delete_records(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
@@ -610,7 +713,7 @@ async fn fetch_records(
                     .map(|document| FetchRecordResponse {
                         id: document.id.to_string(),
                         fields: select_fetch_output_fields(&document.fields, output_fields),
-                        vector: document.vector,
+                        vector: document.vectors.get("vector").cloned().unwrap_or_default(),
                     })
                     .collect(),
             }),
@@ -1104,6 +1207,66 @@ async fn drop_scalar_index(
             }),
         )
             .into_response(),
+    }
+}
+
+async fn add_column_to_collection(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(request): Json<AddColumnRequest>,
+) -> Response {
+    let data_type = match parse_daemon_field_type(&request.data_type) {
+        Ok(dt) => dt,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+    let field = ScalarFieldSchema::new(request.name.clone(), data_type)
+        .with_flags(request.nullable, request.array);
+
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .add_column(&collection, field);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AddColumnResponse { added: request.name }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_daemon_field_type(value: &str) -> Result<FieldType, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "string" => Ok(FieldType::String),
+        "int64" => Ok(FieldType::Int64),
+        "float64" => Ok(FieldType::Float64),
+        "bool" => Ok(FieldType::Bool),
+        other => Err(format!("unsupported data type: {other}")),
     }
 }
 

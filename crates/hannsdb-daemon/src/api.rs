@@ -244,3 +244,34 @@ pub struct VectorIndexesResponse {
 pub struct ScalarIndexesResponse {
     pub scalar_indexes: Vec<Value>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRecordsRequest {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<BTreeMap<String, Option<Value>>>,
+    #[serde(default)]
+    pub vectors: BTreeMap<String, Option<Vec<f32>>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateRecordsResponse {
+    pub updated: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddColumnRequest {
+    pub name: String,
+    pub data_type: String,
+    #[serde(default)]
+    pub nullable: bool,
+    #[serde(default)]
+    pub array: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddColumnResponse {
+    pub added: String,
+}
