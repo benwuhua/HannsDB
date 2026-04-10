@@ -2461,3 +2461,105 @@ fn collection_api_new_field_types_int32_uint32_uint64_float() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 2);
 }
+
+#[test]
+fn collection_api_ivf_create_optimize_and_search() {
+    let dir = unique_temp_dir("ivf_search");
+    let mut db = HannsDb::open(&dir).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    // Create IVF index
+    let descriptor = VectorIndexDescriptor {
+        field_name: "vector".to_string(),
+        kind: VectorIndexKind::Ivf,
+        metric: Some("l2".to_string()),
+        params: json!({"nlist": 2}),
+    };
+    db.create_vector_index("docs", descriptor)
+        .expect("create IVF index");
+
+    // Insert enough vectors for IVF training (> nlist)
+    for i in 0..20 {
+        let x = (i as f32) * 0.5;
+        let y = (i as f32) * 0.3;
+        db.insert_documents(
+            "docs",
+            &[Document::new(
+                i as i64,
+                [("group".to_string(), FieldValue::Int64(i / 10))],
+                vec![x, y],
+            )],
+        )
+        .expect("insert document");
+    }
+
+    // Optimize to build the IVF index
+    db.optimize_collection("docs").expect("optimize");
+
+    // Search for nearest neighbor
+    let hits = db
+        .query_documents("docs", &[0.1, 0.0], 3, None)
+        .expect("search");
+    assert!(!hits.is_empty(), "IVF search should return results");
+    // The nearest vector to [0.1, 0.0] should be id=0 at [0.0, 0.0]
+    assert_eq!(hits[0].id, 0);
+}
+
+#[test]
+fn collection_api_ivf_filtered_search_returns_correct_results() {
+    let dir = unique_temp_dir("ivf_filtered");
+    let mut db = HannsDb::open(&dir).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let descriptor = VectorIndexDescriptor {
+        field_name: "vector".to_string(),
+        kind: VectorIndexKind::Ivf,
+        metric: Some("l2".to_string()),
+        params: json!({"nlist": 2}),
+    };
+    db.create_vector_index("docs", descriptor)
+        .expect("create IVF index");
+
+    // Insert vectors in two groups
+    for i in 0..20 {
+        let group = if i < 10 { 1 } else { 2 };
+        let x = (i as f32) * 0.5;
+        let y = (i as f32) * 0.3;
+        db.insert_documents(
+            "docs",
+            &[Document::new(
+                i as i64,
+                [("group".to_string(), FieldValue::Int64(group))],
+                vec![x, y],
+            )],
+        )
+        .expect("insert document");
+    }
+
+    db.optimize_collection("docs").expect("optimize");
+
+    // Filtered search: only group 1
+    let hits = db
+        .query_documents("docs", &[0.0, 0.0], 3, Some("group == 1"))
+        .expect("filtered search");
+    assert!(!hits.is_empty(), "filtered IVF search should return results");
+    // All results should be from group 1
+    for hit in &hits {
+        let group = hit.fields.get("group").expect("group field");
+        assert_eq!(group, &FieldValue::Int64(1), "all hits must be group 1");
+    }
+}

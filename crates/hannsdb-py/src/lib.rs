@@ -19,7 +19,8 @@ use hannsdb_core::document::{
 #[cfg(feature = "python-binding")]
 use hannsdb_core::query::{
     QueryContext as CoreQueryContext, QueryGroupBy as CoreQueryGroupBy,
-    VectorQuery as CoreVectorQuery, VectorQueryParam as CoreVectorQueryParam,
+    QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
+    VectorQueryParam as CoreVectorQueryParam,
 };
 
 pub fn bootstrap_symbol() -> &'static str {
@@ -1710,23 +1711,24 @@ impl PyCollection {
     }
 
     fn update(&mut self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
-        let inner = self.inner_mut()?;
-        let updates: Vec<hannsdb_core::document::DocumentUpdate> = docs
-            .into_iter()
-            .map(|doc| {
-                let doc = doc.borrow(py);
-                let mut fields = BTreeMap::new();
-                for (key, value) in &doc.inner.fields {
-                    fields.insert(key.clone(), Some(value.clone()));
-                }
-                hannsdb_core::document::DocumentUpdate {
-                    id: parse_doc_id(&doc.inner.id).map_err(io_to_py_err)?,
-                    fields,
-                    vectors: BTreeMap::new(),
-                }
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        inner.db.update_documents(&inner.collection_name, &updates).map_err(io_to_py_err)
+        let collection_name = self.inner_ref()?.collection_name.clone();
+        let mut updates = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let doc = doc.borrow(py);
+            let mut fields = BTreeMap::new();
+            for (key, value) in &doc.inner.fields {
+                fields.insert(key.clone(), Some(value.clone()));
+            }
+            updates.push(hannsdb_core::document::DocumentUpdate {
+                id: parse_doc_id(&doc.inner.id).map_err(io_to_py_err)?,
+                fields,
+                vectors: BTreeMap::new(),
+            });
+        }
+        self.inner_mut()?
+            .db
+            .update_documents(&collection_name, &updates)
+            .map_err(io_to_py_err)
     }
 
     fn delete_by_filter(&mut self, filter: String) -> PyResult<usize> {
@@ -1745,7 +1747,7 @@ impl PyCollection {
         nullable: bool,
         array: bool,
     ) -> PyResult<()> {
-        let inner = self.inner_ref()?;
+        let collection_name = self.inner_ref()?.collection_name.clone();
         let dt = parse_data_type(&data_type)?;
         let core_type = match dt {
             DataType::String => hannsdb_core::document::FieldType::String,
@@ -1766,23 +1768,23 @@ impl PyCollection {
             .with_flags(nullable, array);
         self.inner_mut()?
             .db
-            .add_column(&inner.collection_name, field)
+            .add_column(&collection_name, field)
             .map_err(io_to_py_err)
     }
 
     fn drop_column(&mut self, field_name: String) -> PyResult<()> {
-        let inner = self.inner_ref()?;
+        let collection_name = self.inner_ref()?.collection_name.clone();
         self.inner_mut()?
             .db
-            .drop_column(&inner.collection_name, &field_name)
+            .drop_column(&collection_name, &field_name)
             .map_err(io_to_py_err)
     }
 
     fn alter_column(&mut self, field_name: String, new_name: String) -> PyResult<()> {
-        let inner = self.inner_ref()?;
+        let collection_name = self.inner_ref()?.collection_name.clone();
         self.inner_mut()?
             .db
-            .alter_column(&inner.collection_name, &field_name, &new_name)
+            .alter_column(&collection_name, &field_name, &new_name)
             .map_err(io_to_py_err)
     }
 

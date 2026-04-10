@@ -274,4 +274,47 @@ impl VectorIndexBackend for KnowhereHnswIndex {
     fn serialize_to_bytes(&self) -> Result<Option<Vec<u8>>, AdapterError> {
         KnowhereHnswIndex::serialize_to_bytes(self).map(Some)
     }
+
+    #[cfg(feature = "knowhere-backend")]
+    fn search_with_bitset(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        bitset: &knowhere_rs::BitsetView,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError> {
+        if query.len() != self.dim {
+            return Err(AdapterError::InvalidDimension {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        let req = knowhere_rs::SearchRequest {
+            top_k: k,
+            nprobe: ef_search,
+            filter: None,
+            params: None,
+            radius: None,
+        };
+        let result = self
+            .inner
+            .search_with_bitset(query, &req, bitset)
+            .map_err(|e| AdapterError::Backend(format!("knowhere search_with_bitset failed: {e}")))?;
+
+        Ok(result
+            .ids
+            .into_iter()
+            .zip(result.distances)
+            .filter_map(|(id, distance)| {
+                if id < 0 {
+                    None
+                } else {
+                    Some(HnswSearchHit {
+                        id: id as u64,
+                        distance,
+                    })
+                }
+            })
+            .collect())
+    }
 }

@@ -39,11 +39,21 @@ impl IndexFactory for DefaultIndexFactory {
         let metric = descriptor.metric.as_deref().unwrap_or("l2");
         match descriptor.kind {
             VectorIndexKind::Flat => Ok(Box::new(FlatIndex::new(dim, metric)?)),
-            VectorIndexKind::Ivf => Ok(Box::new(IvfIndex::new(
-                dim,
-                metric,
-                read_usize_param(&descriptor.params, "nlist").unwrap_or(1),
-            )?)),
+            VectorIndexKind::Ivf => {
+                let nlist = read_usize_param(&descriptor.params, "nlist").unwrap_or(1);
+                #[cfg(feature = "knowhere-backend")]
+                {
+                    if let Some(bytes) = serialized {
+                        return Ok(Box::new(IvfIndex::from_bytes(dim, metric, nlist, bytes)?));
+                    }
+                    return Ok(Box::new(IvfIndex::new(dim, metric, nlist)?));
+                }
+                #[cfg(not(feature = "knowhere-backend"))]
+                {
+                    let _ = serialized;
+                    Ok(Box::new(IvfIndex::new(dim, metric, nlist)?))
+                }
+            }
             VectorIndexKind::Hnsw => {
                 #[cfg(feature = "knowhere-backend")]
                 {

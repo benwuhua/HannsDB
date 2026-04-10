@@ -116,6 +116,30 @@ pub trait VectorIndexBackend: Send + Sync {
     fn serialize_to_bytes(&self) -> Result<Option<Vec<u8>>, AdapterError> {
         Ok(None)
     }
+
+    /// Search with a bitset filter applied during search (pre-filter).
+    ///
+    /// `bitset` semantics: bit=1 means **filtered OUT** (excluded), bit=0 means **kept**.
+    ///
+    /// The default implementation falls back to post-filter: it runs a normal
+    /// `search` and then removes any hit whose `id` index has the bitset bit set.
+    /// Backends that support native pre-filtered search should override this
+    /// for better performance.
+    #[cfg(feature = "knowhere-backend")]
+    fn search_with_bitset(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        bitset: &knowhere_rs::BitsetView,
+    ) -> Result<Vec<HnswSearchHit>, AdapterError> {
+        // Default: search then post-filter
+        let hits = self.search(query, k, ef_search)?;
+        Ok(hits
+            .into_iter()
+            .filter(|h| !bitset.get(h.id as usize))
+            .collect())
+    }
 }
 
 pub trait HnswBackend: VectorIndexBackend {}

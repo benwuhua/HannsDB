@@ -1313,8 +1313,49 @@ impl CollectionHandle {
         )?;
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
-                // When a filter is present, overfetch from ANN to compensate for
-                // rows that will be discarded by the post-filter.
+                let ef_search = plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH);
+
+                #[cfg(feature = "knowhere-backend")]
+                if let Some(filter) = &plan.filter {
+                    // Pre-filter path: construct BitsetView from filter evaluation
+                    // and pass it to the ANN backend for efficient pre-filtered search.
+                    let state = self.cached_search_state_for_field(&plan.field_name)?;
+                    if let Some(optimized) = state.optimized_ann.as_ref() {
+                        // Fetch payloads for all indexed vectors to evaluate filter
+                        let documents = self.fetch_documents(&optimized.ann_external_ids)?;
+                        let bitset = hannsdb_index::bitset::filter_to_bitset(
+                            documents.len(),
+                            |i| filter.matches(&documents[i].fields),
+                        );
+                        let ann_hits = ann_search_with_bitset(
+                            optimized.backend.as_ref(),
+                            &optimized.ann_external_ids,
+                            &optimized.metric,
+                            &plan.vector,
+                            plan.top_k,
+                            ef_search,
+                            &bitset,
+                        )?;
+                        // Hits already have correct external IDs; fetch for output fields
+                        let fetched = self.fetch_documents(
+                            &ann_hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+                        )?;
+                        let mut doc_hits: Vec<DocumentHit> = ann_hits
+                            .into_iter()
+                            .zip(fetched)
+                            .map(|(hit, document)| DocumentHit {
+                                id: hit.id,
+                                distance: hit.distance,
+                                fields: document.fields,
+                                vectors: BTreeMap::new(),
+                            })
+                            .collect();
+                        project_document_hits(&mut doc_hits, plan.output_fields.as_deref());
+                        return Ok(doc_hits);
+                    }
+                }
+
+                // Fallback: overfetch + post-filter (non-knowhere-backend or no ANN)
                 const FILTER_OVERFETCH_FACTOR: usize = 4;
                 let search_k = if plan.filter.is_some() {
                     plan.top_k.saturating_mul(FILTER_OVERFETCH_FACTOR)
@@ -1326,7 +1367,7 @@ impl CollectionHandle {
                     &plan.field_name,
                     &plan.vector,
                     search_k,
-                    plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH),
+                    ef_search,
                     context.include_vector,
                 )?;
 
@@ -1377,7 +1418,7 @@ impl CollectionHandle {
             state.optimized_ann = Some(build_optimized_ann_state(&state, Some(&mut blob_bytes))?);
 
             #[cfg(feature = "knowhere-backend")]
-            if let Some(bytes) = blob_bytes {
+            if let Some(ref bytes) = blob_bytes {
                 let blob_path = ann_blob_path(&paths.dir, field_name);
                 if let Some(parent) = blob_path.parent() {
                     if let Err(e) = fs::create_dir_all(parent) {
@@ -2028,10 +2069,6 @@ impl CollectionHandle {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "no descriptor for field")
             })?;
-
-            if descriptor.kind != VectorIndexKind::Hnsw {
-                return Ok(None);
-            }
 
             // Try new per-field path first
             let new_path = ann_blob_path(&paths.dir, field_name);
@@ -3056,6 +3093,49 @@ fn ann_search(
             "l2" => dists_buf[i].max(0.0).sqrt(),
             "ip" => -dists_buf[i],
             _ => dists_buf[i],
+        };
+        mapped.push(SearchHit {
+            id: external_id,
+            distance,
+        });
+    }
+    Ok(mapped)
+}
+
+#[cfg(feature = "knowhere-backend")]
+fn ann_search_with_bitset(
+    backend: &dyn VectorIndexBackend,
+    ann_external_ids: &[i64],
+    metric: &str,
+    query: &[f32],
+    top_k: usize,
+    ef_search: usize,
+    bitset: &hannsdb_index::BitsetView,
+) -> io::Result<Vec<SearchHit>> {
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let hits = backend
+        .search_with_bitset(query, top_k, ef_search, bitset)
+        .map_err(adapter_error_to_io)?;
+    let mut mapped = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let ann_idx = usize::try_from(hit.id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "optimized ANN hit id cannot be converted to usize",
+            )
+        })?;
+        let external_id = ann_external_ids.get(ann_idx).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("optimized ANN hit id out of range: {}", hit.id),
+            )
+        })?;
+        let distance = match metric {
+            "l2" => hit.distance.max(0.0).sqrt(),
+            "ip" => -hit.distance,
+            _ => hit.distance,
         };
         mapped.push(SearchHit {
             id: external_id,

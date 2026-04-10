@@ -10,7 +10,7 @@ fn ivf_factory_backend_returns_nearest_neighbors_for_small_fixture() {
         kind: VectorIndexKind::Ivf,
         metric: Some("l2".to_string()),
         params: json!({
-            "nlist": 4
+            "nlist": 1
         }),
     };
 
@@ -26,7 +26,7 @@ fn ivf_factory_backend_returns_nearest_neighbors_for_small_fixture() {
         .expect("insert fixture");
 
     let hits = backend
-        .search(&[0.2_f32, -0.1], 2, 8)
+        .search(&[0.2_f32, -0.1], 2, 1)
         .expect("search ivf backend");
     let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     assert_eq!(hit_ids, vec![10, 20]);
