@@ -53,7 +53,7 @@ cargo test -p hannsdb-core --test zvec_parity_query -- --nocapture
 cargo test -p hannsdb-daemon --test http_smoke -- --nocapture
 
 cd "$ROOT_DIR/crates/hannsdb-py"
-maturin develop --features python-binding,knowhere-backend
+maturin develop --features python-binding,hanns-backend
 python -m pytest \
   tests/test_typing_surface.py \
   tests/test_schema_surface.py \

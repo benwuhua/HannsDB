@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use crate::document::FieldValue;
@@ -10,12 +10,14 @@ pub fn append_payloads(
     path: &Path,
     payloads: &[BTreeMap<String, FieldValue>],
 ) -> io::Result<usize> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = BufWriter::new(file);
     for payload in payloads {
         let line = serde_json::to_string(payload).map_err(json_to_io_error)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
     }
+    writer.flush()?;
     Ok(payloads.len())
 }
 

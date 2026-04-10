@@ -9,7 +9,7 @@ DIM="${DIM:-256}"
 METRIC="${METRIC:-cosine}" # l2 | cosine | ip
 TOPK="${TOPK:-10}"
 REPEATS="${REPEATS:-3}"
-FEATURES="${FEATURES:-knowhere-backend}"
+FEATURES="${FEATURES:-hanns-backend}"
 PROFILE="${PROFILE:-debug}" # debug | release
 
 if ! [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]]; then

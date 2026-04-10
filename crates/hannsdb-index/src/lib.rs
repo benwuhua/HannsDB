@@ -7,8 +7,8 @@ pub mod hnsw;
 pub mod ivf;
 pub mod scalar;
 
-#[cfg(feature = "knowhere-backend")]
-pub use knowhere_rs::BitsetView;
+#[cfg(feature = "hanns-backend")]
+pub use hanns::BitsetView;
 
 pub fn index_bootstrap_marker() -> &'static str {
     "hannsdb-index-bootstrap"

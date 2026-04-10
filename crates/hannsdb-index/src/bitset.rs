@@ -8,8 +8,8 @@
 //! Convention: **bit = 1 means filtered OUT (excluded)**, bit = 0 means kept.
 //! This matches the Hanns / BitsetPredicate semantics used by knowhere.
 
-#[cfg(feature = "knowhere-backend")]
-use knowhere_rs::BitsetView;
+#[cfg(feature = "hanns-backend")]
+use hanns::BitsetView;
 
 /// Build a `BitsetView` from a closure that decides whether each row passes a filter.
 ///
@@ -18,7 +18,7 @@ use knowhere_rs::BitsetView;
 ///   **passes** the filter (should be **kept**).
 ///
 /// Returns a `BitsetView` where bit=1 means the row is **excluded**.
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 pub fn filter_to_bitset<F>(total: usize, passes: F) -> BitsetView
 where
     F: Fn(usize) -> bool,
@@ -41,11 +41,11 @@ where
 
 /// Build a packed `Vec<u64>` bitset from a closure (no knowhere dependency).
 ///
-/// Useful when the `knowhere-backend` feature is disabled but a compact bitset
+/// Useful when the `hanns-backend` feature is disabled but a compact bitset
 /// representation is still needed (e.g. brute-force filtered search).
 ///
 /// Same convention: bit=1 means **excluded**, bit=0 means **kept**.
-#[cfg(not(feature = "knowhere-backend"))]
+#[cfg(not(feature = "hanns-backend"))]
 pub fn filter_to_bitset_vec<F>(total: usize, passes: F) -> Vec<u64>
 where
     F: Fn(usize) -> bool,
@@ -74,12 +74,12 @@ mod tests {
     }
 
     fn bits_from_closure(total: usize, passes: impl Fn(usize) -> bool) -> Vec<bool> {
-        #[cfg(feature = "knowhere-backend")]
+        #[cfg(feature = "hanns-backend")]
         {
             let bv = filter_to_bitset(total, passes);
             collect_bits(&bv)
         }
-        #[cfg(not(feature = "knowhere-backend"))]
+        #[cfg(not(feature = "hanns-backend"))]
         {
             let data = filter_to_bitset_vec(total, passes);
             (0..total).map(|i| {
@@ -125,12 +125,12 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        #[cfg(feature = "knowhere-backend")]
+        #[cfg(feature = "hanns-backend")]
         {
             let bv = filter_to_bitset(0, |_| false);
             assert_eq!(bv.num_bits(), 0);
         }
-        #[cfg(not(feature = "knowhere-backend"))]
+        #[cfg(not(feature = "hanns-backend"))]
         {
             let data = filter_to_bitset_vec(0, |_| false);
             assert!(data.is_empty());

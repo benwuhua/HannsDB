@@ -1098,7 +1098,7 @@ fn collection_api_optimize_warms_search_state_for_repeated_queries() {
     );
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn collection_api_optimize_ann_maps_external_ids_and_normalizes_l2_distance() {
     let root = unique_temp_dir("hannsdb_collection_api_optimize_ann_mapping");
@@ -1133,7 +1133,7 @@ fn collection_api_optimize_ann_maps_external_ids_and_normalizes_l2_distance() {
     );
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn collection_api_optimize_ann_preserves_ip_distance_semantics() {
     let root = unique_temp_dir("hannsdb_collection_api_optimize_ann_ip_distance");
@@ -1167,7 +1167,7 @@ fn collection_api_optimize_ann_preserves_ip_distance_semantics() {
     );
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn collection_api_reopen_loads_persisted_hnsw_index() {
     let root = unique_temp_dir("hannsdb_collection_api_reopen_loads_persisted_hnsw");
@@ -1183,8 +1183,8 @@ fn collection_api_reopen_loads_persisted_hnsw_index() {
 
     let collection_dir = root.join("collections").join("docs");
     assert!(
-        collection_dir.join("hnsw_index.bin").exists(),
-        "persisted hnsw index should exist after optimize"
+        collection_dir.join("ann").join("vector.bin").exists(),
+        "persisted ann index should exist after optimize"
     );
     fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
     fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");

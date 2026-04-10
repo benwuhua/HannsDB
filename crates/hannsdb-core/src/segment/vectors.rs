@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 pub fn append_vectors(path: &Path, vectors: &[BTreeMap<String, Vec<f32>>]) -> io::Result<usize> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = BufWriter::new(file);
     for vector_map in vectors {
         let line = serde_json::to_string(vector_map).map_err(json_to_io_error)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        writer.write_all(line.as_bytes())?;
+        writer.write_all(b"\n")?;
     }
+    writer.flush()?;
     Ok(vectors.len())
 }
 

@@ -1,15 +1,15 @@
 use crate::adapter::{AdapterError, HnswSearchHit, MetricKind, VectorIndexBackend};
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// knowhere-backend: real IVF backed by hanns::faiss::IvfFlatIndex
+// hanns-backend: real IVF backed by hanns::faiss::IvfFlatIndex
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 pub struct IvfIndex {
-    inner: knowhere_rs::faiss::IvfFlatIndex,
+    inner: hanns::faiss::IvfFlatIndex,
     dim: usize,
     #[allow(dead_code)]
     metric: MetricKind,
@@ -17,24 +17,24 @@ pub struct IvfIndex {
     nlist: usize,
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 impl IvfIndex {
     pub fn new(dim: usize, metric: &str, nlist: usize) -> Result<Self, AdapterError> {
         let metric_kind = MetricKind::parse(metric)?;
         let metric_type = match metric_kind {
-            MetricKind::L2 => knowhere_rs::MetricType::L2,
-            MetricKind::Cosine => knowhere_rs::MetricType::Cosine,
-            MetricKind::Ip => knowhere_rs::MetricType::Ip,
+            MetricKind::L2 => hanns::MetricType::L2,
+            MetricKind::Cosine => hanns::MetricType::Cosine,
+            MetricKind::Ip => hanns::MetricType::Ip,
         };
         let nlist = nlist.max(1);
-        let config = knowhere_rs::IndexConfig {
-            index_type: knowhere_rs::IndexType::IvfFlat,
+        let config = hanns::IndexConfig {
+            index_type: hanns::IndexType::IvfFlat,
             metric_type,
             dim,
-            data_type: knowhere_rs::api::data_type::DataType::Float,
-            params: knowhere_rs::api::index::IndexParams::ivf(nlist, nlist.min(8)),
+            data_type: hanns::api::data_type::DataType::Float,
+            params: hanns::api::index::IndexParams::ivf(nlist, nlist.min(8)),
         };
-        let inner = knowhere_rs::faiss::IvfFlatIndex::new(&config)
+        let inner = hanns::faiss::IvfFlatIndex::new(&config)
             .map_err(|e| AdapterError::Backend(format!("ivf create failed: {e}")))?;
 
         Ok(Self {
@@ -52,7 +52,7 @@ impl IvfIndex {
         bytes: &[u8],
     ) -> Result<Self, AdapterError> {
         let metric_kind = MetricKind::parse(metric)?;
-        let inner = knowhere_rs::faiss::IvfFlatIndex::deserialize_from_bytes(bytes, dim)
+        let inner = hanns::faiss::IvfFlatIndex::deserialize_from_bytes(bytes, dim)
             .map_err(|e| AdapterError::Backend(format!("ivf deserialize failed: {e}")))?;
         Ok(Self {
             inner,
@@ -67,7 +67,7 @@ impl IvfIndex {
         query: &[f32],
         k: usize,
         nprobe: usize,
-        bitset: &knowhere_rs::BitsetView,
+        bitset: &hanns::BitsetView,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
@@ -75,8 +75,8 @@ impl IvfIndex {
                 got: query.len(),
             });
         }
-        let predicate = knowhere_rs::api::search::BitsetPredicate::new(bitset.clone());
-        let req = knowhere_rs::SearchRequest {
+        let predicate = hanns::api::search::BitsetPredicate::new(bitset.clone());
+        let req = hanns::SearchRequest {
             top_k: k,
             nprobe,
             filter: Some(Arc::new(predicate)),
@@ -106,7 +106,7 @@ impl IvfIndex {
     }
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 impl VectorIndexBackend for IvfIndex {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError> {
         for (_, v) in vectors {
@@ -168,7 +168,7 @@ impl VectorIndexBackend for IvfIndex {
                 got: query.len(),
             });
         }
-        let req = knowhere_rs::SearchRequest {
+        let req = hanns::SearchRequest {
             top_k: k,
             nprobe: ef_search,
             filter: None,
@@ -210,7 +210,7 @@ impl VectorIndexBackend for IvfIndex {
         query: &[f32],
         k: usize,
         ef_search: usize,
-        bitset: &knowhere_rs::BitsetView,
+        bitset: &hanns::BitsetView,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         // Delegate to the inherent method which uses BitsetPredicate for pre-filter.
         self.search_with_bitset(query, k, ef_search, bitset)
@@ -218,20 +218,20 @@ impl VectorIndexBackend for IvfIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback without knowhere-backend: FlatIndex wrapper (existing behavior)
+// Fallback without hanns-backend: FlatIndex wrapper (existing behavior)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "knowhere-backend"))]
+#[cfg(not(feature = "hanns-backend"))]
 use crate::flat::FlatIndex;
 
-#[cfg(not(feature = "knowhere-backend"))]
+#[cfg(not(feature = "hanns-backend"))]
 pub struct IvfIndex {
     inner: FlatIndex,
     #[allow(dead_code)]
     nlist: usize,
 }
 
-#[cfg(not(feature = "knowhere-backend"))]
+#[cfg(not(feature = "hanns-backend"))]
 impl IvfIndex {
     pub fn new(dim: usize, metric: &str, nlist: usize) -> Result<Self, AdapterError> {
         Ok(Self {
@@ -241,7 +241,7 @@ impl IvfIndex {
     }
 }
 
-#[cfg(not(feature = "knowhere-backend"))]
+#[cfg(not(feature = "hanns-backend"))]
 impl VectorIndexBackend for IvfIndex {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError> {
         self.inner.insert(vectors)

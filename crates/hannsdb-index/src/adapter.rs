@@ -19,7 +19,7 @@ impl MetricKind {
 
     pub(crate) fn distance(self, query: &[f32], vector: &[f32]) -> f32 {
         match self {
-            Self::L2 => l2_sq(query, vector),
+            Self::L2 => l2_sq(query, vector).sqrt(),
             Self::Cosine => cosine_distance(query, vector),
             Self::Ip => -dot(query, vector),
         }
@@ -125,13 +125,13 @@ pub trait VectorIndexBackend: Send + Sync {
     /// `search` and then removes any hit whose `id` index has the bitset bit set.
     /// Backends that support native pre-filtered search should override this
     /// for better performance.
-    #[cfg(feature = "knowhere-backend")]
+    #[cfg(feature = "hanns-backend")]
     fn search_with_bitset(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
-        bitset: &knowhere_rs::BitsetView,
+        bitset: &hanns::BitsetView,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         // Default: search then post-filter
         let hits = self.search(query, k, ef_search)?;

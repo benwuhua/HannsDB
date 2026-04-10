@@ -7,9 +7,9 @@ license.workspace = true
 
 [features]
 default = []
-knowhere-backend = ["dep:knowhere-rs"]
+hanns-backend = ["dep:hanns"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-knowhere-rs = { path = "../../../knowhere-rs", optional = true }
+hanns = { path = "../../../Hanns", optional = true }

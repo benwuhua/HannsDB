@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-knowhere-backend = ["hannsdb-index/knowhere-backend"]
+hanns-backend = ["hannsdb-index/hanns-backend"]
 
 [dependencies]
 serde.workspace = true

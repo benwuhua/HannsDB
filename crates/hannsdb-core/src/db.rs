@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -30,9 +30,14 @@ const DEFAULT_EF_SEARCH: usize = 32;
 const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 const INDEX_CATALOG_FILE: &str = "indexes.json";
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 fn ann_blob_path(collection_dir: &Path, field_name: &str) -> PathBuf {
     collection_dir.join("ann").join(format!("{field_name}.bin"))
+}
+
+#[cfg(feature = "hanns-backend")]
+fn ann_ids_path(collection_dir: &Path, field_name: &str) -> PathBuf {
+    collection_dir.join("ann").join(format!("{field_name}.ids.bin"))
 }
 
 pub struct HannsDb {
@@ -86,6 +91,13 @@ struct OptimizedAnnState {
     metric: String,
 }
 
+#[derive(Clone)]
+struct CachedDocumentState {
+    documents: Arc<HashMap<i64, Document>>,
+    collection_meta: Arc<CollectionMetadata>,
+    index_catalog: Arc<IndexCatalog>,
+}
+
 #[derive(Debug, Default)]
 struct IndexRegistry;
 
@@ -97,6 +109,7 @@ pub struct CollectionHandle {
     index_registry: Arc<IndexRegistry>,
     search_cache: Mutex<HashMap<String, CachedSearchState>>,
     scalar_cache: Mutex<HashMap<String, InvertedScalarIndex>>,
+    document_cache: Mutex<Option<CachedDocumentState>>,
 }
 
 impl HannsDb {
@@ -1276,6 +1289,7 @@ impl CollectionHandle {
             index_registry,
             search_cache: Mutex::new(HashMap::new()),
             scalar_cache: Mutex::new(HashMap::new()),
+            document_cache: Mutex::new(None),
         }
     }
 
@@ -1315,7 +1329,7 @@ impl CollectionHandle {
             QueryPlan::LegacySingleVector(plan) => {
                 let ef_search = plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH);
 
-                #[cfg(feature = "knowhere-backend")]
+                #[cfg(feature = "hanns-backend")]
                 if let Some(filter) = &plan.filter {
                     // Pre-filter path: construct BitsetView from filter evaluation
                     // and pass it to the ANN backend for efficient pre-filtered search.
@@ -1355,7 +1369,7 @@ impl CollectionHandle {
                     }
                 }
 
-                // Fallback: overfetch + post-filter (non-knowhere-backend or no ANN)
+                // Fallback: overfetch + post-filter (non-hanns-backend or no ANN)
                 const FILTER_OVERFETCH_FACTOR: usize = 4;
                 let search_k = if plan.filter.is_some() {
                     plan.top_k.saturating_mul(FILTER_OVERFETCH_FACTOR)
@@ -1417,7 +1431,7 @@ impl CollectionHandle {
             let mut blob_bytes = None;
             state.optimized_ann = Some(build_optimized_ann_state(&state, Some(&mut blob_bytes))?);
 
-            #[cfg(feature = "knowhere-backend")]
+            #[cfg(feature = "hanns-backend")]
             if let Some(ref bytes) = blob_bytes {
                 let blob_path = ann_blob_path(&paths.dir, field_name);
                 if let Some(parent) = blob_path.parent() {
@@ -1439,12 +1453,28 @@ impl CollectionHandle {
                         field_name,
                         self.name
                     );
+                    // Persist external IDs alongside the blob so the ANN can be
+                    // loaded without the original records.bin / ids.bin files.
+                    if let Some(ref ann) = state.optimized_ann {
+                        let ids_path = ann_ids_path(&paths.dir, field_name);
+                        let ids_bytes: Vec<u8> = ann
+                            .ann_external_ids
+                            .iter()
+                            .flat_map(|id| id.to_le_bytes())
+                            .collect();
+                        if let Err(e) = fs::write(&ids_path, &ids_bytes) {
+                            log::warn!(
+                                "Failed to persist ANN ids for '{}': {e}",
+                                field_name
+                            );
+                        }
+                    }
                 }
             }
 
             cache.insert(state.field_name.clone(), state);
 
-            // Suppress unused-variable warnings when knowhere-backend is off
+            // Suppress unused-variable warnings when hanns-backend is off
             let _ = (&descriptor, &blob_bytes);
         }
 
@@ -1719,54 +1749,12 @@ impl CollectionHandle {
     }
 
     fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
-        let paths = self.collection_paths();
-        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let segment_paths = self.segment_manager.segment_paths()?;
-        let mut documents = Vec::with_capacity(external_ids.len());
-
-        for external_id in external_ids {
-            let mut found = None;
-            for segment in &segment_paths {
-                let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
-                let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-                let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
-                let vectors = load_vectors_or_empty(&segment.vectors, stored_ids.len())?;
-                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-                if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "records and ids are not aligned",
-                    ));
-                }
-
-                if let Some(row_idx) = latest_row_index_for_id(&stored_ids, *external_id) {
-                    if tombstone.is_deleted(row_idx) {
-                        found = None;
-                        break;
-                    }
-                    let start = row_idx * collection_meta.dimension;
-                    let end = start + collection_meta.dimension;
-                    let mut doc_vectors = vectors[row_idx].clone();
-                    doc_vectors.insert(
-                        collection_meta.primary_vector.clone(),
-                        records[start..end].to_vec(),
-                    );
-                    found = Some(Document {
-                        id: *external_id,
-                        fields: payloads[row_idx].clone(),
-                        vectors: doc_vectors,
-                    });
-                    break;
-                }
-            }
-
-            if let Some(document) = found {
-                documents.push(document);
-            }
-        }
-
-        Ok(documents)
+        let state = self.cached_document_state()?;
+        let docs = &*state.documents;
+        Ok(external_ids
+            .iter()
+            .filter_map(|id| docs.get(id).cloned())
+            .collect())
     }
 
     fn materialize_document_hit_vectors(
@@ -2046,17 +2034,101 @@ impl CollectionHandle {
         Ok(state)
     }
 
+    fn cached_document_state(&self) -> io::Result<CachedDocumentState> {
+        {
+            let cache = self
+                .document_cache
+                .lock()
+                .expect("document cache mutex poisoned");
+            if let Some(ref state) = *cache {
+                return Ok(state.clone());
+            }
+        }
+
+        let state = self.build_document_cache()?;
+
+        let mut cache = self
+            .document_cache
+            .lock()
+            .expect("document cache mutex poisoned");
+        if let Some(ref existing) = *cache {
+            return Ok(existing.clone());
+        }
+        *cache = Some(state.clone());
+        Ok(state)
+    }
+
+    fn build_document_cache(&self) -> io::Result<CachedDocumentState> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
+        let segment_paths = self.segment_manager.segment_paths()?;
+
+        let mut documents: HashMap<i64, Document> = HashMap::new();
+        let mut shadowed_ids: HashSet<i64> = HashSet::new();
+
+        for segment in &segment_paths {
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let vectors = load_vectors_or_empty(&segment.vectors, stored_ids.len())?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            if stored_ids
+                .len()
+                .saturating_mul(collection_meta.dimension)
+                != records.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "records and ids are not aligned",
+                ));
+            }
+
+            for row_idx in (0..stored_ids.len()).rev() {
+                let ext_id = stored_ids[row_idx];
+                if !shadowed_ids.insert(ext_id) {
+                    continue;
+                }
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                let start = row_idx * collection_meta.dimension;
+                let end = start + collection_meta.dimension;
+                let mut doc_vectors = vectors[row_idx].clone();
+                doc_vectors.insert(
+                    collection_meta.primary_vector.clone(),
+                    records[start..end].to_vec(),
+                );
+                documents.insert(
+                    ext_id,
+                    Document {
+                        id: ext_id,
+                        fields: payloads[row_idx].clone(),
+                        vectors: doc_vectors,
+                    },
+                );
+            }
+        }
+
+        Ok(CachedDocumentState {
+            documents: Arc::new(documents),
+            collection_meta: Arc::new(collection_meta),
+            index_catalog: Arc::new(index_catalog),
+        })
+    }
+
     fn try_load_persisted_ann_state(
         &self,
         field_name: &str,
     ) -> io::Result<Option<CachedSearchState>> {
-        #[cfg(not(feature = "knowhere-backend"))]
+        #[cfg(not(feature = "hanns-backend"))]
         {
             let _ = field_name;
             return Ok(None);
         }
 
-        #[cfg(feature = "knowhere-backend")]
+        #[cfg(feature = "hanns-backend")]
         {
             let paths = self.collection_paths();
             let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
@@ -2108,19 +2180,45 @@ impl CollectionHandle {
                     .map_err(adapter_error_to_io)
             }) {
                 Ok(backend) => {
-                    let mut state = self.load_search_state_for_field(field_name)?;
+                    // Try to load persisted external IDs (avoids needing records.bin).
+                    let ids_file = ann_ids_path(&paths.dir, field_name);
+                    let ann_external_ids = if ids_file.exists() {
+                        let raw = fs::read(&ids_file)?;
+                        let ids: Vec<i64> = raw
+                            .chunks_exact(8)
+                            .map(|chunk| {
+                                let buf: [u8; 8] = chunk.try_into().expect("chunk size");
+                                i64::from_le_bytes(buf)
+                            })
+                            .collect();
+                        Arc::new(ids)
+                    } else {
+                        // Legacy: fall back to loading from segment data.
+                        let state = self.load_search_state_for_field(field_name)?;
+                        Arc::clone(&state.external_ids)
+                    };
+
+                    let state = CachedSearchState {
+                        records: Arc::new(Vec::new()),
+                        external_ids: Arc::clone(&ann_external_ids),
+                        tombstone: Arc::new(TombstoneMask::new(0)),
+                        dimension: vector_schema.dimension,
+                        metric: metric_lc.clone(),
+                        field_name: field_name.to_string(),
+                        descriptor,
+                        optimized_ann: Some(OptimizedAnnState {
+                            backend: Arc::from(backend),
+                            ann_external_ids,
+                            metric: metric_lc,
+                        }),
+                    };
+
                     log::info!(
                         "Loaded persisted ANN index for field '{}' in '{}' from '{}'",
                         field_name,
                         self.name,
                         blob_path.display()
                     );
-                    let ann_external_ids = Arc::clone(&state.external_ids);
-                    state.optimized_ann = Some(OptimizedAnnState {
-                        backend: Arc::from(backend),
-                        ann_external_ids,
-                        metric: metric_lc,
-                    });
                     Ok(Some(state))
                 }
                 Err(e) => {
@@ -2142,6 +2240,11 @@ impl CollectionHandle {
             .lock()
             .expect("search cache mutex poisoned");
         cache.clear();
+        let mut doc_cache = self
+            .document_cache
+            .lock()
+            .expect("document cache mutex poisoned");
+        *doc_cache = None;
     }
 
     fn refresh_version_set(&self) -> io::Result<()> {
@@ -2684,10 +2787,17 @@ fn append_documents(
     Ok(inserted)
 }
 
+/// Count non-empty lines in a JSONL file without parsing the content.
+fn count_jsonl_lines(path: &Path) -> io::Result<usize> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    Ok(reader.lines().filter(|l| l.as_ref().map_or(false, |s| !s.is_empty())).count())
+}
+
 fn ensure_vector_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
-    match load_vectors(path) {
-        Ok(vectors) => {
-            if vectors.len() != existing_rows {
+    match count_jsonl_lines(path) {
+        Ok(count) => {
+            if count != existing_rows {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "vector row count is misaligned with existing records",
@@ -2706,16 +2816,16 @@ fn ensure_vector_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
 }
 
 fn ensure_payload_rows(path: &Path, expected_rows: usize) -> io::Result<()> {
-    match load_payloads(path) {
-        Ok(payloads) => {
-            if payloads.len() > expected_rows {
+    match count_jsonl_lines(path) {
+        Ok(count) => {
+            if count > expected_rows {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "payload row count exceeds record row count",
                 ));
             }
-            if payloads.len() < expected_rows {
-                let missing = vec![BTreeMap::new(); expected_rows - payloads.len()];
+            if count < expected_rows {
+                let missing = vec![BTreeMap::new(); expected_rows - count];
                 let _ = append_payloads(path, &missing)?;
             }
             Ok(())
@@ -2943,7 +3053,7 @@ fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io
     Ok(())
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 fn resolve_primary_vector_descriptor(
     collection_meta: &CollectionMetadata,
     index_catalog: &IndexCatalog,
@@ -3018,9 +3128,10 @@ fn build_optimized_ann_state(
         .unwrap_or_else(|| state.metric.clone())
         .to_ascii_lowercase();
     let (ann_external_ids, flat_vectors) = if state.tombstone.deleted_count() == 0 {
+        // No tombstones: pass Arc references directly — no 293MB clone needed.
         (
             Arc::clone(&state.external_ids),
-            state.records.as_ref().clone(),
+            Arc::clone(&state.records),
         )
     } else {
         let live_count = state
@@ -3036,7 +3147,7 @@ fn build_optimized_ann_state(
             flat_vectors.extend_from_slice(vector);
             live_external_ids.push(state.external_ids[row_idx]);
         }
-        (Arc::new(live_external_ids), flat_vectors)
+        (Arc::new(live_external_ids), Arc::new(flat_vectors))
     };
 
     let mut backend = DefaultIndexFactory::default()
@@ -3090,7 +3201,7 @@ fn ann_search(
             )
         })?;
         let distance = match metric {
-            "l2" => dists_buf[i].max(0.0).sqrt(),
+            "l2" => dists_buf[i].max(0.0),
             "ip" => -dists_buf[i],
             _ => dists_buf[i],
         };
@@ -3102,7 +3213,7 @@ fn ann_search(
     Ok(mapped)
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 fn ann_search_with_bitset(
     backend: &dyn VectorIndexBackend,
     ann_external_ids: &[i64],
@@ -3133,7 +3244,7 @@ fn ann_search_with_bitset(
             )
         })?;
         let distance = match metric {
-            "l2" => hit.distance.max(0.0).sqrt(),
+            "l2" => hit.distance.max(0.0),
             "ip" => -hit.distance,
             _ => hit.distance,
         };

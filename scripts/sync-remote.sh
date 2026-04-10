@@ -49,7 +49,7 @@ case "${1:-}" in
       HANNSSDB_OPT_BENCH_N=${N:-50000} \
       HANNSSDB_OPT_BENCH_DIM=${DIM:-1536} \
       HANNSSDB_OPT_BENCH_METRIC=${METRIC:-cosine} \
-      cargo test -p hannsdb-core --release --features knowhere-backend collection_api_optimize_benchmark_entry -- --nocapture 2>&1 | grep OPT_BENCH"
+      cargo test -p hannsdb-core --release --features hanns-backend collection_api_optimize_benchmark_entry -- --nocapture 2>&1 | grep OPT_BENCH"
     ;;
   build)
     sync_hannsdb

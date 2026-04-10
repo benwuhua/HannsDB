@@ -2,7 +2,7 @@ use crate::adapter::{AdapterError, VectorIndexBackend};
 use crate::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 use crate::flat::FlatIndex;
 use crate::hnsw::InMemoryHnswIndex;
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 use crate::hnsw::KnowhereHnswIndex;
 use crate::ivf::IvfIndex;
 
@@ -41,21 +41,21 @@ impl IndexFactory for DefaultIndexFactory {
             VectorIndexKind::Flat => Ok(Box::new(FlatIndex::new(dim, metric)?)),
             VectorIndexKind::Ivf => {
                 let nlist = read_usize_param(&descriptor.params, "nlist").unwrap_or(1);
-                #[cfg(feature = "knowhere-backend")]
+                #[cfg(feature = "hanns-backend")]
                 {
                     if let Some(bytes) = serialized {
                         return Ok(Box::new(IvfIndex::from_bytes(dim, metric, nlist, bytes)?));
                     }
                     return Ok(Box::new(IvfIndex::new(dim, metric, nlist)?));
                 }
-                #[cfg(not(feature = "knowhere-backend"))]
+                #[cfg(not(feature = "hanns-backend"))]
                 {
                     let _ = serialized;
                     Ok(Box::new(IvfIndex::new(dim, metric, nlist)?))
                 }
             }
             VectorIndexKind::Hnsw => {
-                #[cfg(feature = "knowhere-backend")]
+                #[cfg(feature = "hanns-backend")]
                 {
                     if let Some(bytes) = serialized {
                         return Ok(Box::new(KnowhereHnswIndex::from_bytes(dim, bytes)?));
@@ -68,7 +68,7 @@ impl IndexFactory for DefaultIndexFactory {
                     )?));
                 }
 
-                #[cfg(not(feature = "knowhere-backend"))]
+                #[cfg(not(feature = "hanns-backend"))]
                 {
                     let _ = serialized;
                     Ok(Box::new(InMemoryHnswIndex::new(dim, metric)?))

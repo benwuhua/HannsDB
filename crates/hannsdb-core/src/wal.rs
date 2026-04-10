@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -57,10 +57,12 @@ pub enum WalRecord {
 }
 
 pub fn append_wal_record(path: &Path, record: &WalRecord) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = BufWriter::new(file);
     let encoded = serde_json::to_string(record).map_err(json_to_io_error)?;
-    file.write_all(encoded.as_bytes())?;
-    file.write_all(b"\n")?;
+    writer.write_all(encoded.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
     Ok(())
 }
 

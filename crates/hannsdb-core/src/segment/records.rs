@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 pub fn append_records(path: &Path, dimension: usize, vectors: &[f32]) -> io::Result<usize> {
@@ -11,10 +11,15 @@ pub fn append_records(path: &Path, dimension: usize, vectors: &[f32]) -> io::Res
         ));
     }
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    for value in vectors {
-        file.write_all(&value.to_le_bytes())?;
-    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = BufWriter::new(file);
+    // Write all f32 bytes in one shot instead of 4-byte syscalls.
+    // SAFETY: &[f32] → &[u8] via bytemuck-style cast; f32 has no padding.
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(vectors.as_ptr() as *const u8, vectors.len() * 4)
+    };
+    writer.write_all(byte_slice)?;
+    writer.flush()?;
     Ok(vectors.len() / dimension)
 }
 
@@ -27,56 +32,98 @@ pub fn load_records(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {
     }
 
     let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len() as usize;
 
-    if bytes.len() % 4 != 0 {
+    if file_len % 4 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "record file byte length is not aligned to f32",
         ));
     }
 
-    let mut values = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    let count = file_len / 4;
+    // Allocate aligned buffer and read directly into it.
+    let mut buffer: Vec<u8> = Vec::with_capacity(file_len);
+    // SAFETY: we read exactly file_len bytes, then interpret as f32.
+    unsafe {
+        buffer.set_len(file_len);
     }
+    file.read_exact(&mut buffer)?;
 
-    if values.len() % dimension != 0 {
+    if count % dimension != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "record count is not aligned to dimension",
         ));
     }
 
+    // Zero-copy reinterpret: Vec<u8> → Vec<f32>.
+    // SAFETY: alignment of u8 (1) divides alignment of f32 (4), and we verified len % 4 == 0.
+    // The Vec<u8> is created from a fresh allocation with capacity >= file_len, so alignment is fine.
+    let values: Vec<f32> = unsafe {
+        let ptr = buffer.as_mut_ptr() as *mut f32;
+        let capacity = buffer.capacity() / 4;
+        let len = buffer.len() / 4;
+        std::mem::forget(buffer);
+        Vec::from_raw_parts(ptr, len, capacity)
+    };
+
+    // Convert from native endian bytes to f32 values.
+    // On little-endian (x86, ARM) this is a no-op at the hardware level.
+    #[cfg(target_endian = "big")]
+    {
+        for v in &mut values {
+            *v = f32::from_le(*v);
+        }
+    }
+
     Ok(values)
 }
 
 pub fn append_record_ids(path: &Path, ids: &[i64]) -> io::Result<usize> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    for id in ids {
-        file.write_all(&id.to_le_bytes())?;
-    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut writer = BufWriter::new(file);
+    let byte_slice = unsafe {
+        std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 8)
+    };
+    writer.write_all(byte_slice)?;
+    writer.flush()?;
     Ok(ids.len())
 }
 
 pub fn load_record_ids(path: &Path) -> io::Result<Vec<i64>> {
     let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len() as usize;
 
-    if bytes.len() % 8 != 0 {
+    if file_len % 8 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ids file byte length is not aligned to i64",
         ));
     }
 
-    let mut ids = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        ids.push(i64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]));
+    let mut buffer: Vec<u8> = Vec::with_capacity(file_len);
+    unsafe {
+        buffer.set_len(file_len);
     }
+    file.read_exact(&mut buffer)?;
+
+    let ids: Vec<i64> = unsafe {
+        let ptr = buffer.as_mut_ptr() as *mut i64;
+        let capacity = buffer.capacity() / 8;
+        let len = buffer.len() / 8;
+        std::mem::forget(buffer);
+        Vec::from_raw_parts(ptr, len, capacity)
+    };
+
+    #[cfg(target_endian = "big")]
+    {
+        for v in &mut ids {
+            *v = i64::from_le(*v);
+        }
+    }
+
     Ok(ids)
 }

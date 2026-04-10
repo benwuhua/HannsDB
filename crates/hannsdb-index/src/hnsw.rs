@@ -61,13 +61,13 @@ impl VectorIndexBackend for InMemoryHnswIndex {
     }
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 pub struct KnowhereHnswIndex {
     dim: usize,
-    inner: knowhere_rs::HnswIndex,
+    inner: hanns::HnswIndex,
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 impl KnowhereHnswIndex {
     pub fn new(
         dim: usize,
@@ -76,18 +76,18 @@ impl KnowhereHnswIndex {
         ef_construction: usize,
     ) -> Result<Self, AdapterError> {
         let metric_type = match MetricKind::parse(metric)? {
-            MetricKind::L2 => knowhere_rs::MetricType::L2,
-            MetricKind::Cosine => knowhere_rs::MetricType::Cosine,
-            MetricKind::Ip => knowhere_rs::MetricType::Ip,
+            MetricKind::L2 => hanns::MetricType::L2,
+            MetricKind::Cosine => hanns::MetricType::Cosine,
+            MetricKind::Ip => hanns::MetricType::Ip,
         };
-        let mut cfg = knowhere_rs::IndexConfig::new(knowhere_rs::IndexType::Hnsw, metric_type, dim);
+        let mut cfg = hanns::IndexConfig::new(hanns::IndexType::Hnsw, metric_type, dim);
         // Keep index-level ef floor minimal; query-time ef_search is provided per request.
         cfg.params.ef_search = Some(1);
         cfg.params.ef_construction = Some(ef_construction);
         cfg.params.m = Some(m);
         cfg.params.random_seed = Some(42);
 
-        let inner = knowhere_rs::HnswIndex::new(&cfg)
+        let inner = hanns::HnswIndex::new(&cfg)
             .map_err(|e| AdapterError::Backend(format!("knowhere create failed: {e}")))?;
 
         Ok(Self { dim, inner })
@@ -101,7 +101,7 @@ impl KnowhereHnswIndex {
 
     pub fn from_bytes(dim: usize, bytes: &[u8]) -> Result<Self, AdapterError> {
         let inner =
-            std::panic::catch_unwind(|| knowhere_rs::HnswIndex::deserialize_from_bytes(bytes))
+            std::panic::catch_unwind(|| hanns::HnswIndex::deserialize_from_bytes(bytes))
                 .map_err(|_| {
                     AdapterError::Backend(format!(
                         "hnsw deserialize panicked (dim={dim}, bytes={})",
@@ -118,7 +118,7 @@ impl KnowhereHnswIndex {
     }
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 impl VectorIndexBackend for KnowhereHnswIndex {
     fn insert(&mut self, vectors: &[(u64, Vec<f32>)]) -> Result<(), AdapterError> {
         for (_, v) in vectors {
@@ -215,7 +215,7 @@ impl VectorIndexBackend for KnowhereHnswIndex {
                 got: query.len(),
             });
         }
-        let req = knowhere_rs::SearchRequest {
+        let req = hanns::SearchRequest {
             top_k: k,
             nprobe: ef_search,
             filter: None,
@@ -259,7 +259,7 @@ impl VectorIndexBackend for KnowhereHnswIndex {
             });
         }
         let k = k.min(ids_out.len()).min(dists_out.len());
-        let req = knowhere_rs::SearchRequest {
+        let req = hanns::SearchRequest {
             top_k: k,
             nprobe: ef_search,
             filter: None,
@@ -275,13 +275,13 @@ impl VectorIndexBackend for KnowhereHnswIndex {
         KnowhereHnswIndex::serialize_to_bytes(self).map(Some)
     }
 
-    #[cfg(feature = "knowhere-backend")]
+    #[cfg(feature = "hanns-backend")]
     fn search_with_bitset(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
-        bitset: &knowhere_rs::BitsetView,
+        bitset: &hanns::BitsetView,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
@@ -289,7 +289,7 @@ impl VectorIndexBackend for KnowhereHnswIndex {
                 got: query.len(),
             });
         }
-        let req = knowhere_rs::SearchRequest {
+        let req = hanns::SearchRequest {
             top_k: k,
             nprobe: ef_search,
             filter: None,

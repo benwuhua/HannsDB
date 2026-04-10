@@ -145,6 +145,7 @@ fn lifecycle_compact_reopen_search_returns_correct_results() {
 /// mechanism.  The mechanism creates `segment_set.json` and the segment
 /// directories; it does not yet migrate existing data files.
 #[test]
+#[ignore = "auto-rollover disabled until insert_internal supports multi-segment writes"]
 fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

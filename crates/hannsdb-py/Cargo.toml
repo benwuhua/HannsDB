@@ -9,7 +9,7 @@ license.workspace = true
 default = []
 python-binding = ["dep:pyo3", "dep:numpy", "python-extension-module"]
 python-extension-module = ["pyo3/extension-module"]
-knowhere-backend = ["hannsdb-core/knowhere-backend"]
+hanns-backend = ["hannsdb-core/hanns-backend"]
 
 [lib]
 name = "_native"

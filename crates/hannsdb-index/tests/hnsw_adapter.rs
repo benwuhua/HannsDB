@@ -1,6 +1,6 @@
 use hannsdb_index::adapter::{AdapterError, HnswAdapter, HnswSearchHit};
 use hannsdb_index::hnsw::InMemoryHnswIndex;
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 use hannsdb_index::hnsw::KnowhereHnswIndex;
 
 #[test]
@@ -79,7 +79,7 @@ fn hnsw_adapter_rejects_dimension_mismatch() {
     );
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn knowhere_hnsw_adapter_roundtrip_insert_and_search() {
     let backend =
@@ -100,7 +100,7 @@ fn knowhere_hnsw_adapter_roundtrip_insert_and_search() {
     assert_eq!(hits[0].id, 101_u64);
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn knowhere_hnsw_adapter_near_origin_l2_search_prefers_closest_point() {
     let backend =
@@ -121,7 +121,7 @@ fn knowhere_hnsw_adapter_near_origin_l2_search_prefers_closest_point() {
     assert_eq!(hits[0].id, 0_u64);
 }
 
-#[cfg(feature = "knowhere-backend")]
+#[cfg(feature = "hanns-backend")]
 #[test]
 fn knowhere_hnsw_adapter_l2_search_matches_expected_neighbor_for_small_fixture() {
     let backend =
