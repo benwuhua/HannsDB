@@ -3,24 +3,30 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
+
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hannsdb_core::db::HannsDb;
-use hannsdb_core::document::{Document, FieldType, FieldValue, ScalarFieldSchema, SparseVector};
+use hannsdb_core::document::{
+    Document, FieldType, FieldValue, ScalarFieldSchema, SparseVector, VectorFieldSchema,
+    VectorIndexSchema,
+};
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, QueryVector, VectorQuery, VectorQueryParam,
 };
 
 use crate::api::{
-    AddColumnRequest, AddColumnResponse, AlterColumnRequest, AlterColumnResponse,
-    CollectionInfoResponse, CompactCollectionResponse, CreateCollectionRequest,
-    CreateCollectionResponse, CreateIndexResponse, DropCollectionResponse, DropColumnResponse,
-    DropIndexResponse, ErrorResponse, FlushCollectionResponse, HealthResponse,
-    InsertRecordsRequest, ListCollectionsResponse, OptimizeCollectionResponse, ScalarIndexRequest,
-    ScalarIndexesResponse, SegmentsResponse, VectorIndexRequest, VectorIndexesResponse,
+    AddColumnRequest, AddColumnResponse, AddVectorFieldRequest, AddVectorFieldResponse,
+    AlterColumnRequest, AlterColumnResponse, CollectionInfoResponse, CompactCollectionResponse,
+    CreateCollectionRequest, CreateCollectionResponse, CreateIndexResponse, DropCollectionResponse,
+    DropColumnResponse, DropIndexResponse, DropVectorFieldResponse, ErrorResponse,
+    FlushCollectionResponse, HealthResponse, InsertRecordsRequest, ListCollectionsResponse,
+    OptimizeCollectionResponse, ScalarIndexRequest, ScalarIndexesResponse, SegmentsResponse,
+    VectorIndexRequest, VectorIndexesResponse,
 };
 
 use super::routes_mutation;
@@ -95,6 +101,14 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
         .route(
             "/collections/:collection/schema/columns/:field_name",
             delete(drop_column_from_collection).patch(alter_column_in_collection),
+        )
+        .route(
+            "/collections/:collection/schema/vectors",
+            post(add_vector_field_to_collection),
+        )
+        .route(
+            "/collections/:collection/schema/vectors/:field_name",
+            delete(drop_vector_field_from_collection),
         )
         .route(
             "/collections/:collection/indexes/vector",
@@ -247,6 +261,7 @@ fn collection_info_response(result: io::Result<hannsdb_core::db::CollectionInfo>
                 record_count: info.record_count,
                 deleted_count: info.deleted_count,
                 live_count: info.live_count,
+                index_completeness: info.index_completeness,
             }),
         )
             .into_response(),
@@ -819,9 +834,171 @@ async fn alter_column_in_collection(
     }
 }
 
+async fn add_vector_field_to_collection(
+    State(state): State<DaemonState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(request): Json<AddVectorFieldRequest>,
+) -> Response {
+    let data_type = match parse_daemon_vector_field_type(&request.data_type) {
+        Ok(dt) => dt,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+    let index_param = match parse_optional_index_param(request.index_param.as_ref()) {
+        Ok(p) => p,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    };
+    let field = VectorFieldSchema {
+        name: request.name.clone(),
+        data_type,
+        dimension: request.dimension,
+        index_param,
+        bm25_params: None,
+    };
+
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .add_vector_field(&collection, field);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AddVectorFieldResponse {
+                added: request.name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn drop_vector_field_from_collection(
+    State(state): State<DaemonState>,
+    AxumPath((collection, field_name)): AxumPath<(String, String)>,
+) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .drop_vector_field(&collection, &field_name);
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DropVectorFieldResponse {
+                dropped: field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers (used by routes_mutation and routes_search via super::routes)
 // ---------------------------------------------------------------------------
+
+pub(crate) fn parse_daemon_vector_field_type(value: &str) -> Result<FieldType, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "vector_fp32" | "vectorfp32" => Ok(FieldType::VectorFp32),
+        "vector_fp16" | "vectorfp16" => Ok(FieldType::VectorFp16),
+        "vector_sparse" | "vectorsparse" => Ok(FieldType::VectorSparse),
+        other => Err(format!("unsupported vector data type: {other}")),
+    }
+}
+
+pub(crate) fn parse_optional_index_param(
+    value: Option<&Value>,
+) -> Result<Option<VectorIndexSchema>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "index_param must be a JSON object".to_string())?;
+    let kind = obj
+        .get("kind")
+        .and_then(|v: &Value| v.as_str())
+        .unwrap_or("hnsw");
+    let metric = obj
+        .get("metric")
+        .and_then(|v: &Value| v.as_str())
+        .map(str::to_string);
+    match kind {
+        "hnsw" => {
+            let m = obj.get("m").and_then(|v: &Value| v.as_u64()).unwrap_or(16) as usize;
+            let ef_construction = obj
+                .get("ef_construction")
+                .and_then(|v: &Value| v.as_u64())
+                .unwrap_or(128) as usize;
+            Ok(Some(VectorIndexSchema::hnsw(
+                metric.as_deref(),
+                m,
+                ef_construction,
+            )))
+        }
+        "ivf" => {
+            let nlist = obj
+                .get("nlist")
+                .and_then(|v: &Value| v.as_u64())
+                .unwrap_or(1024) as usize;
+            Ok(Some(VectorIndexSchema::ivf(metric.as_deref(), nlist)))
+        }
+        other => Err(format!("unsupported index kind: {other}")),
+    }
+}
 
 pub(crate) fn parse_daemon_field_type(value: &str) -> Result<FieldType, String> {
     match value.to_ascii_lowercase().as_str() {

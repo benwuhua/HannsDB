@@ -5,7 +5,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{CollectionSchema, Document, DocumentUpdate, ScalarFieldSchema};
+use crate::document::{
+    CollectionSchema, Document, DocumentUpdate, ScalarFieldSchema, VectorFieldSchema,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WalRecord {
@@ -54,6 +56,14 @@ pub enum WalRecord {
         old_name: String,
         new_name: String,
     },
+    AddVectorField {
+        collection: String,
+        field: VectorFieldSchema,
+    },
+    DropVectorField {
+        collection: String,
+        field_name: String,
+    },
 }
 
 pub fn append_wal_record(path: &Path, record: &WalRecord) -> io::Result<()> {
@@ -97,6 +107,20 @@ pub fn load_wal_records(path: &Path) -> io::Result<Vec<WalRecord>> {
         }
     }
     Ok(records)
+}
+
+/// Truncate the WAL file to zero bytes, removing all entries.
+///
+/// This is a checkpoint operation: after all data has been flushed/optimized
+/// to segment files, the WAL entries are no longer needed and can be discarded.
+/// The WAL file itself is kept (as an empty file) so that subsequent appends
+/// work without needing to check for file existence.
+pub fn truncate_wal(path: &Path) -> io::Result<()> {
+    use std::io::Seek;
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(0)?;
+    file.seek(io::SeekFrom::Start(0))?;
+    Ok(())
 }
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {

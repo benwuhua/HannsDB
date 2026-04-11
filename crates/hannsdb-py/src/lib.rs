@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyFileNotFoundError, PyNotImplementedError, PyRuntimeErro
 #[cfg(feature = "python-binding")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
-use pyo3::types::{PyAny, PyBool, PyDict};
+use pyo3::types::{PyAny, PyBool, PyDict, PyList};
 
 use hannsdb_core::catalog::{CollectionMetadata, IndexCatalog};
 use hannsdb_core::document::{
@@ -139,6 +139,8 @@ pub struct Doc {
     pub fields: BTreeMap<String, FieldValue>,
     pub vectors: BTreeMap<String, Vec<f32>>,
     pub field_name: String,
+    /// Set when group_by is active: the value of the group_by field.
+    pub group_key: Option<FieldValue>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,7 +162,7 @@ pub struct VectorQuery {
     pub param: Option<HnswQueryParam>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollectionStats {
     pub name: String,
     pub dimension: usize,
@@ -168,6 +170,8 @@ pub struct CollectionStats {
     pub record_count: usize,
     pub deleted_count: usize,
     pub live_count: usize,
+    /// For each vector field, fraction of data covered by an ANN index (0.0..=1.0).
+    pub index_completeness: BTreeMap<String, f64>,
 }
 
 pub struct Collection {
@@ -387,7 +391,11 @@ fn py_query_context_to_core(
             vector,
             param: query.param.map(|param| CoreVectorQueryParam {
                 ef_search: Some(param.ef),
-                nprobe: if param.nprobe > 0 { Some(param.nprobe) } else { None },
+                nprobe: if param.nprobe > 0 {
+                    Some(param.nprobe)
+                } else {
+                    None
+                },
             }),
         });
     }
@@ -491,6 +499,7 @@ fn doc_from_core_document(document: CoreDocument, primary_vector_name: &str) -> 
         fields,
         vectors,
         field_name: primary_vector_name.to_string(),
+        group_key: None,
     }
 }
 
@@ -732,6 +741,7 @@ impl Collection {
             record_count: info.record_count,
             deleted_count: info.deleted_count,
             live_count: info.live_count,
+            index_completeness: info.index_completeness,
         })
     }
 
@@ -794,6 +804,53 @@ impl Collection {
             })
     }
 
+    pub fn add_vector_field(
+        &mut self,
+        name: &str,
+        data_type: &str,
+        dimension: usize,
+        index_param: Option<&IndexParam>,
+    ) -> std::io::Result<()> {
+        let core_data_type = match data_type.to_ascii_lowercase().as_str() {
+            "vector_fp32" | "vectorfp32" => hannsdb_core::document::FieldType::VectorFp32,
+            "vector_fp16" | "vectorfp16" => hannsdb_core::document::FieldType::VectorFp16,
+            "vector_sparse" | "vectorsparse" => hannsdb_core::document::FieldType::VectorSparse,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported vector data type: {other}"),
+                ))
+            }
+        };
+        let core_index_param = match index_param {
+            Some(IndexParam::Hnsw(params)) => Some(
+                hannsdb_core::document::VectorIndexSchema::hnsw(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.ef_construction,
+                )
+                .with_quantize_type(quantize_type_value(params.quantize_type)),
+            ),
+            Some(IndexParam::Ivf(params)) => Some(hannsdb_core::document::VectorIndexSchema::ivf(
+                params.metric_type.map(metric_type_name),
+                params.nlist,
+            )),
+            None => None,
+        };
+        let field = hannsdb_core::document::VectorFieldSchema {
+            name: name.to_string(),
+            data_type: core_data_type,
+            dimension,
+            index_param: core_index_param,
+            bm25_params: None,
+        };
+        self.db.add_vector_field(&self.collection_name, field)
+    }
+
+    pub fn drop_vector_field(&mut self, field_name: &str) -> std::io::Result<()> {
+        self.db.drop_vector_field(&self.collection_name, field_name)
+    }
+
     pub fn query(
         &self,
         output_fields: Option<Vec<String>>,
@@ -833,6 +890,7 @@ impl Collection {
                             fields: select_output_fields(&hit.fields, &output_fields),
                             vectors: BTreeMap::new(),
                             field_name: self.primary_vector_name.clone(),
+                            group_key: None,
                         })
                         .collect()
                 });
@@ -854,6 +912,7 @@ impl Collection {
                     fields: BTreeMap::new(),
                     vectors: BTreeMap::new(),
                     field_name: self.primary_vector_name.clone(),
+                    group_key: None,
                 })
                 .collect());
         }
@@ -871,6 +930,7 @@ impl Collection {
                 fields: select_output_fields(&document.fields, &output_fields),
                 vectors: BTreeMap::new(),
                 field_name: self.primary_vector_name.clone(),
+                group_key: None,
             })
             .collect())
     }
@@ -890,6 +950,7 @@ impl Collection {
                 fields: hit.fields,
                 vectors: hit.vectors,
                 field_name: self.primary_vector_name.clone(),
+                group_key: hit.group_key,
             })
             .collect())
     }
@@ -959,6 +1020,25 @@ fn py_dict_to_vectors(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, V
         out.insert(key, value);
     }
     Ok(out)
+}
+
+#[cfg(feature = "python-binding")]
+fn field_value_to_py<'py>(py: Python<'py>, value: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
+    match value {
+        FieldValue::String(v) => v.into_bound(py).into_any(),
+        FieldValue::Int64(v) => v.into_bound(py).into_any(),
+        FieldValue::Int32(v) => v.into_bound(py).into_any(),
+        FieldValue::UInt32(v) => (*v as u64).into_bound(py).into_any(),
+        FieldValue::UInt64(v) => v.into_bound(py).into_any(),
+        FieldValue::Float(v) => v.into_bound(py).into_any(),
+        FieldValue::Float64(v) => v.into_bound(py).into_any(),
+        FieldValue::Bool(v) => v.into_bound(py).into_any(),
+        FieldValue::Array(items) => {
+            let list = PyList::new(py, items.iter().map(|item| field_value_to_py(py, item)).collect::<PyResult<Vec<_>>>()?)?;
+            list.into_any()
+        }
+    }
+    .map_err(Into::into)
 }
 
 #[cfg(feature = "python-binding")]
@@ -1540,6 +1620,7 @@ impl PyDoc {
                         .unwrap_or_default(),
                     vectors: inner_vectors,
                     field_name,
+                    group_key: None,
                 }
             },
         })
@@ -1569,10 +1650,15 @@ impl PyDoc {
     fn field_name(&self) -> String {
         self.inner.field_name.clone()
     }
-}
 
-#[cfg(feature = "python-binding")]
-#[pyclass(name = "SparseVector", module = "hannsdb")]
+    #[getter]
+    fn group_key<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match &self.inner.group_key {
+            Some(value) => Ok(Some(field_value_to_py(py, value)?)),
+            None => Ok(None),
+        }
+    }
+}
 #[derive(Clone)]
 struct PySparseVector {
     inner: SparseVectorData,
@@ -1709,10 +1795,7 @@ struct PyWeightedReRanker {
 impl PyWeightedReRanker {
     #[new]
     #[pyo3(signature = (weights, metric=None))]
-    fn new(
-        weights: std::collections::HashMap<String, f64>,
-        metric: Option<String>,
-    ) -> Self {
+    fn new(weights: std::collections::HashMap<String, f64>, metric: Option<String>) -> Self {
         Self { weights, metric }
     }
 
@@ -1771,6 +1854,15 @@ impl PyCollectionStats {
     #[getter]
     fn live_count(&self) -> usize {
         self.inner.live_count
+    }
+
+    #[getter]
+    fn index_completeness(&self) -> std::collections::HashMap<String, f64> {
+        self.inner
+            .index_completeness
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 }
 
@@ -1948,6 +2040,7 @@ impl PyCollection {
                                 fields: BTreeMap::new(),
                                 vectors: BTreeMap::new(),
                                 field_name: inner.primary_vector_name.clone(),
+                                group_key: None,
                             },
                         },
                     )
@@ -1986,6 +2079,7 @@ impl PyCollection {
                             fields: hit.fields,
                             vectors: hit.vectors,
                             field_name: inner.primary_vector_name.clone(),
+                            group_key: hit.group_key,
                         },
                     },
                 )
@@ -2106,6 +2200,49 @@ impl PyCollection {
             .list_scalar_indexes()
             .map_err(io_to_py_err)
     }
+
+    #[pyo3(signature = (name, data_type, dimension, index_param=None))]
+    fn add_vector_field(
+        &mut self,
+        name: String,
+        data_type: String,
+        dimension: usize,
+        index_param: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let index_param = match index_param {
+            Some(param) => {
+                let py = unsafe { pyo3::Python::assume_gil_acquired() };
+                let bound = param.bind(py);
+                if bound.is_instance_of::<PyHnswIndexParam>() {
+                    Some(IndexParam::Hnsw(
+                        bound
+                            .extract::<pyo3::PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyIVFIndexParam>() {
+                    Some(IndexParam::Ivf(
+                        bound
+                            .extract::<pyo3::PyRef<'_, PyIVFIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        self.inner_mut()?
+            .add_vector_field(&name, &data_type, dimension, index_param.as_ref())
+            .map_err(io_to_py_err)
+    }
+
+    fn drop_vector_field(&mut self, field_name: String) -> PyResult<()> {
+        self.inner_mut()?
+            .drop_vector_field(&field_name)
+            .map_err(io_to_py_err)
+    }
 }
 
 #[cfg(feature = "python-binding")]
@@ -2211,6 +2348,7 @@ mod tests {
                 .collect(),
             vectors: [("dense".to_string(), vector)].into_iter().collect(),
             field_name: "dense".to_string(),
+            group_key: None,
         }
     }
 
@@ -2252,6 +2390,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             field_name: "dense".to_string(),
+            group_key: None,
         };
         let _query = VectorQuery {
             field_name: "dense".to_string(),

@@ -145,6 +145,7 @@ impl QueryExecutor {
                         fields: doc.fields,
                         vectors: BTreeMap::new(),
                         sparse_vectors: BTreeMap::new(),
+                        group_key: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -268,6 +269,7 @@ fn apply_reranker(
                 fields: doc.fields.clone(),
                 vectors: BTreeMap::new(),
                 sparse_vectors: BTreeMap::new(),
+                group_key: None,
             })
         })
         .collect()
@@ -317,10 +319,10 @@ fn collapse_hits_by_group(
     let mut groups_seen: usize = 0;
     let mut result = Vec::new();
 
-    for hit in hits {
-        let group_key = hit
-            .fields
-            .get(field_name)
+    for mut hit in hits {
+        let group_key_value = hit.fields.get(field_name).cloned();
+        let group_key = group_key_value
+            .as_ref()
             .map(GroupByValueKey::from_field_value)
             .unwrap_or(GroupByValueKey::Missing);
 
@@ -336,6 +338,7 @@ fn collapse_hits_by_group(
             continue;
         }
         *count += 1;
+        hit.group_key = group_key_value;
         result.push(hit);
         if result.len() >= top_k {
             break;

@@ -14,7 +14,7 @@ use hannsdb_index::sparse::{SparseIndexBackend, SparseVectorData};
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
     CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
-    VectorIndexSchema,
+    VectorFieldSchema, VectorIndexSchema,
 };
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
@@ -37,7 +37,7 @@ use crate::segment::{
     write_vectors_arrow, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
     VersionSet,
 };
-use crate::wal::{append_wal_record, load_wal_records, WalRecord};
+use crate::wal::{append_wal_record, load_wal_records, truncate_wal, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
 const DEFAULT_NPROBE: usize = 32;
@@ -49,7 +49,7 @@ pub struct HannsDb {
     collection_handles: RwLock<HashMap<String, Arc<CollectionHandle>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollectionInfo {
     pub name: String,
     pub dimension: usize,
@@ -57,6 +57,9 @@ pub struct CollectionInfo {
     pub record_count: usize,
     pub deleted_count: usize,
     pub live_count: usize,
+    /// For each vector field, the fraction of live data covered by an ANN index (0.0..=1.0).
+    /// A value of 1.0 means the field is fully indexed; 0.0 means no index exists.
+    pub index_completeness: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +77,8 @@ pub struct DocumentHit {
     pub fields: BTreeMap<String, FieldValue>,
     pub vectors: BTreeMap<String, Vec<f32>>,
     pub sparse_vectors: BTreeMap<String, crate::document::SparseVector>,
+    /// Set when group_by is active: the value of the group_by field for this hit.
+    pub group_key: Option<FieldValue>,
 }
 
 #[derive(Clone)]
@@ -358,6 +363,105 @@ impl HannsDb {
         Ok(())
     }
 
+    pub fn add_vector_field(
+        &mut self,
+        collection: &str,
+        field: VectorFieldSchema,
+    ) -> io::Result<()> {
+        self.require_write()?;
+        self.add_vector_field_internal(collection, field, true)
+    }
+
+    fn add_vector_field_internal(
+        &mut self,
+        collection: &str,
+        field: VectorFieldSchema,
+        log_wal: bool,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        // Also check scalar fields for name collisions.
+        if meta.fields.iter().any(|f| f.name == field.name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("a scalar field with name '{}' already exists", field.name),
+            ));
+        }
+
+        crate::catalog::schema_mutation::add_vector_field_to_schema(
+            &mut meta.vectors,
+            field.clone(),
+        )?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::AddVectorField {
+                    collection: collection.to_string(),
+                    field,
+                },
+            )?;
+        }
+
+        meta.save_to_path(&paths.collection_meta)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
+    pub fn drop_vector_field(&mut self, collection: &str, field_name: &str) -> io::Result<()> {
+        self.require_write()?;
+        self.drop_vector_field_internal(collection, field_name, true)
+    }
+
+    fn drop_vector_field_internal(
+        &mut self,
+        collection: &str,
+        field_name: &str,
+        log_wal: bool,
+    ) -> io::Result<()> {
+        let paths = self.collection_paths(collection);
+        let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        crate::catalog::schema_mutation::remove_vector_field_from_schema(
+            &mut meta.vectors,
+            field_name,
+            &meta.primary_vector,
+        )?;
+
+        if log_wal {
+            append_wal_record(
+                &wal_path(&self.root),
+                &WalRecord::DropVectorField {
+                    collection: collection.to_string(),
+                    field_name: field_name.to_string(),
+                },
+            )?;
+        }
+
+        // Drop any associated vector index descriptor.
+        if paths.index_catalog.exists() {
+            if let Ok(mut catalog) = IndexCatalog::load_from_path(&paths.index_catalog) {
+                catalog.drop_vector_index(field_name);
+                catalog.save_to_path(&paths.index_catalog)?;
+            }
+        }
+
+        // Remove persisted ANN blobs for this field.
+        let ann_blob = ann_blob_path(&paths.dir, field_name);
+        if ann_blob.exists() {
+            let _ = fs::remove_file(&ann_blob);
+        }
+        let ann_ids = ann_ids_path(&paths.dir, field_name);
+        if ann_ids.exists() {
+            let _ = fs::remove_file(&ann_ids);
+        }
+
+        meta.save_to_path(&paths.collection_meta)?;
+        self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
     pub fn drop_collection(&mut self, name: &str) -> io::Result<()> {
         self.require_write()?;
         self.drop_collection_internal(name, true)
@@ -507,11 +611,26 @@ impl HannsDb {
     }
 
     pub fn flush_collection(&self, name: &str) -> io::Result<()> {
-        self.open_collection_handle(name)?.flush()
+        self.open_collection_handle(name)?.flush()?;
+        // After successful flush, all WAL entries are reflected in the segment
+        // files on disk. Truncate the WAL to reclaim space and avoid redundant
+        // replay on the next open.
+        let wal = wal_path(&self.root);
+        if wal.exists() {
+            truncate_wal(&wal)?;
+        }
+        Ok(())
     }
 
     pub fn optimize_collection(&self, name: &str) -> io::Result<()> {
-        self.open_collection_handle(name)?.optimize()
+        self.open_collection_handle(name)?.optimize()?;
+        // After successful optimize, all data is persisted in segment files and
+        // ANN index blobs. Truncate the WAL since replay is no longer needed.
+        let wal = wal_path(&self.root);
+        if wal.exists() {
+            truncate_wal(&wal)?;
+        }
+        Ok(())
     }
 
     pub fn compact_collection(&mut self, name: &str) -> io::Result<()> {
@@ -1431,6 +1550,13 @@ impl HannsDb {
                 old_name,
                 new_name,
             } => self.alter_column_internal(collection, old_name, new_name, false),
+            WalRecord::AddVectorField { collection, field } => {
+                self.add_vector_field_internal(collection, field.clone(), false)
+            }
+            WalRecord::DropVectorField {
+                collection,
+                field_name,
+            } => self.drop_vector_field_internal(collection, field_name, false),
         }
     }
 }
@@ -1580,7 +1706,8 @@ impl CollectionHandle {
                 // provided, it overrides ef_search for IVF indexes (the IVF backend
                 // maps the ef_search argument to nprobe internally).
                 let state = self.cached_search_state_for_field(&plan.field_name)?;
-                let is_ivf = state.descriptor.kind == hannsdb_index::descriptor::VectorIndexKind::Ivf;
+                let is_ivf =
+                    state.descriptor.kind == hannsdb_index::descriptor::VectorIndexKind::Ivf;
                 let effective_search_param = if is_ivf && plan.nprobe.is_some() {
                     nprobe
                 } else {
@@ -1627,6 +1754,7 @@ impl CollectionHandle {
                                 fields: document.fields,
                                 vectors: BTreeMap::new(),
                                 sparse_vectors: BTreeMap::new(),
+                                group_key: None,
                             })
                             .collect();
                         project_document_hits(&mut doc_hits, plan.output_fields.as_deref());
@@ -1939,6 +2067,30 @@ impl CollectionHandle {
             record_count += metadata.record_count;
             deleted_count += metadata.deleted_count;
         }
+        let live_count = record_count.saturating_sub(deleted_count);
+
+        // Build index_completeness: check the search cache for each vector field.
+        // If the cache has an entry with optimized_ann populated, that field is fully indexed.
+        let mut index_completeness = BTreeMap::new();
+        let cache = self
+            .search_cache
+            .lock()
+            .expect("search cache mutex poisoned");
+        for vector_schema in &collection_meta.vectors {
+            let completeness = if live_count == 0 {
+                // No data: vacuously fully indexed.
+                1.0
+            } else if let Some(state) = cache.get(&vector_schema.name) {
+                if state.optimized_ann.is_some() {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            index_completeness.insert(vector_schema.name.clone(), completeness);
+        }
 
         Ok(CollectionInfo {
             name: collection_meta.name,
@@ -1946,7 +2098,8 @@ impl CollectionHandle {
             metric: collection_meta.metric,
             record_count,
             deleted_count,
-            live_count: record_count.saturating_sub(deleted_count),
+            live_count,
+            index_completeness,
         })
     }
 
@@ -2046,6 +2199,7 @@ impl CollectionHandle {
                             fields: document.fields,
                             vectors,
                             sparse_vectors: BTreeMap::new(),
+                            group_key: None,
                         }
                     })
                     .collect())
@@ -2100,6 +2254,7 @@ impl CollectionHandle {
                     fields: document.fields,
                     vectors,
                     sparse_vectors: BTreeMap::new(),
+                    group_key: None,
                 }
             })
             .collect())
@@ -2250,6 +2405,7 @@ impl CollectionHandle {
                         fields: fields.clone(),
                         vectors: BTreeMap::new(),
                         sparse_vectors: BTreeMap::new(),
+                        group_key: None,
                     },
                 };
 
@@ -3018,7 +3174,9 @@ fn collection_name_for_wal_record(record: &WalRecord) -> &str {
         | WalRecord::UpdateDocuments { collection, .. }
         | WalRecord::AddColumn { collection, .. }
         | WalRecord::DropColumn { collection, .. }
-        | WalRecord::AlterColumn { collection, .. } => collection,
+        | WalRecord::AlterColumn { collection, .. }
+        | WalRecord::AddVectorField { collection, .. }
+        | WalRecord::DropVectorField { collection, .. } => collection,
         WalRecord::CompactCollection {
             collection_name, ..
         } => collection_name,

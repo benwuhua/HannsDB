@@ -848,3 +848,173 @@ fn wal_recovery_crash_missing_tombstones_replays_delete_state() {
         "tombstones should be recreated by replay"
     );
 }
+
+// ── WAL truncation / checkpointing tests ──────────────────────────────────
+
+#[test]
+fn wal_truncate_removes_all_wal_entries_after_flush() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let wal_path = root.join("wal.jsonl");
+
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert_documents("docs", &[sample_document(11)])
+        .expect("insert document");
+
+    // WAL should have entries before flush.
+    let records_before = load_wal_records(&wal_path).expect("load wal before flush");
+    assert!(
+        !records_before.is_empty(),
+        "WAL should have entries before flush"
+    );
+
+    db.flush_collection("docs").expect("flush collection");
+
+    // WAL file should still exist but be empty after flush.
+    assert!(wal_path.exists(), "WAL file should still exist after flush");
+    let records_after = load_wal_records(&wal_path).expect("load wal after flush");
+    assert!(
+        records_after.is_empty(),
+        "WAL should be empty after flush, got {} entries",
+        records_after.len()
+    );
+}
+
+#[test]
+fn wal_truncate_data_survives_reopen_after_flush() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+
+    {
+        let mut db = HannsDb::open(root).expect("open db");
+        db.create_collection_with_schema("docs", &sample_schema())
+            .expect("create collection");
+        db.insert_documents("docs", &[sample_document(11), sample_document(22)])
+            .expect("insert documents");
+        db.delete("docs", &[11]).expect("delete document");
+        db.flush_collection("docs").expect("flush collection");
+    }
+
+    // Reopen should work without WAL replay since all data is on disk.
+    let reopened = HannsDb::open(root).expect("reopen db after flush");
+    let info = reopened
+        .get_collection_info("docs")
+        .expect("collection info");
+    assert_eq!(info.record_count, 2);
+    assert_eq!(info.deleted_count, 1);
+    assert_eq!(info.live_count, 1);
+
+    let fetched = reopened
+        .fetch_documents("docs", &[22])
+        .expect("fetch surviving document");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].id, 22);
+}
+
+#[test]
+fn wal_truncate_subsequent_writes_work_after_flush() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let wal_path = root.join("wal.jsonl");
+
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert_documents("docs", &[sample_document(11)])
+        .expect("insert first document");
+    db.flush_collection("docs").expect("flush collection");
+
+    // WAL should be empty after flush.
+    assert!(load_wal_records(&wal_path)
+        .expect("load wal after flush")
+        .is_empty());
+
+    // New writes should append to the WAL normally.
+    db.insert_documents("docs", &[sample_document(22)])
+        .expect("insert second document");
+
+    let records = load_wal_records(&wal_path).expect("load wal after new write");
+    assert_eq!(
+        records.len(),
+        1,
+        "WAL should have exactly 1 entry for the new insert"
+    );
+    assert!(matches!(
+        &records[0],
+        WalRecord::InsertDocuments { collection, .. } if collection == "docs"
+    ));
+}
+
+#[test]
+fn wal_truncate_optimize_truncates_wal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let wal_path = root.join("wal.jsonl");
+
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert_documents("docs", &[sample_document(11)])
+        .expect("insert document");
+
+    // WAL should have entries before optimize.
+    assert!(!load_wal_records(&wal_path)
+        .expect("load wal before optimize")
+        .is_empty());
+
+    db.optimize_collection("docs").expect("optimize collection");
+
+    // WAL should be empty after optimize.
+    assert!(
+        load_wal_records(&wal_path)
+            .expect("load wal after optimize")
+            .is_empty(),
+        "WAL should be empty after optimize"
+    );
+}
+
+#[test]
+fn wal_truncate_flush_then_reopen_then_insert_search_works() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+
+    // Phase 1: create, insert, flush, close.
+    {
+        let mut db = HannsDb::open(root).expect("open db phase 1");
+        db.create_collection_with_schema("docs", &sample_schema())
+            .expect("create");
+        db.insert_documents(
+            "docs",
+            &[
+                custom_document(1, "a", 1, true, vec![1.0, 0.0]),
+                custom_document(2, "b", 2, false, vec![0.0, 1.0]),
+            ],
+        )
+        .expect("insert");
+        db.flush_collection("docs").expect("flush");
+    }
+
+    // Phase 2: reopen, verify data, insert more, close.
+    {
+        let mut db = HannsDb::open(root).expect("open db phase 2");
+        let info = db.get_collection_info("docs").expect("info");
+        assert_eq!(info.live_count, 2);
+
+        db.insert_documents("docs", &[custom_document(3, "c", 3, true, vec![0.5, 0.5])])
+            .expect("insert more");
+
+        let hits = db.search("docs", &[0.5, 0.5], 1).expect("search");
+        assert_eq!(hits[0].id, 3);
+        db.flush_collection("docs").expect("flush");
+    }
+
+    // Phase 3: reopen again, verify all data.
+    let db = HannsDb::open(root).expect("open db phase 3");
+    let info = db.get_collection_info("docs").expect("info");
+    assert_eq!(info.live_count, 3);
+
+    let fetched = db.fetch_documents("docs", &[1, 2, 3]).expect("fetch all");
+    assert_eq!(fetched.len(), 3);
+}

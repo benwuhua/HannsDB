@@ -195,6 +195,7 @@ fn search_records_legacy(
                         fields: select_output_fields(&hit.fields, output_fields),
                         vector: None,
                         sparse_vectors: None,
+                        group_key: None,
                     })
                     .collect()
             });
@@ -214,6 +215,7 @@ fn search_records_legacy(
                         fields: select_output_fields(&hit.fields, output_fields),
                         vector: None,
                         sparse_vectors: None,
+                        group_key: None,
                     })
                     .collect()
             });
@@ -232,6 +234,7 @@ fn search_records_legacy(
                     fields: BTreeMap::new(),
                     vector: None,
                     sparse_vectors: None,
+                    group_key: None,
                 })
                 .collect()
         })
@@ -289,6 +292,7 @@ fn search_records_typed(
                         },
                         vector,
                         sparse_vectors,
+                        group_key: hit.group_key.map(super::routes::field_value_to_json),
                     }
                 })
                 .collect()

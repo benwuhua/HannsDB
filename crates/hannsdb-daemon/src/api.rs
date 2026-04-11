@@ -180,6 +180,8 @@ pub struct SearchHitResponse {
     pub vector: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sparse_vectors: Option<BTreeMap<String, SparseVectorResponse>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +260,8 @@ pub struct CollectionInfoResponse {
     pub record_count: usize,
     pub deleted_count: usize,
     pub live_count: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub index_completeness: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,4 +348,25 @@ pub struct AlterColumnRequest {
 pub struct AlterColumnResponse {
     pub old_name: String,
     pub new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddVectorFieldRequest {
+    pub name: String,
+    pub data_type: String, // "vector_fp32", "vector_fp16", "vector_sparse"
+    #[serde(default)]
+    pub dimension: usize,
+    #[serde(default)]
+    pub index_param: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddVectorFieldResponse {
+    pub added: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DropVectorFieldResponse {
+    pub dropped: String,
 }
