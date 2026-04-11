@@ -135,6 +135,8 @@ pub struct TypedVectorQueryRequest {
 pub struct TypedVectorQueryParamRequest {
     #[serde(default)]
     pub ef_search: Option<usize>,
+    #[serde(default)]
+    pub nprobe: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +156,10 @@ pub struct TypedQueryRerankerRequest {
     pub rank_constant: Option<u64>,
     #[serde(default)]
     pub weights: BTreeMap<String, f64>,
+    /// Override metric for score normalization: "l2", "ip", "cosine".
+    /// When omitted, per-field metrics from recall sources are used.
+    #[serde(default)]
+    pub metric: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +176,16 @@ pub struct SearchHitResponse {
     pub distance: f32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_vectors: Option<BTreeMap<String, SparseVectorResponse>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SparseVectorResponse {
+    pub indices: Vec<u32>,
+    pub values: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]

@@ -144,6 +144,7 @@ impl QueryExecutor {
                         distance,
                         fields: doc.fields,
                         vectors: BTreeMap::new(),
+                        sparse_vectors: BTreeMap::new(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -266,6 +267,7 @@ fn apply_reranker(
                 distance,
                 fields: doc.fields.clone(),
                 vectors: BTreeMap::new(),
+                sparse_vectors: BTreeMap::new(),
             })
         })
         .collect()

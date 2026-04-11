@@ -1017,6 +1017,7 @@ pub(crate) fn build_query_context(
                     vector,
                     param: query.param.map(|param| VectorQueryParam {
                         ef_search: param.ef_search,
+                        nprobe: param.nprobe,
                     }),
                 })
             })
@@ -1039,6 +1040,7 @@ pub(crate) fn build_query_context(
             } else if !reranker.weights.is_empty() {
                 Some(QueryReranker::Weighted {
                     weights: reranker.weights,
+                    metric: reranker.metric,
                 })
             } else {
                 None

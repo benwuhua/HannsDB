@@ -193,6 +193,8 @@ fn search_records_legacy(
                         id: hit.id.to_string(),
                         distance: hit.distance,
                         fields: select_output_fields(&hit.fields, output_fields),
+                        vector: None,
+                        sparse_vectors: None,
                     })
                     .collect()
             });
@@ -210,6 +212,8 @@ fn search_records_legacy(
                         id: hit.id.to_string(),
                         distance: hit.distance,
                         fields: select_output_fields(&hit.fields, output_fields),
+                        vector: None,
+                        sparse_vectors: None,
                     })
                     .collect()
             });
@@ -226,6 +230,8 @@ fn search_records_legacy(
                     id: hit.id.to_string(),
                     distance: hit.distance,
                     fields: BTreeMap::new(),
+                    vector: None,
+                    sparse_vectors: None,
                 })
                 .collect()
         })
@@ -236,13 +242,7 @@ fn search_records_typed(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    if request.include_vector {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "include_vector is not supported for typed search",
-        ));
-    }
-
+    let include_vector = request.include_vector;
     let include_fields =
         matches!(request.output_fields.as_deref(), Some(fields) if !fields.is_empty());
     let context = build_query_context(request)?;
@@ -254,14 +254,42 @@ fn search_records_typed(
         .query_with_context(collection, &context)
         .map(|hits| {
             hits.into_iter()
-                .map(|hit| SearchHitResponse {
-                    id: hit.id.to_string(),
-                    distance: hit.distance,
-                    fields: if include_fields {
-                        super::routes::field_values_to_json(hit.fields)
+                .map(|hit| {
+                    let (vector, sparse_vectors) = if include_vector {
+                        let primary_vec = hit.vectors.values().next().cloned();
+                        let sparse = if hit.sparse_vectors.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                hit.sparse_vectors
+                                    .into_iter()
+                                    .map(|(name, sv)| {
+                                        (
+                                            name,
+                                            crate::api::SparseVectorResponse {
+                                                indices: sv.indices,
+                                                values: sv.values,
+                                            },
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        };
+                        (primary_vec, sparse)
                     } else {
-                        BTreeMap::new()
-                    },
+                        (None, None)
+                    };
+                    SearchHitResponse {
+                        id: hit.id.to_string(),
+                        distance: hit.distance,
+                        fields: if include_fields {
+                            super::routes::field_values_to_json(hit.fields)
+                        } else {
+                            BTreeMap::new()
+                        },
+                        vector,
+                        sparse_vectors,
+                    }
                 })
                 .collect()
         })

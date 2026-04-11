@@ -104,6 +104,7 @@ pub enum IndexParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HnswQueryParam {
     pub ef: usize,
+    pub nprobe: usize,
     pub is_using_refiner: bool,
 }
 
@@ -343,6 +344,11 @@ fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery>
     let param = match query.getattr("param") {
         Ok(param) if !param.is_none() => Some(HnswQueryParam {
             ef: param.getattr("ef")?.extract::<usize>()?,
+            nprobe: param
+                .getattr("nprobe")
+                .ok()
+                .and_then(|value| value.extract::<usize>().ok())
+                .unwrap_or(0),
             is_using_refiner: param
                 .getattr("is_using_refiner")
                 .ok()
@@ -381,6 +387,7 @@ fn py_query_context_to_core(
             vector,
             param: query.param.map(|param| CoreVectorQueryParam {
                 ef_search: Some(param.ef),
+                nprobe: if param.nprobe > 0 { Some(param.nprobe) } else { None },
             }),
         });
     }
@@ -411,8 +418,12 @@ fn py_query_context_to_core(
                 let weights = reranker_attr
                     .getattr("weights")?
                     .extract::<std::collections::HashMap<String, f64>>()?;
+                let metric = reranker_attr
+                    .getattr("metric")?
+                    .extract::<Option<String>>()?;
                 Some(CoreQueryReranker::Weighted {
                     weights: weights.into_iter().collect(),
+                    metric,
                 })
             }
             _ => {
@@ -1232,11 +1243,12 @@ struct PyHnswQueryParam {
 #[pymethods]
 impl PyHnswQueryParam {
     #[new]
-    #[pyo3(signature = (ef=32, is_using_refiner=false))]
-    fn new(ef: usize, is_using_refiner: bool) -> Self {
+    #[pyo3(signature = (ef=32, nprobe=0, is_using_refiner=false))]
+    fn new(ef: usize, nprobe: usize, is_using_refiner: bool) -> Self {
         Self {
             inner: HnswQueryParam {
                 ef,
+                nprobe,
                 is_using_refiner,
             },
         }
@@ -1245,6 +1257,11 @@ impl PyHnswQueryParam {
     #[getter]
     fn ef(&self) -> usize {
         self.inner.ef
+    }
+
+    #[getter]
+    fn nprobe(&self) -> usize {
+        self.inner.nprobe
     }
 
     #[getter]
@@ -1684,19 +1701,29 @@ impl PyRrfReRanker {
 #[derive(Clone)]
 struct PyWeightedReRanker {
     weights: std::collections::HashMap<String, f64>,
+    metric: Option<String>,
 }
 
 #[cfg(feature = "python-binding")]
 #[pymethods]
 impl PyWeightedReRanker {
     #[new]
-    fn new(weights: std::collections::HashMap<String, f64>) -> Self {
-        Self { weights }
+    #[pyo3(signature = (weights, metric=None))]
+    fn new(
+        weights: std::collections::HashMap<String, f64>,
+        metric: Option<String>,
+    ) -> Self {
+        Self { weights, metric }
     }
 
     #[getter]
     fn weights(&self) -> std::collections::HashMap<String, f64> {
         self.weights.clone()
+    }
+
+    #[getter]
+    fn metric(&self) -> Option<String> {
+        self.metric.clone()
     }
 }
 
@@ -2231,6 +2258,7 @@ mod tests {
             vector: crate::QueryVector::Dense(vec![0.0, 0.1, 0.2, 0.3]),
             param: Some(HnswQueryParam {
                 ef: 32,
+                nprobe: 0,
                 is_using_refiner: false,
             }),
         };
@@ -2323,6 +2351,7 @@ mod tests {
                     vector: crate::QueryVector::Dense(vec![0.1, -0.1]),
                     param: Some(HnswQueryParam {
                         ef: 32,
+                        nprobe: 0,
                         is_using_refiner: false,
                     }),
                 },
@@ -2346,6 +2375,7 @@ mod tests {
                     vector: crate::QueryVector::Dense(vec![0.1, -0.1]),
                     param: Some(HnswQueryParam {
                         ef: 32,
+                        nprobe: 0,
                         is_using_refiner: false,
                     }),
                 },
@@ -2493,6 +2523,7 @@ mod tests {
                     vector: crate::QueryVector::Dense(vec![0.0, 0.0]),
                     param: Some(HnswQueryParam {
                         ef: 32,
+                        nprobe: 0,
                         is_using_refiner: false,
                     }),
                 },

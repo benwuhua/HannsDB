@@ -48,6 +48,7 @@ pub struct VectorQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VectorQueryParam {
     pub ef_search: Option<usize>,
+    pub nprobe: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,12 @@ pub enum QueryReranker {
     },
     Weighted {
         weights: std::collections::BTreeMap<String, f64>,
+        /// Override metric used for score normalization.
+        /// When set, this metric is applied to all fields regardless of their
+        /// individual metric. When None, per-field metrics from recall sources
+        /// are used (metric-aware normalization already happens via the planner).
+        /// Accepted values: "l2", "ip", "cosine".
+        metric: Option<String>,
     },
 }
 

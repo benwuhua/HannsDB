@@ -17,7 +17,18 @@ pub fn fuse(
 ) -> FusedResult {
     match reranker {
         QueryReranker::Rrf { rank_constant } => rrf_fusion(per_field, *rank_constant, top_k),
-        QueryReranker::Weighted { weights } => weighted_fusion(per_field, weights, metrics, top_k),
+        QueryReranker::Weighted { weights, metric } => {
+            let effective_metrics = if let Some(metric_override) = metric.as_deref() {
+                let mut overridden = metrics.clone();
+                for value in overridden.values_mut() {
+                    *value = metric_override.to_string();
+                }
+                overridden
+            } else {
+                metrics.clone()
+            };
+            weighted_fusion(per_field, weights, &effective_metrics, top_k)
+        }
     }
 }
 

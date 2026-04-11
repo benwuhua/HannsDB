@@ -1155,7 +1155,7 @@ async fn search_route_rejects_legacy_request_mixing_vector_with_query_by_id_fiel
 }
 
 #[tokio::test]
-async fn search_route_returns_bad_request_for_unsupported_typed_shape() {
+async fn search_route_include_vector_returns_hits_with_vectors() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
 
@@ -1191,15 +1191,12 @@ async fn search_route_returns_bad_request_for_unsupported_typed_shape() {
         .await
         .expect("send search request");
 
-    assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(search.status(), StatusCode::OK);
     let body = to_bytes(search.into_body(), usize::MAX)
         .await
         .expect("read search body");
     let json: Value = serde_json::from_slice(&body).expect("parse search json");
-    assert!(json["error"]
-        .as_str()
-        .expect("error string")
-        .contains("include_vector"));
+    assert!(json["hits"].is_array());
 }
 
 #[tokio::test]

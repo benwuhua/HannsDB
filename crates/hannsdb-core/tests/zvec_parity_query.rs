@@ -452,6 +452,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -532,6 +533,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -621,6 +623,7 @@ fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_o
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -689,6 +692,7 @@ fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_fi
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -1058,6 +1062,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -1641,6 +1646,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -1733,6 +1739,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -1776,6 +1783,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -1974,6 +1982,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: None,
@@ -2023,6 +2032,7 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
                     vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
+                        nprobe: None,
                     }),
                 }],
                 query_by_id: Some(vec![7]),

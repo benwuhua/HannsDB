@@ -20,6 +20,7 @@ pub(crate) struct LegacySingleVectorPlan {
     pub(crate) top_k: usize,
     pub(crate) vector: QueryVector,
     pub(crate) ef_search: Option<usize>,
+    pub(crate) nprobe: Option<usize>,
     pub(crate) output_fields: Option<Vec<String>>,
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) order_by: Option<OrderBy>,
@@ -98,6 +99,13 @@ impl QueryPlanner {
                 .and_then(|param| param.ef_search)
                 .is_some()
         });
+        let uses_nprobe = context.queries.iter().any(|query| {
+            query
+                .param
+                .as_ref()
+                .and_then(|param| param.nprobe)
+                .is_some()
+        });
         let is_single_vector_fast_path = context.group_by.is_none()
             && context.queries.len() == 1
             && context.query_by_id.is_none()
@@ -107,10 +115,10 @@ impl QueryPlanner {
                 &context.queries[0].field_name,
             )?
             .is_some();
-        if uses_ef_search && !is_single_vector_fast_path {
+        if (uses_ef_search || uses_nprobe) && !is_single_vector_fast_path {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "vector query param ef_search is only supported on the typed single-vector fast path",
+                "vector query params (ef_search, nprobe) are only supported on the typed single-vector fast path",
             ));
         }
 
@@ -127,6 +135,7 @@ impl QueryPlanner {
                 top_k: context.top_k,
                 vector: query.vector.clone(),
                 ef_search: query.param.as_ref().and_then(|param| param.ef_search),
+                nprobe: query.param.as_ref().and_then(|param| param.nprobe),
                 output_fields: context.output_fields.clone(),
                 filter: parsed_filter,
                 order_by,
@@ -274,11 +283,11 @@ fn validate_vector_query(
         && query
             .param
             .as_ref()
-            .is_some_and(|param| param.ef_search.is_some())
+            .is_some_and(|param| param.ef_search.is_some() || param.nprobe.is_some())
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "vector query param ef_search is not supported on the typed brute-force path yet",
+            "vector query params (ef_search, nprobe) are not supported on the typed brute-force path yet",
         ));
     }
 

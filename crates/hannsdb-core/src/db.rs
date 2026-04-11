@@ -40,6 +40,7 @@ use crate::segment::{
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
+const DEFAULT_NPROBE: usize = 32;
 const INDEX_CATALOG_FILE: &str = "indexes.json";
 
 pub struct HannsDb {
@@ -72,6 +73,7 @@ pub struct DocumentHit {
     pub distance: f32,
     pub fields: BTreeMap<String, FieldValue>,
     pub vectors: BTreeMap<String, Vec<f32>>,
+    pub sparse_vectors: BTreeMap<String, crate::document::SparseVector>,
 }
 
 #[derive(Clone)]
@@ -1572,12 +1574,23 @@ impl CollectionHandle {
         match plan {
             QueryPlan::LegacySingleVector(plan) => {
                 let ef_search = plan.ef_search.unwrap_or(DEFAULT_EF_SEARCH);
+                let nprobe = plan.nprobe.unwrap_or(DEFAULT_NPROBE);
+
+                // Resolve the effective search parameter: when nprobe is explicitly
+                // provided, it overrides ef_search for IVF indexes (the IVF backend
+                // maps the ef_search argument to nprobe internally).
+                let state = self.cached_search_state_for_field(&plan.field_name)?;
+                let is_ivf = state.descriptor.kind == hannsdb_index::descriptor::VectorIndexKind::Ivf;
+                let effective_search_param = if is_ivf && plan.nprobe.is_some() {
+                    nprobe
+                } else {
+                    ef_search
+                };
 
                 #[cfg(feature = "hanns-backend")]
                 if let Some(filter) = &plan.filter {
                     // Pre-filter path: construct BitsetView from filter evaluation
                     // and pass it to the ANN backend for efficient pre-filtered search.
-                    let state = self.cached_search_state_for_field(&plan.field_name)?;
                     if let Some(optimized) = state.optimized_ann.as_ref() {
                         // Fetch payloads for all indexed vectors to evaluate filter
                         let documents = self.fetch_documents(&optimized.ann_external_ids)?;
@@ -1592,7 +1605,7 @@ impl CollectionHandle {
                                 &optimized.metric,
                                 v,
                                 plan.top_k,
-                                ef_search,
+                                effective_search_param,
                                 &bitset,
                             )?,
                             crate::query::QueryVector::Sparse(_) => {
@@ -1613,6 +1626,7 @@ impl CollectionHandle {
                                 distance: hit.distance,
                                 fields: document.fields,
                                 vectors: BTreeMap::new(),
+                                sparse_vectors: BTreeMap::new(),
                             })
                             .collect();
                         project_document_hits(&mut doc_hits, plan.output_fields.as_deref());
@@ -1641,7 +1655,7 @@ impl CollectionHandle {
                     &plan.field_name,
                     &query_vec,
                     search_k,
-                    ef_search,
+                    effective_search_param,
                     context.include_vector,
                 )?;
 
@@ -2031,6 +2045,7 @@ impl CollectionHandle {
                             distance: hit.distance,
                             fields: document.fields,
                             vectors,
+                            sparse_vectors: BTreeMap::new(),
                         }
                     })
                     .collect())
@@ -2084,6 +2099,7 @@ impl CollectionHandle {
                     distance: hit.distance,
                     fields: document.fields,
                     vectors,
+                    sparse_vectors: BTreeMap::new(),
                 }
             })
             .collect())
@@ -2155,6 +2171,7 @@ impl CollectionHandle {
             hit.vectors = document
                 .vectors_with_primary(collection_meta.primary_vector.as_str())
                 .clone();
+            hit.sparse_vectors = document.sparse_vectors.clone();
         }
         Ok(())
     }
@@ -2232,6 +2249,7 @@ impl CollectionHandle {
                         distance: distance_by_metric(query, vector, &collection_meta.metric)?,
                         fields: fields.clone(),
                         vectors: BTreeMap::new(),
+                        sparse_vectors: BTreeMap::new(),
                     },
                 };
 

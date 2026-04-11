@@ -32,6 +32,16 @@ pub enum FilterExpr {
         pattern: String,
         negated: bool,
     },
+    HasPrefix {
+        field: String,
+        pattern: String,
+        negated: bool,
+    },
+    HasSuffix {
+        field: String,
+        pattern: String,
+        negated: bool,
+    },
     ArrayContains {
         field: String,
         value: FieldValue,
@@ -113,6 +123,44 @@ impl FilterExpr {
                     matched
                 }
             }
+            FilterExpr::HasPrefix {
+                field,
+                pattern,
+                negated,
+            } => {
+                let Some(actual) = fields.get(field) else {
+                    return *negated;
+                };
+                let s = match actual {
+                    FieldValue::String(s) => s,
+                    _ => return false,
+                };
+                let matched = s.starts_with(pattern.as_str());
+                if *negated {
+                    !matched
+                } else {
+                    matched
+                }
+            }
+            FilterExpr::HasSuffix {
+                field,
+                pattern,
+                negated,
+            } => {
+                let Some(actual) = fields.get(field) else {
+                    return *negated;
+                };
+                let s = match actual {
+                    FieldValue::String(s) => s,
+                    _ => return false,
+                };
+                let matched = s.ends_with(pattern.as_str());
+                if *negated {
+                    !matched
+                } else {
+                    matched
+                }
+            }
             FilterExpr::ArrayContains { field, value } => {
                 let Some(actual) = fields.get(field) else {
                     return false;
@@ -166,6 +214,8 @@ impl FilterExpr {
             | FilterExpr::InList { field, .. }
             | FilterExpr::NullCheck { field, .. }
             | FilterExpr::Like { field, .. }
+            | FilterExpr::HasPrefix { field, .. }
+            | FilterExpr::HasSuffix { field, .. }
             | FilterExpr::ArrayContains { field, .. }
             | FilterExpr::ArrayContainsAny { field, .. }
             | FilterExpr::ArrayContainsAll { field, .. } => {
@@ -296,6 +346,10 @@ fn parse_primary(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
 
 // clause = field op value | field "in" "(" values ")" | field "not" "in" "(" values ")"
 //        | field "is" "null" | field "is" "not" "null"
+//        | field "like" pattern | field "not" "like" pattern
+//        | field "has_prefix" pattern | field "not" "has_prefix" pattern
+//        | field "has_suffix" pattern | field "not" "has_suffix" pattern
+//        | field "contains" value | field "contains" "any" "(" values ")" | field "contains" "all" "(" values ")"
 fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
     skip_whitespace(input, pos);
 
@@ -369,7 +423,44 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
                 negated: true,
             });
         }
-        // Not "not in" / "not like" — backtrack
+        // Check for "not has_prefix" / "not has_suffix"
+        if peek_keyword(&input[*pos..], 0, "has_prefix") {
+            *pos += 10; // skip "has_prefix"
+            skip_whitespace(input, pos);
+            let pattern = read_value_token(input, *pos);
+            if pattern.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing pattern in 'not has_prefix' filter clause",
+                ));
+            }
+            *pos += pattern.len();
+            let pattern = parse_pattern(pattern.trim())?;
+            return Ok(FilterExpr::HasPrefix {
+                field,
+                pattern,
+                negated: true,
+            });
+        }
+        if peek_keyword(&input[*pos..], 0, "has_suffix") {
+            *pos += 10; // skip "has_suffix"
+            skip_whitespace(input, pos);
+            let pattern = read_value_token(input, *pos);
+            if pattern.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing pattern in 'not has_suffix' filter clause",
+                ));
+            }
+            *pos += pattern.len();
+            let pattern = parse_pattern(pattern.trim())?;
+            return Ok(FilterExpr::HasSuffix {
+                field,
+                pattern,
+                negated: true,
+            });
+        }
+        // Not "not in" / "not like" / "not has_prefix" / "not has_suffix" — backtrack
         *pos = saved;
     }
 
@@ -398,6 +489,46 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
         *pos += pattern.len();
         let pattern = parse_pattern(pattern.trim())?;
         return Ok(FilterExpr::Like {
+            field,
+            pattern,
+            negated: false,
+        });
+    }
+
+    // Check for "has_prefix"
+    if peek_keyword(rest, 0, "has_prefix") {
+        *pos += 10; // skip "has_prefix"
+        skip_whitespace(input, pos);
+        let pattern = read_value_token(input, *pos);
+        if pattern.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing pattern in 'has_prefix' filter clause",
+            ));
+        }
+        *pos += pattern.len();
+        let pattern = parse_pattern(pattern.trim())?;
+        return Ok(FilterExpr::HasPrefix {
+            field,
+            pattern,
+            negated: false,
+        });
+    }
+
+    // Check for "has_suffix"
+    if peek_keyword(rest, 0, "has_suffix") {
+        *pos += 10; // skip "has_suffix"
+        skip_whitespace(input, pos);
+        let pattern = read_value_token(input, *pos);
+        if pattern.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing pattern in 'has_suffix' filter clause",
+            ));
+        }
+        *pos += pattern.len();
+        let pattern = parse_pattern(pattern.trim())?;
+        return Ok(FilterExpr::HasSuffix {
             field,
             pattern,
             negated: false,
@@ -1298,6 +1429,175 @@ mod tests {
             "groups",
             FieldValue::Array(vec![FieldValue::Int64(2), FieldValue::Int64(3)]),
         )]);
+        assert!(expr.matches(&f1));
+    }
+
+    // -- has_prefix tests --
+
+    #[test]
+    fn has_prefix_matches() {
+        let expr = parse_filter("name has_prefix \"John\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("John".into()))]);
+        assert!(expr.matches(&f2));
+        let f3 = field_map(vec![("name", FieldValue::String("Jane".into()))]);
+        assert!(!expr.matches(&f3));
+        let f4 = field_map(vec![("name", FieldValue::String("AJohn".into()))]);
+        assert!(!expr.matches(&f4));
+    }
+
+    #[test]
+    fn has_prefix_empty_pattern() {
+        let expr = parse_filter("name has_prefix \"\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("anything".into()))]);
+        assert!(expr.matches(&f1));
+    }
+
+    #[test]
+    fn has_prefix_missing_field() {
+        let expr = parse_filter("name has_prefix \"abc\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("abcdef".into()))]);
+        assert!(!expr.matches(&fields));
+    }
+
+    #[test]
+    fn has_prefix_non_string_field() {
+        let expr = parse_filter("age has_prefix \"1\"").unwrap();
+        let f1 = field_map(vec![("age", FieldValue::Int64(100))]);
+        assert!(!expr.matches(&f1));
+    }
+
+    #[test]
+    fn not_has_prefix() {
+        let expr = parse_filter("name not has_prefix \"John\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(!expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Jane".into()))]);
+        assert!(expr.matches(&f2));
+    }
+
+    #[test]
+    fn not_has_prefix_missing_field() {
+        let expr = parse_filter("name not has_prefix \"abc\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("abc".into()))]);
+        assert!(expr.matches(&fields)); // negated: missing -> true
+    }
+
+    #[test]
+    fn has_prefix_combined_with_and() {
+        let expr = parse_filter("name has_prefix \"John\" and age > 30").unwrap();
+        let f1 = field_map(vec![
+            ("name", FieldValue::String("Johnson".into())),
+            ("age", FieldValue::Int64(35)),
+        ]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![
+            ("name", FieldValue::String("Johnson".into())),
+            ("age", FieldValue::Int64(25)),
+        ]);
+        assert!(!expr.matches(&f2));
+        let f3 = field_map(vec![
+            ("name", FieldValue::String("Jane".into())),
+            ("age", FieldValue::Int64(35)),
+        ]);
+        assert!(!expr.matches(&f3));
+    }
+
+    // -- has_suffix tests --
+
+    #[test]
+    fn has_suffix_matches() {
+        let expr = parse_filter("name has_suffix \"son\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("son".into()))]);
+        assert!(expr.matches(&f2));
+        let f3 = field_map(vec![("name", FieldValue::String("Smith".into()))]);
+        assert!(!expr.matches(&f3));
+        let f4 = field_map(vec![("name", FieldValue::String("sonnet".into()))]);
+        assert!(!expr.matches(&f4));
+    }
+
+    #[test]
+    fn has_suffix_empty_pattern() {
+        let expr = parse_filter("name has_suffix \"\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("anything".into()))]);
+        assert!(expr.matches(&f1));
+    }
+
+    #[test]
+    fn has_suffix_missing_field() {
+        let expr = parse_filter("name has_suffix \"xyz\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("abcxyz".into()))]);
+        assert!(!expr.matches(&fields));
+    }
+
+    #[test]
+    fn has_suffix_non_string_field() {
+        let expr = parse_filter("age has_suffix \"0\"").unwrap();
+        let f1 = field_map(vec![("age", FieldValue::Int64(100))]);
+        assert!(!expr.matches(&f1));
+    }
+
+    #[test]
+    fn not_has_suffix() {
+        let expr = parse_filter("name not has_suffix \"son\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(!expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Smith".into()))]);
+        assert!(expr.matches(&f2));
+    }
+
+    #[test]
+    fn not_has_suffix_missing_field() {
+        let expr = parse_filter("name not has_suffix \"xyz\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("xyz".into()))]);
+        assert!(expr.matches(&fields)); // negated: missing -> true
+    }
+
+    #[test]
+    fn has_suffix_combined_with_or() {
+        let expr = parse_filter("name has_suffix \"son\" or status == \"active\"").unwrap();
+        let f1 = field_map(vec![
+            ("name", FieldValue::String("Johnson".into())),
+            ("status", FieldValue::String("inactive".into())),
+        ]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![
+            ("name", FieldValue::String("Smith".into())),
+            ("status", FieldValue::String("active".into())),
+        ]);
+        assert!(expr.matches(&f2));
+        let f3 = field_map(vec![
+            ("name", FieldValue::String("Smith".into())),
+            ("status", FieldValue::String("inactive".into())),
+        ]);
+        assert!(!expr.matches(&f3));
+    }
+
+    #[test]
+    fn has_prefix_and_has_suffix_combined() {
+        let expr = parse_filter("name has_prefix \"J\" and name has_suffix \"n\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Jane".into()))]);
+        assert!(!expr.matches(&f2)); // doesn't end with "n"
+        let f3 = field_map(vec![("name", FieldValue::String("Brian".into()))]);
+        assert!(!expr.matches(&f3)); // doesn't start with "J"
+    }
+
+    #[test]
+    fn has_prefix_unquoted_pattern() {
+        let expr = parse_filter("name has_prefix abc").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("abcdef".into()))]);
+        assert!(expr.matches(&f1));
+    }
+
+    #[test]
+    fn has_suffix_unquoted_pattern() {
+        let expr = parse_filter("name has_suffix xyz").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("abcxyz".into()))]);
         assert!(expr.matches(&f1));
     }
 }
