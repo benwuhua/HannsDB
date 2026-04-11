@@ -69,6 +69,7 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hanns-backend")]
     fn collect_bits(bv: &BitsetView) -> Vec<bool> {
         (0..bv.num_bits()).map(|i| bv.get(i)).collect()
     }
@@ -82,10 +83,12 @@ mod tests {
         #[cfg(not(feature = "hanns-backend"))]
         {
             let data = filter_to_bitset_vec(total, passes);
-            (0..total).map(|i| {
-                let word = data[i / 64];
-                (word >> (i % 64)) & 1 == 1
-            }).collect()
+            (0..total)
+                .map(|i| {
+                    let word = data[i / 64];
+                    (word >> (i % 64)) & 1 == 1
+                })
+                .collect()
         }
     }
 
@@ -106,7 +109,7 @@ mod tests {
         // 8 rows, exclude indices 1, 3, 7
         let bits = bits_from_closure(8, |i| !matches!(i, 1 | 3 | 7));
         assert!(!bits[0]); // pass
-        assert!(bits[1]);  // excluded
+        assert!(bits[1]); // excluded
         assert!(!bits[2]);
         assert!(bits[3]);
         assert!(!bits[4]);

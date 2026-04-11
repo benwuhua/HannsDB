@@ -6,6 +6,7 @@ pub mod flat;
 pub mod hnsw;
 pub mod ivf;
 pub mod scalar;
+pub mod sparse;
 
 #[cfg(feature = "hanns-backend")]
 pub use hanns::BitsetView;

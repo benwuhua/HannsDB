@@ -141,9 +141,21 @@ pub struct Doc {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SparseVectorData {
+    pub indices: Vec<u32>,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryVector {
+    Dense(Vec<f32>),
+    Sparse(SparseVectorData),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct VectorQuery {
     pub field_name: String,
-    pub vector: Vec<f32>,
+    pub vector: QueryVector,
     pub param: Option<HnswQueryParam>,
 }
 
@@ -268,6 +280,7 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
                 data_type: CoreFieldType::VectorFp32,
                 dimension: vector.dimension,
                 index_param,
+                bm25_params: None,
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
@@ -313,7 +326,20 @@ fn parse_query_ids(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<
 #[cfg(feature = "python-binding")]
 fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery> {
     let field_name = query.getattr("field_name")?.extract::<String>()?;
-    let vector = query.getattr("vector")?.extract::<Vec<f32>>()?;
+
+    // Check if the vector is a sparse vector (has indices and values attributes)
+    let vector_attr = query.getattr("vector")?;
+    let vector = if vector_attr.hasattr("indices")? && vector_attr.hasattr("values")? {
+        // Sparse vector
+        let indices = vector_attr.getattr("indices")?.extract::<Vec<u32>>()?;
+        let values = vector_attr.getattr("values")?.extract::<Vec<f32>>()?;
+        QueryVector::Sparse(SparseVectorData { indices, values })
+    } else {
+        // Dense vector
+        let vec = vector_attr.extract::<Vec<f32>>()?;
+        QueryVector::Dense(vec)
+    };
+
     let param = match query.getattr("param") {
         Ok(param) if !param.is_none() => Some(HnswQueryParam {
             ef: param.getattr("ef")?.extract::<usize>()?,
@@ -344,9 +370,15 @@ fn py_query_context_to_core(
     let mut core_queries = Vec::with_capacity(query_objects.len());
     for query_object in query_objects {
         let query = py_vector_query_from_pyany(&query_object.bind(py))?;
+        let vector = match query.vector {
+            QueryVector::Dense(v) => hannsdb_core::query::QueryVector::Dense(v),
+            QueryVector::Sparse(sv) => hannsdb_core::query::QueryVector::Sparse(
+                hannsdb_core::document::SparseVector::new(sv.indices, sv.values),
+            ),
+        };
         core_queries.push(CoreVectorQuery {
             field_name: query.field_name,
-            vector: query.vector,
+            vector,
             param: query.param.map(|param| CoreVectorQueryParam {
                 ef_search: Some(param.ef),
             }),
@@ -376,15 +408,17 @@ fn py_query_context_to_core(
                 Some(CoreQueryReranker::Rrf { rank_constant })
             }
             "WeightedReRanker" => {
-                let weights = reranker_attr.getattr("weights")?.extract::<std::collections::HashMap<String, f64>>()?;
+                let weights = reranker_attr
+                    .getattr("weights")?
+                    .extract::<std::collections::HashMap<String, f64>>()?;
                 Some(CoreQueryReranker::Weighted {
                     weights: weights.into_iter().collect(),
                 })
             }
             _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("unsupported reranker type: {type_name}"),
-                ));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported reranker type: {type_name}"
+                )));
             }
         }
     };
@@ -421,20 +455,18 @@ fn py_query_context_to_core(
 }
 
 fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Result<CoreDocument> {
-    let _primary_vector = doc
-        .vectors
-        .get(primary_vector_name)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("doc must contain a vector named '{primary_vector_name}'"),
-            )
-        })?;
+    let _primary_vector = doc.vectors.get(primary_vector_name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("doc must contain a vector named '{primary_vector_name}'"),
+        )
+    })?;
 
     Ok(CoreDocument {
         id: parse_doc_id(&doc.id)?,
         fields: doc.fields.clone(),
         vectors: doc.vectors.clone(),
+        sparse_vectors: Default::default(),
     })
 }
 
@@ -620,10 +652,20 @@ impl Collection {
             ));
         }
 
+        let dense = match &vectors.vector {
+            QueryVector::Dense(v) => v,
+            QueryVector::Sparse(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "query_ids_scores does not support sparse vectors, use query_context instead",
+                ));
+            }
+        };
+
         let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
-        let hits =
-            self.db
-                .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
+        let hits = self
+            .db
+            .search_with_ef(&self.collection_name, dense, topk, ef_search)?;
         Ok(hits
             .into_iter()
             .map(|hit| (hit.id.to_string(), hit.distance))
@@ -758,10 +800,20 @@ impl Collection {
             ));
         }
 
+        let dense = match &vectors.vector {
+            QueryVector::Dense(v) => v.clone(),
+            QueryVector::Sparse(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "query does not support sparse vectors, use query_context instead",
+                ));
+            }
+        };
+
         if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
             return self
                 .db
-                .query_documents(&self.collection_name, &vectors.vector, topk, Some(filter))
+                .query_documents(&self.collection_name, &dense, topk, Some(filter))
                 .map(|hits| {
                     hits.into_iter()
                         .map(|hit| Doc {
@@ -776,9 +828,9 @@ impl Collection {
         }
 
         let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
-        let hits =
-            self.db
-                .search_with_ef(&self.collection_name, &vectors.vector, topk, ef_search)?;
+        let hits = self
+            .db
+            .search_with_ef(&self.collection_name, &dense, topk, ef_search)?;
         let should_fetch_fields = output_fields
             .as_ref()
             .map_or(true, |fields| !fields.is_empty());
@@ -1503,6 +1555,39 @@ impl PyDoc {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "SparseVector", module = "hannsdb")]
+#[derive(Clone)]
+struct PySparseVector {
+    inner: SparseVectorData,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PySparseVector {
+    #[new]
+    fn new(indices: Vec<u32>, values: Vec<f32>) -> PyResult<Self> {
+        if indices.len() != values.len() {
+            return Err(PyValueError::new_err(
+                "indices and values must have the same length",
+            ));
+        }
+        Ok(Self {
+            inner: SparseVectorData { indices, values },
+        })
+    }
+
+    #[getter]
+    fn indices(&self) -> Vec<u32> {
+        self.inner.indices.clone()
+    }
+
+    #[getter]
+    fn values(&self) -> Vec<f32> {
+        self.inner.values.clone()
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "VectorQuery", module = "hannsdb")]
 #[derive(Clone)]
 struct PyVectorQuery {
@@ -1517,16 +1602,24 @@ impl PyVectorQuery {
     fn new(
         py: Python<'_>,
         field_name: String,
-        vector: Vec<f32>,
+        vector: Bound<'_, PyAny>,
         param: Option<Py<PyHnswQueryParam>>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        let query_vector = if vector.hasattr("indices")? && vector.hasattr("values")? {
+            let indices = vector.getattr("indices")?.extract::<Vec<u32>>()?;
+            let values = vector.getattr("values")?.extract::<Vec<f32>>()?;
+            QueryVector::Sparse(crate::SparseVectorData { indices, values })
+        } else {
+            let dense = vector.extract::<Vec<f32>>()?;
+            QueryVector::Dense(dense)
+        };
+        Ok(Self {
             inner: VectorQuery {
                 field_name,
-                vector,
+                vector: query_vector,
                 param: param.map(|value| value.borrow(py).inner.clone()),
             },
-        }
+        })
     }
 
     #[getter]
@@ -1535,8 +1628,14 @@ impl PyVectorQuery {
     }
 
     #[getter]
-    fn vector(&self) -> Vec<f32> {
-        self.inner.vector.clone()
+    fn vector(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.vector {
+            QueryVector::Dense(v) => Ok(v.clone().into_pyobject(py)?.into_any().unbind()),
+            QueryVector::Sparse(sv) => {
+                let py_sparse = Py::new(py, PySparseVector { inner: sv.clone() })?;
+                Ok(py_sparse.into_any())
+            }
+        }
     }
 
     #[getter]
@@ -2038,6 +2137,7 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyVectorSchema>()?;
     module.add_class::<PyCollectionSchema>()?;
     module.add_class::<PyDoc>()?;
+    module.add_class::<PySparseVector>()?;
     module.add_class::<PyVectorQuery>()?;
     module.add_class::<PyRrfReRanker>()?;
     module.add_class::<PyWeightedReRanker>()?;
@@ -2128,7 +2228,7 @@ mod tests {
         };
         let _query = VectorQuery {
             field_name: "dense".to_string(),
-            vector: vec![0.0, 0.1, 0.2, 0.3],
+            vector: crate::QueryVector::Dense(vec![0.0, 0.1, 0.2, 0.3]),
             param: Some(HnswQueryParam {
                 ef: 32,
                 is_using_refiner: false,
@@ -2220,7 +2320,7 @@ mod tests {
                 Some(""),
                 VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.1, -0.1],
+                    vector: crate::QueryVector::Dense(vec![0.1, -0.1]),
                     param: Some(HnswQueryParam {
                         ef: 32,
                         is_using_refiner: false,
@@ -2243,7 +2343,7 @@ mod tests {
                 Some(""),
                 VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.1, -0.1],
+                    vector: crate::QueryVector::Dense(vec![0.1, -0.1]),
                     param: Some(HnswQueryParam {
                         ef: 32,
                         is_using_refiner: false,
@@ -2390,7 +2490,7 @@ mod tests {
                 Some("session_id == \"s1\" and turn >= 2"),
                 VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0, 0.0],
+                    vector: crate::QueryVector::Dense(vec![0.0, 0.0]),
                     param: Some(HnswQueryParam {
                         ef: 32,
                         is_using_refiner: false,

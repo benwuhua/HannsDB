@@ -17,9 +17,7 @@ pub fn fuse(
 ) -> FusedResult {
     match reranker {
         QueryReranker::Rrf { rank_constant } => rrf_fusion(per_field, *rank_constant, top_k),
-        QueryReranker::Weighted { weights } => {
-            weighted_fusion(per_field, weights, metrics, top_k)
-        }
+        QueryReranker::Weighted { weights } => weighted_fusion(per_field, weights, metrics, top_k),
     }
 }
 
@@ -59,10 +57,7 @@ fn weighted_fusion(
 
     for (field_name, ranked_list) in per_field {
         let weight = weights.get(field_name).copied().unwrap_or(1.0);
-        let metric = metrics
-            .get(field_name)
-            .map(String::as_str)
-            .unwrap_or("l2");
+        let metric = metrics.get(field_name).map(String::as_str).unwrap_or("l2");
 
         for (id, distance) in ranked_list {
             let normalized = normalize_distance(*distance, metric);
@@ -93,14 +88,8 @@ mod tests {
     #[test]
     fn rrf_basic() {
         let mut per_field = PerFieldResults::new();
-        per_field.insert(
-            "dense".to_string(),
-            vec![(1, 0.1), (2, 0.2), (3, 0.3)],
-        );
-        per_field.insert(
-            "title".to_string(),
-            vec![(2, 0.1), (1, 0.2), (4, 0.3)],
-        );
+        per_field.insert("dense".to_string(), vec![(1, 0.1), (2, 0.2), (3, 0.3)]);
+        per_field.insert("title".to_string(), vec![(2, 0.1), (1, 0.2), (4, 0.3)]);
 
         let result = rrf_fusion(&per_field, 60, 10);
         // id=1: 1/(60+0+1) + 1/(60+1+1) = 1/61 + 1/62

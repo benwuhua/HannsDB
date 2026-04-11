@@ -1,3 +1,5 @@
+use crate::document::SparseVector;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryContext {
     pub top_k: usize,
@@ -9,6 +11,7 @@ pub struct QueryContext {
     pub include_vector: bool,
     pub group_by: Option<QueryGroupBy>,
     pub reranker: Option<QueryReranker>,
+    pub order_by: Option<OrderBy>,
 }
 
 impl Default for QueryContext {
@@ -23,14 +26,22 @@ impl Default for QueryContext {
             include_vector: false,
             group_by: None,
             reranker: None,
+            order_by: None,
         }
     }
+}
+
+/// A query vector that can be either dense (f32 array) or sparse.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryVector {
+    Dense(Vec<f32>),
+    Sparse(SparseVector),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorQuery {
     pub field_name: String,
-    pub vector: Vec<f32>,
+    pub vector: QueryVector,
     pub param: Option<VectorQueryParam>,
 }
 
@@ -48,6 +59,20 @@ pub struct QueryGroupBy {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryReranker {
-    Rrf { rank_constant: u64 },
-    Weighted { weights: std::collections::BTreeMap<String, f64> },
+    Rrf {
+        rank_constant: u64,
+    },
+    Weighted {
+        weights: std::collections::BTreeMap<String, f64>,
+    },
+}
+
+/// Specifies how query results should be ordered.
+///
+/// When present, results are sorted by the given scalar field value instead of
+/// by vector distance. A secondary sort by distance (then by id) breaks ties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderBy {
+    pub field_name: String,
+    pub descending: bool,
 }

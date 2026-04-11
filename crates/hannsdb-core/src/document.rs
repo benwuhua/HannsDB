@@ -13,6 +13,41 @@ pub enum FieldType {
     Float64,
     Bool,
     VectorFp32,
+    VectorFp16,
+    VectorSparse,
+}
+
+/// A sparse vector represented as parallel index/value arrays.
+///
+/// Indices must be sorted in ascending order with no duplicates.
+/// This is the standard CSR-like representation used by most vector DB systems.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseVector {
+    pub indices: Vec<u32>,
+    pub values: Vec<f32>,
+}
+
+impl SparseVector {
+    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Self {
+        assert_eq!(
+            indices.len(),
+            values.len(),
+            "sparse vector indices and values must have equal length"
+        );
+        Self { indices, values }
+    }
+
+    pub fn is_sorted(&self) -> bool {
+        self.indices.windows(2).all(|w| w[0] < w[1])
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,6 +60,7 @@ pub enum FieldValue {
     Float(f32),
     Float64(f64),
     Bool(bool),
+    Array(Vec<FieldValue>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,13 +165,26 @@ impl VectorIndexSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// BM25 scoring parameters for sparse vector fields.
+///
+/// When present on a sparse vector field, these parameters are passed to the
+/// sparse index backend so that BM25-style scoring can be applied during search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Bm25Params {
+    pub k1: f32,
+    pub b: f32,
+    pub avgdl: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorFieldSchema {
     pub name: String,
     pub data_type: FieldType,
     pub dimension: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_param: Option<VectorIndexSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_params: Option<Bm25Params>,
 }
 
 impl VectorFieldSchema {
@@ -145,6 +194,7 @@ impl VectorFieldSchema {
             data_type: FieldType::VectorFp32,
             dimension,
             index_param: None,
+            bm25_params: None,
         }
     }
 
@@ -166,7 +216,7 @@ impl VectorFieldSchema {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionSchema {
     #[serde(default = "default_primary_vector_name")]
     pub primary_vector: String,
@@ -257,6 +307,8 @@ pub struct DocumentUpdate {
     pub id: i64,
     pub fields: BTreeMap<String, Option<FieldValue>>,
     pub vectors: BTreeMap<String, Option<Vec<f32>>>,
+    #[serde(default)]
+    pub sparse_vectors: BTreeMap<String, Option<SparseVector>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,6 +317,8 @@ pub struct Document {
     pub fields: BTreeMap<String, FieldValue>,
     #[serde(default)]
     pub vectors: BTreeMap<String, Vec<f32>>,
+    #[serde(default)]
+    pub sparse_vectors: BTreeMap<String, SparseVector>,
 }
 
 impl Document {
@@ -281,6 +335,7 @@ impl Document {
             id,
             fields: fields.into_iter().collect(),
             vectors,
+            sparse_vectors: BTreeMap::new(),
         }
     }
 
@@ -296,6 +351,7 @@ impl Document {
             id,
             fields: fields.into_iter().collect(),
             vectors,
+            sparse_vectors: BTreeMap::new(),
         }
     }
 
@@ -314,6 +370,7 @@ impl Document {
             id,
             fields: fields.into_iter().collect(),
             vectors,
+            sparse_vectors: BTreeMap::new(),
         }
     }
 
@@ -333,6 +390,7 @@ impl Document {
             id,
             fields: fields.into_iter().collect(),
             vectors,
+            sparse_vectors: BTreeMap::new(),
         }
     }
 
@@ -348,5 +406,23 @@ impl Document {
 
     pub fn vectors_with_primary(&self, _primary_vector_name: &str) -> &BTreeMap<String, Vec<f32>> {
         &self.vectors
+    }
+
+    /// Create a document with sparse vector fields in addition to the primary dense vector.
+    pub fn with_sparse_vectors(
+        id: i64,
+        fields: impl IntoIterator<Item = (String, FieldValue)>,
+        primary_vector_name: &str,
+        dense_vector: Vec<f32>,
+        sparse_vectors: impl IntoIterator<Item = (String, SparseVector)>,
+    ) -> Self {
+        let mut vectors = BTreeMap::new();
+        vectors.insert(primary_vector_name.to_string(), dense_vector);
+        Self {
+            id,
+            fields: fields.into_iter().collect(),
+            vectors,
+            sparse_vectors: sparse_vectors.into_iter().collect(),
+        }
     }
 }

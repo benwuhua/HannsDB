@@ -1,10 +1,16 @@
 use crate::adapter::{AdapterError, VectorIndexBackend};
-use crate::descriptor::{VectorIndexDescriptor, VectorIndexKind};
+use crate::descriptor::{
+    SparseIndexDescriptor, SparseIndexKind, VectorIndexDescriptor, VectorIndexKind,
+};
 use crate::flat::FlatIndex;
+#[cfg(not(feature = "hanns-backend"))]
 use crate::hnsw::InMemoryHnswIndex;
 #[cfg(feature = "hanns-backend")]
 use crate::hnsw::KnowhereHnswIndex;
 use crate::ivf::IvfIndex;
+#[cfg(not(feature = "hanns-backend"))]
+use crate::sparse::BruteForceSparseIndex;
+use crate::sparse::SparseIndexBackend;
 
 pub trait IndexFactory {
     fn create_vector_index(
@@ -83,4 +89,50 @@ fn read_usize_param(value: &serde_json::Value, key: &str) -> Option<usize> {
         .get(key)
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
+}
+
+impl DefaultIndexFactory {
+    pub fn create_sparse_index(
+        &self,
+        descriptor: &SparseIndexDescriptor,
+        serialized: Option<&[u8]>,
+    ) -> Result<Box<dyn SparseIndexBackend>, AdapterError> {
+        let metric = descriptor.metric.as_deref().unwrap_or("ip");
+        match descriptor.kind {
+            SparseIndexKind::SparseInverted => {
+                #[cfg(feature = "hanns-backend")]
+                {
+                    if let Some(bytes) = serialized {
+                        return Ok(Box::new(
+                            crate::sparse::HannsSparseInvertedIndex::from_bytes(bytes)?,
+                        ));
+                    }
+                    return Ok(Box::new(crate::sparse::HannsSparseInvertedIndex::new(
+                        metric,
+                    )?));
+                }
+                #[cfg(not(feature = "hanns-backend"))]
+                {
+                    let _ = (serialized, metric);
+                    Ok(Box::new(BruteForceSparseIndex::new()))
+                }
+            }
+            SparseIndexKind::SparseWand => {
+                #[cfg(feature = "hanns-backend")]
+                {
+                    if let Some(bytes) = serialized {
+                        return Ok(Box::new(crate::sparse::HannsSparseWandIndex::from_bytes(
+                            bytes,
+                        )?));
+                    }
+                    return Ok(Box::new(crate::sparse::HannsSparseWandIndex::new(metric)?));
+                }
+                #[cfg(not(feature = "hanns-backend"))]
+                {
+                    let _ = (serialized, metric);
+                    Ok(Box::new(BruteForceSparseIndex::new()))
+                }
+            }
+        }
+    }
 }

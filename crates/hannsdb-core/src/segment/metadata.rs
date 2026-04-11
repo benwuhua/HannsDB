@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::version_set::atomic_write;
 use super::SEGMENT_FORMAT_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,6 +14,12 @@ pub struct SegmentMetadata {
     pub dimension: usize,
     pub record_count: usize,
     pub deleted_count: usize,
+    #[serde(default = "default_storage_format")]
+    pub storage_format: String,
+}
+
+fn default_storage_format() -> String {
+    "jsonl".to_string()
 }
 
 impl SegmentMetadata {
@@ -28,12 +35,13 @@ impl SegmentMetadata {
             dimension,
             record_count,
             deleted_count,
+            storage_format: default_storage_format(),
         }
     }
 
     pub fn save_to_path(&self, path: &Path) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(json_to_io_error)?;
-        fs::write(path, bytes)
+        atomic_write(path, &bytes)
     }
 
     pub fn load_from_path(path: &Path) -> io::Result<Self> {

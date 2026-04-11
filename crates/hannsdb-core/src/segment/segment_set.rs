@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const ROLLOVER_MAX_ROWS: u64 = 200_000;
 pub const ROLLOVER_MAX_TOMBSTONE_RATIO: f64 = 0.20;
+pub const COMPACTION_THRESHOLD: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentSet {
@@ -24,6 +25,10 @@ impl SegmentSet {
     pub fn should_rollover(record_count: u64, tombstone_count: u64) -> bool {
         record_count >= ROLLOVER_MAX_ROWS
             || tombstone_ratio(record_count, tombstone_count) >= ROLLOVER_MAX_TOMBSTONE_RATIO
+    }
+
+    pub fn should_compact(immutable_count: usize) -> bool {
+        immutable_count >= COMPACTION_THRESHOLD
     }
 
     pub fn rollover(&mut self) {

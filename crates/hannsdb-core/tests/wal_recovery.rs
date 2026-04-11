@@ -217,7 +217,10 @@ fn wal_recovery_document_records_keep_typed_fields_and_vectors() {
         WalRecord::UpsertDocuments { documents, .. } => {
             assert_eq!(documents.len(), 1);
             assert_eq!(documents[0].id, 42);
-            assert_eq!(documents[0].primary_vector_for("dense").unwrap(), &[0.1, 0.2]);
+            assert_eq!(
+                documents[0].primary_vector_for("dense").unwrap(),
+                &[0.1, 0.2]
+            );
             assert_eq!(
                 documents[0].fields.get("session_id"),
                 Some(&FieldValue::String("s1".to_string()))
@@ -333,7 +336,10 @@ fn wal_recovery_replays_delete_by_filter_outcome() {
     let replayed = reopened
         .fetch_documents("docs", &[11, 22])
         .expect("fetch after replay");
-    assert!(replayed.is_empty(), "delete_by_filter outcome must survive WAL replay");
+    assert!(
+        replayed.is_empty(),
+        "delete_by_filter outcome must survive WAL replay"
+    );
 }
 
 #[test]
@@ -406,7 +412,9 @@ fn wal_recovery_replays_segment_aware_delete_outcome() {
     assert_eq!(deleted, 1);
     drop(db);
 
-    let active_segment_dir = collection_dir(root, "docs").join("segments").join("seg-0002");
+    let active_segment_dir = collection_dir(root, "docs")
+        .join("segments")
+        .join("seg-0002");
     fs::remove_file(active_segment_dir.join("tombstones.json")).expect("remove active tombstones");
 
     let reopened = HannsDb::open(root).expect("reopen should replay wal");
@@ -420,7 +428,10 @@ fn wal_recovery_replays_segment_aware_delete_outcome() {
     let replayed = reopened
         .fetch_documents("docs", &[10, 20, 30, 40])
         .expect("fetch after replay");
-    let replayed_ids = replayed.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let replayed_ids = replayed
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(replayed_ids, vec![30, 40]);
 }
 
@@ -485,7 +496,10 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
         .expect("fetch replayed document after recovery");
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].id, 11);
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[0.9, 0.8]);
+    assert_eq!(
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[0.9, 0.8]
+    );
     assert_eq!(
         replayed[0].fields.get("session_id"),
         Some(&FieldValue::String("s2".to_string()))
@@ -558,7 +572,10 @@ fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view()
         .expect("fetch replayed document after cleanup");
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].id, 11);
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[0.4, 0.6]);
+    assert_eq!(
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[0.4, 0.6]
+    );
     assert_eq!(
         replayed[0].fields.get("session_id"),
         Some(&FieldValue::String("s3".to_string()))

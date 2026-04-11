@@ -67,7 +67,7 @@ impl VersionSet {
             immutable_segment_ids: self.immutable_segment_ids.clone(),
         })
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
-        fs::write(path, bytes)
+        atomic_write(path, &bytes)
     }
 
     pub fn active_segment_id(&self) -> &str {
@@ -78,11 +78,25 @@ impl VersionSet {
         &self.immutable_segment_ids
     }
 
+    pub fn immutable_segment_ids_mut(&mut self) -> &mut Vec<String> {
+        &mut self.immutable_segment_ids
+    }
+
     pub fn all_segment_ids(&self) -> Vec<String> {
         let mut ids = Vec::with_capacity(1 + self.immutable_segment_ids.len());
         ids.push(self.active_segment_id.clone());
         ids.extend(self.immutable_segment_ids.iter().cloned());
         ids
+    }
+
+    /// Perform a rollover: push the current active segment to immutable,
+    /// set a new active segment ID. Returns the new active segment ID.
+    pub fn rollover(&mut self) -> String {
+        let next = next_segment_id(&self.active_segment_id);
+        self.immutable_segment_ids
+            .push(self.active_segment_id.clone());
+        self.active_segment_id = next.clone();
+        next
     }
 
     pub fn format_version(&self) -> u32 {
@@ -102,4 +116,22 @@ struct VersionSetFile {
     format_version: u32,
     active_segment_id: String,
     immutable_segment_ids: Vec<String>,
+}
+
+fn next_segment_id(current: &str) -> String {
+    let value = current
+        .strip_prefix("seg-")
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    format!("seg-{value:06}")
+}
+
+/// Write bytes to a file atomically using write-to-tmp + rename.
+/// On POSIX systems, `rename` is atomic, so a crash mid-write leaves
+/// the old file intact.
+pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)
 }

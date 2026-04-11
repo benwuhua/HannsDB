@@ -100,20 +100,19 @@ impl KnowhereHnswIndex {
     }
 
     pub fn from_bytes(dim: usize, bytes: &[u8]) -> Result<Self, AdapterError> {
-        let inner =
-            std::panic::catch_unwind(|| hanns::HnswIndex::deserialize_from_bytes(bytes))
-                .map_err(|_| {
-                    AdapterError::Backend(format!(
-                        "hnsw deserialize panicked (dim={dim}, bytes={})",
-                        bytes.len()
-                    ))
-                })?
-                .map_err(|e| {
-                    AdapterError::Backend(format!(
-                        "hnsw deserialize failed (dim={dim}, bytes={}): {e}",
-                        bytes.len()
-                    ))
-                })?;
+        let inner = std::panic::catch_unwind(|| hanns::HnswIndex::deserialize_from_bytes(bytes))
+            .map_err(|_| {
+                AdapterError::Backend(format!(
+                    "hnsw deserialize panicked (dim={dim}, bytes={})",
+                    bytes.len()
+                ))
+            })?
+            .map_err(|e| {
+                AdapterError::Backend(format!(
+                    "hnsw deserialize failed (dim={dim}, bytes={}): {e}",
+                    bytes.len()
+                ))
+            })?;
         Ok(Self { dim, inner })
     }
 }
@@ -299,7 +298,9 @@ impl VectorIndexBackend for KnowhereHnswIndex {
         let result = self
             .inner
             .search_with_bitset(query, &req, bitset)
-            .map_err(|e| AdapterError::Backend(format!("knowhere search_with_bitset failed: {e}")))?;
+            .map_err(|e| {
+                AdapterError::Backend(format!("knowhere search_with_bitset failed: {e}"))
+            })?;
 
         Ok(result
             .ids

@@ -10,7 +10,7 @@ use hannsdb_core::document::{
     VectorIndexSchema,
 };
 use hannsdb_core::query::{
-    QueryContext, QueryGroupBy, QueryReranker, VectorQuery, VectorQueryParam,
+    QueryContext, QueryGroupBy, QueryReranker, QueryVector, VectorQuery, VectorQueryParam,
 };
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, append_vectors, SegmentMetadata,
@@ -103,6 +103,7 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
     root: &std::path::Path,
     collection: &str,
     dimension: usize,
+    primary_vector_name: &str,
     second_segment_documents: &[Document],
     deleted_second_segment_rows: &[usize],
 ) {
@@ -130,7 +131,11 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
     let mut vector_sidecars = Vec::with_capacity(second_segment_documents.len());
     for document in second_segment_documents {
         ids.push(document.id);
-        vectors.extend_from_slice(document.primary_vector());
+        vectors.extend_from_slice(
+            document
+                .primary_vector_for(primary_vector_name)
+                .expect("document must have primary vector"),
+        );
         payloads.push(document.fields.clone());
         vector_sidecars.push(document.vectors.clone());
     }
@@ -140,8 +145,8 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
     assert_eq!(inserted, second_segment_documents.len());
     let _ = append_record_ids(&seg2_dir.join("ids.bin"), &ids).expect("append ids");
     let _ = append_payloads(&seg2_dir.join("payloads.jsonl"), &payloads).expect("append payloads");
-    let _ = append_vectors(&seg2_dir.join("vectors.jsonl"), &vector_sidecars)
-        .expect("append vectors");
+    let _ =
+        append_vectors(&seg2_dir.join("vectors.jsonl"), &vector_sidecars).expect("append vectors");
 
     let mut seg2_tombstone = TombstoneMask::new(second_segment_documents.len());
     for row_idx in deleted_second_segment_rows {
@@ -195,12 +200,12 @@ hannsdb_core = {{ package = "hannsdb-core", path = "{}" }}
 
     fs::write(
         src_dir.join("main.rs"),
-        r#"use hannsdb_core::query::{QueryContext, VectorQuery};
+        r#"use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery};
 
 fn main() {
     let query = VectorQuery {
         field_name: "dense".to_string(),
-        vector: vec![0.0_f32, 0.1],
+        vector: QueryVector::Dense(vec![0.0_f32, 0.1]),
         param: None,
     };
     let _request = QueryContext {
@@ -213,6 +218,7 @@ fn main() {
         include_vector: false,
         group_by: None,
         reranker: None,
+                order_by: None,
     };
 }
 "#,
@@ -285,7 +291,7 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: Some(vec![2]),
@@ -295,6 +301,7 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query with merged recall sources");
@@ -332,21 +339,24 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![0.2_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0],
                 [("title".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -361,7 +371,7 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -371,6 +381,7 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("secondary vector typed query");
@@ -406,21 +417,24 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![2.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0],
                 [("title".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -435,7 +449,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -447,6 +461,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("schema-indexed secondary vector fast path");
@@ -482,21 +497,24 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0, 5.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0, 0.0],
                 [("title".to_string(), vec![0.2_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0, 1.0],
                 [("title".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -511,7 +529,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -523,6 +541,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("schema-indexed secondary vector fast path across dimension mismatch");
@@ -567,21 +586,24 @@ fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_o
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![2.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0],
                 [("title".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -596,7 +618,7 @@ fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_o
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -608,6 +630,7 @@ fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_o
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("descriptor-backed secondary vector fast path");
@@ -638,15 +661,17 @@ fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_fi
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![2.0_f32, 0.0])],
             ),
@@ -661,7 +686,7 @@ fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_fi
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -673,6 +698,7 @@ fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_fi
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("unindexed secondary ef_search should remain unsupported");
@@ -710,15 +736,17 @@ fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_brutefo
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.9_f32, 0.1])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![10.0_f32, 0.0])],
             ),
@@ -733,7 +761,7 @@ fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_brutefo
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![1.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![1.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -743,6 +771,7 @@ fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_brutefo
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("secondary vector typed query");
@@ -784,21 +813,24 @@ fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_brutefo
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("title".to_string(), vec![0.9_f32, 0.1])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![10.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0],
                 [("title".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -819,6 +851,7 @@ fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_brutefo
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query_by_id typed query");
@@ -866,12 +899,12 @@ fn zvec_parity_query_context_accepts_mixed_metric_typed_recall_sources() {
                 queries: vec![
                     VectorQuery {
                         field_name: "dense".to_string(),
-                        vector: vec![1.0_f32, 0.0],
+                        vector: QueryVector::Dense(vec![1.0_f32, 0.0]),
                         param: None,
                     },
                     VectorQuery {
                         field_name: "title".to_string(),
-                        vector: vec![1.0_f32, 0.0],
+                        vector: QueryVector::Dense(vec![1.0_f32, 0.0]),
                         param: None,
                     },
                 ],
@@ -882,6 +915,7 @@ fn zvec_parity_query_context_accepts_mixed_metric_typed_recall_sources() {
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("mixed metric typed recall should now be accepted");
@@ -905,21 +939,24 @@ fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources(
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![0.9_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.2_f32, 0.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 0.0],
                 [("title".to_string(), vec![0.1_f32, 0.0])],
             ),
@@ -935,12 +972,12 @@ fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources(
                 queries: vec![
                     VectorQuery {
                         field_name: "dense".to_string(),
-                        vector: vec![0.0_f32, 0.0],
+                        vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                         param: None,
                     },
                     VectorQuery {
                         field_name: "title".to_string(),
-                        vector: vec![0.0_f32, 0.0],
+                        vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                         param: None,
                     },
                 ],
@@ -951,6 +988,7 @@ fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources(
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("mixed typed recall sources");
@@ -982,21 +1020,24 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("title".to_string(), vec![10.0_f32, 10.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.2_f32, 0.0],
                 [("title".to_string(), vec![11.0_f32, 11.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![0.1_f32, 0.0],
                 [("title".to_string(), vec![12.0_f32, 12.0])],
             ),
@@ -1014,7 +1055,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1026,6 +1067,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed query should reuse the legacy single-vector path");
@@ -1087,7 +1129,7 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1095,8 +1137,13 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "group".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("group_by should keep the best hit from each group");
@@ -1149,7 +1196,7 @@ fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1157,8 +1204,13 @@ fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "group".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("group_by should retain the top-ranked hit with a missing group field");
@@ -1214,7 +1266,7 @@ fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1222,8 +1274,13 @@ fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "score".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "score".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("group_by should canonicalize float group keys");
@@ -1252,7 +1309,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1260,8 +1317,13 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "missing".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "missing".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("group_by should reject an undefined field");
@@ -1277,7 +1339,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1285,8 +1347,13 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
                 filter: None,
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "vector".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "vector".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("group_by should reject vector fields");
@@ -1320,8 +1387,13 @@ fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
                 filter: Some("group == 1".to_string()),
                 output_fields: None,
                 include_vector: false,
-                group_by: Some(QueryGroupBy { field_name: "group".to_string(), group_topk: 0, group_count: 0 }),
+                group_by: Some(QueryGroupBy {
+                    field_name: "group".to_string(),
+                    group_topk: 0,
+                    group_count: 0,
+                }),
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("filter-only group_by should remain unsupported in this slice");
@@ -1336,6 +1408,8 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
         .expect("create collection");
+    db.insert("docs", &[1, 2], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
 
     let hits = db
         .query_with_context(
@@ -1344,7 +1418,7 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1354,6 +1428,7 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
                 include_vector: false,
                 group_by: None,
                 reranker: Some(QueryReranker::Rrf { rank_constant: 60 }),
+                order_by: None,
             },
         )
         .expect("reranker with single vector should succeed");
@@ -1413,7 +1488,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1423,6 +1498,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query with shadowed duplicate ids");
@@ -1462,27 +1538,43 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
-                [("version".to_string(), FieldValue::String("old-1".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("old-1".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
-                [("version".to_string(), FieldValue::String("old-2".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("old-2".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.1_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 3,
-                [("version".to_string(), FieldValue::String("old-3".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("old-3".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.05_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 4,
-                [("version".to_string(), FieldValue::String("old-4".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("old-4".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.2_f32, 0.0])],
             ),
@@ -1494,27 +1586,44 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
         &root,
         "docs",
         3,
+        "dense",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
-                [("version".to_string(), FieldValue::String("new-1".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("new-1".to_string()),
+                )],
+                "dense",
                 vec![1.0_f32, 1.0, 1.0],
                 [("title".to_string(), vec![10.0_f32, 10.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
-                [("version".to_string(), FieldValue::String("new-2".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("new-2".to_string()),
+                )],
+                "dense",
                 vec![1.0_f32, 1.0, 1.0],
                 [("title".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::new(
+            Document::with_primary_vector_name(
                 3,
-                [("version".to_string(), FieldValue::String("new-3".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("new-3".to_string()),
+                )],
+                "dense",
                 vec![1.0_f32, 1.0, 1.0],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 5,
-                [("version".to_string(), FieldValue::String("new-5".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("new-5".to_string()),
+                )],
+                "dense",
                 vec![1.0_f32, 1.0, 1.0],
                 [("title".to_string(), vec![0.3_f32, 0.0])],
             ),
@@ -1529,7 +1638,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
                 top_k: 4,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1541,6 +1650,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("secondary typed fast path across segments");
@@ -1561,8 +1671,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
 }
 
 #[test]
-fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_secondary_insert(
-) {
+fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_secondary_insert() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_cache_invalidation");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -1590,15 +1699,23 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 1,
-                [("version".to_string(), FieldValue::String("first".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("first".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.9_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 2,
-                [("version".to_string(), FieldValue::String("second".to_string()))],
+                [(
+                    "version".to_string(),
+                    FieldValue::String("second".to_string()),
+                )],
+                "dense",
                 vec![9.0_f32, 9.0, 9.0],
                 [("title".to_string(), vec![0.1_f32, 0.0])],
             ),
@@ -1613,7 +1730,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1625,6 +1742,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("warm secondary cache");
@@ -1635,9 +1753,13 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
 
     db.insert_documents(
         "docs",
-        &[Document::with_vectors(
+        &[Document::with_named_vectors(
             3,
-            [("version".to_string(), FieldValue::String("fresh".to_string()))],
+            [(
+                "version".to_string(),
+                FieldValue::String("fresh".to_string()),
+            )],
+            "dense",
             vec![9.0_f32, 9.0, 9.0],
             [("title".to_string(), vec![0.0_f32, 0.0])],
         )],
@@ -1651,7 +1773,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "title".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1663,6 +1785,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("second secondary fast-path query should reflect inserted document");
@@ -1672,7 +1795,10 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
         vec![3, 2, 1]
     );
     assert_eq!(hits[0].distance, 0.0);
-    assert_eq!(hits[0].fields.get("version"), Some(&FieldValue::String("fresh".to_string())));
+    assert_eq!(
+        hits[0].fields.get("version"),
+        Some(&FieldValue::String("fresh".to_string()))
+    );
 }
 
 #[test]
@@ -1729,7 +1855,7 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -1739,6 +1865,7 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query with tombstoned shadowed duplicate ids");
@@ -1807,6 +1934,7 @@ fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombsto
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("query_by_id should not resolve a tombstoned newer duplicate");
@@ -1843,7 +1971,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1855,6 +1983,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed query should reuse the legacy single-vector path");
@@ -1891,7 +2020,7 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: Some(VectorQueryParam {
                         ef_search: Some(64),
                     }),
@@ -1903,6 +2032,7 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("mixed query_by_id + ef_search should be rejected");
@@ -2015,6 +2145,7 @@ fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("filter-only query should scan live documents");
@@ -2090,7 +2221,7 @@ fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_querie
                 top_k: 3,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: query.clone(),
+                    vector: QueryVector::Dense(query.clone()),
                     param: None,
                 }],
                 query_by_id: None,
@@ -2100,6 +2231,7 @@ fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_querie
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed filtered query");
@@ -2192,7 +2324,7 @@ fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "vector".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -2202,6 +2334,7 @@ fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed query with output field projection");
@@ -2236,15 +2369,17 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 7,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("sparse".to_string(), vec![7.0_f32, 7.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 8,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![0.1_f32, 0.0],
                 [("sparse".to_string(), vec![8.0_f32, 8.0])],
             ),
@@ -2259,7 +2394,7 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
                 top_k: 1,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -2269,6 +2404,7 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
                 include_vector: true,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed query should include vectors on the fast path");
@@ -2300,15 +2436,17 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 7,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("sparse".to_string(), vec![7.0_f32, 7.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 8,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![0.1_f32, 0.0],
                 [("sparse".to_string(), vec![8.0_f32, 8.0])],
             ),
@@ -2329,6 +2467,7 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
                 include_vector: true,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("typed query should include vectors when recall comes from query_by_id");
@@ -2361,21 +2500,24 @@ fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_n
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 7,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![5.0_f32, 5.0],
                 [("sparse".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 8,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
                 [("sparse".to_string(), vec![0.2_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 9,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![1.0_f32, 1.0],
                 [("sparse".to_string(), vec![1.0_f32, 0.0])],
             ),
@@ -2396,6 +2538,7 @@ fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_n
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query should default query_by_id to primary vector recall");
@@ -2424,15 +2567,17 @@ fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configur
     db.insert_documents(
         "docs",
         &[
-            Document::with_vectors(
+            Document::with_named_vectors(
                 7,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![9.0_f32, 9.0],
                 [("sparse".to_string(), vec![0.0_f32, 0.0])],
             ),
-            Document::with_vectors(
+            Document::with_named_vectors(
                 8,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![0.1_f32, 0.0],
                 [("sparse".to_string(), vec![0.2_f32, 0.0])],
             ),
@@ -2447,7 +2592,7 @@ fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configur
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: Some(vec![7]),
@@ -2457,6 +2602,7 @@ fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configur
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query should recall from secondary vector");
@@ -2484,7 +2630,7 @@ fn zvec_parity_query_context_rejects_invalid_query_by_id_field_name() {
                 top_k: 1,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: Some(vec![1]),
@@ -2494,6 +2640,7 @@ fn zvec_parity_query_context_rejects_invalid_query_by_id_field_name() {
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("invalid query_by_id field should error");
@@ -2517,9 +2664,10 @@ fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing
         .expect("create collection");
     db.insert_documents(
         "docs",
-        &[Document::new(
+        &[Document::with_primary_vector_name(
             7,
             [("group".to_string(), FieldValue::Int64(1))],
+            "dense",
             vec![0.0_f32, 0.0],
         )],
     )
@@ -2532,7 +2680,7 @@ fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing
                 top_k: 1,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: Some(vec![7]),
@@ -2542,6 +2690,7 @@ fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("missing secondary vector should error");
@@ -2565,14 +2714,16 @@ fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_
     db.insert_documents(
         "docs",
         &[
-            Document::new(
+            Document::with_primary_vector_name(
                 1,
                 [("group".to_string(), FieldValue::Int64(1))],
+                "dense",
                 vec![0.0_f32, 0.0],
             ),
-            Document::new(
+            Document::with_primary_vector_name(
                 2,
                 [("group".to_string(), FieldValue::Int64(2))],
+                "dense",
                 vec![0.2_f32, 0.0],
             ),
         ],
@@ -2586,7 +2737,7 @@ fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_
                 top_k: 2,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -2596,6 +2747,7 @@ fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("query_by_id_field_name should be ignored when query_by_id is absent");
@@ -2626,9 +2778,10 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
         .expect("create collection");
     db.insert_documents(
         "docs",
-        &[Document::new(
+        &[Document::with_primary_vector_name(
             7,
             [("group".to_string(), FieldValue::Int64(1))],
+            "dense",
             vec![0.0_f32, 0.0],
         )],
     )
@@ -2666,7 +2819,7 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
                 top_k: 1,
                 queries: vec![VectorQuery {
                     field_name: "dense".to_string(),
-                    vector: vec![0.0_f32, 0.0],
+                    vector: QueryVector::Dense(vec![0.0_f32, 0.0]),
                     param: None,
                 }],
                 query_by_id: None,
@@ -2676,6 +2829,7 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
                 include_vector: true,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect_err("include_vector should error when fetch cannot materialize a cached hit");
@@ -2735,6 +2889,7 @@ fn zvec_parity_filter_only_query_projects_output_fields() {
                 include_vector: false,
                 group_by: None,
                 reranker: None,
+                order_by: None,
             },
         )
         .expect("filter-only query with output field projection");

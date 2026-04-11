@@ -27,6 +27,23 @@ pub enum FilterExpr {
         field: String,
         negated: bool,
     },
+    Like {
+        field: String,
+        pattern: String,
+        negated: bool,
+    },
+    ArrayContains {
+        field: String,
+        value: FieldValue,
+    },
+    ArrayContainsAny {
+        field: String,
+        values: Vec<FieldValue>,
+    },
+    ArrayContainsAll {
+        field: String,
+        values: Vec<FieldValue>,
+    },
 }
 
 impl FilterExpr {
@@ -54,16 +71,105 @@ impl FilterExpr {
                     ),
                 }
             }
-            FilterExpr::InList { field, negated, values } => {
+            FilterExpr::InList {
+                field,
+                negated,
+                values,
+            } => {
                 let Some(actual) = fields.get(field) else {
                     return *negated; // missing field: non-negated → false, negated → true
                 };
                 let found = values.iter().any(|v| values_equal(actual, v));
-                if *negated { !found } else { found }
+                if *negated {
+                    !found
+                } else {
+                    found
+                }
             }
             FilterExpr::NullCheck { field, negated } => {
                 let is_null = !fields.contains_key(field);
-                if *negated { !is_null } else { is_null }
+                if *negated {
+                    !is_null
+                } else {
+                    is_null
+                }
+            }
+            FilterExpr::Like {
+                field,
+                pattern,
+                negated,
+            } => {
+                let Some(actual) = fields.get(field) else {
+                    return *negated;
+                };
+                let s = match actual {
+                    FieldValue::String(s) => s,
+                    _ => return false,
+                };
+                let matched = like_match(s, pattern);
+                if *negated {
+                    !matched
+                } else {
+                    matched
+                }
+            }
+            FilterExpr::ArrayContains { field, value } => {
+                let Some(actual) = fields.get(field) else {
+                    return false;
+                };
+                match actual {
+                    FieldValue::Array(items) => items.iter().any(|item| values_equal(item, value)),
+                    _ => values_equal(actual, value),
+                }
+            }
+            FilterExpr::ArrayContainsAny { field, values } => {
+                let Some(actual) = fields.get(field) else {
+                    return false;
+                };
+                match actual {
+                    FieldValue::Array(items) => items
+                        .iter()
+                        .any(|item| values.iter().any(|v| values_equal(item, v))),
+                    _ => values.iter().any(|v| values_equal(actual, v)),
+                }
+            }
+            FilterExpr::ArrayContainsAll { field, values } => {
+                let Some(actual) = fields.get(field) else {
+                    return false;
+                };
+                match actual {
+                    FieldValue::Array(items) => values
+                        .iter()
+                        .all(|v| items.iter().any(|item| values_equal(item, v))),
+                    _ => values.iter().all(|v| values_equal(actual, v)),
+                }
+            }
+        }
+    }
+
+    /// Collect all field names referenced by this filter expression.
+    pub fn referenced_fields(&self) -> std::collections::BTreeSet<String> {
+        let mut fields = std::collections::BTreeSet::new();
+        self.collect_fields(&mut fields);
+        fields
+    }
+
+    fn collect_fields(&self, out: &mut std::collections::BTreeSet<String>) {
+        match self {
+            FilterExpr::And(exprs) | FilterExpr::Or(exprs) => {
+                for expr in exprs {
+                    expr.collect_fields(out);
+                }
+            }
+            FilterExpr::Not(expr) => expr.collect_fields(out),
+            FilterExpr::Clause { field, .. }
+            | FilterExpr::InList { field, .. }
+            | FilterExpr::NullCheck { field, .. }
+            | FilterExpr::Like { field, .. }
+            | FilterExpr::ArrayContains { field, .. }
+            | FilterExpr::ArrayContainsAny { field, .. }
+            | FilterExpr::ArrayContainsAll { field, .. } => {
+                out.insert(field.clone());
             }
         }
     }
@@ -218,10 +324,16 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
             *pos += 3; // skip "not"
             skip_whitespace(input, pos);
             expect_keyword(input, pos, "null")?;
-            return Ok(FilterExpr::NullCheck { field, negated: true });
+            return Ok(FilterExpr::NullCheck {
+                field,
+                negated: true,
+            });
         }
         expect_keyword(input, pos, "null")?;
-        return Ok(FilterExpr::NullCheck { field, negated: false });
+        return Ok(FilterExpr::NullCheck {
+            field,
+            negated: false,
+        });
     }
 
     // Check for "not in (...)"
@@ -232,9 +344,32 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
         if peek_keyword(&input[*pos..], 0, "in") {
             *pos += 2; // skip "in"
             let values = parse_in_list_values(input, pos)?;
-            return Ok(FilterExpr::InList { field, negated: true, values });
+            return Ok(FilterExpr::InList {
+                field,
+                negated: true,
+                values,
+            });
         }
-        // Not "not in" — backtrack
+        // Check for "not like"
+        if peek_keyword(&input[*pos..], 0, "like") {
+            *pos += 4; // skip "like"
+            skip_whitespace(input, pos);
+            let pattern = read_value_token(input, *pos);
+            if pattern.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing pattern in 'not like' filter clause",
+                ));
+            }
+            *pos += pattern.len();
+            let pattern = parse_pattern(pattern.trim())?;
+            return Ok(FilterExpr::Like {
+                field,
+                pattern,
+                negated: true,
+            });
+        }
+        // Not "not in" / "not like" — backtrack
         *pos = saved;
     }
 
@@ -242,7 +377,60 @@ fn parse_clause_expr(input: &str, pos: &mut usize) -> io::Result<FilterExpr> {
     if peek_keyword(rest, 0, "in") {
         *pos += 2; // skip "in"
         let values = parse_in_list_values(input, pos)?;
-        return Ok(FilterExpr::InList { field, negated: false, values });
+        return Ok(FilterExpr::InList {
+            field,
+            negated: false,
+            values,
+        });
+    }
+
+    // Check for "like"
+    if peek_keyword(rest, 0, "like") {
+        *pos += 4; // skip "like"
+        skip_whitespace(input, pos);
+        let pattern = read_value_token(input, *pos);
+        if pattern.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing pattern in 'like' filter clause",
+            ));
+        }
+        *pos += pattern.len();
+        let pattern = parse_pattern(pattern.trim())?;
+        return Ok(FilterExpr::Like {
+            field,
+            pattern,
+            negated: false,
+        });
+    }
+
+    // Check for "contains"
+    if peek_keyword(rest, 0, "contains") {
+        *pos += 8; // skip "contains"
+        skip_whitespace(input, pos);
+        let rest_after = &input[*pos..];
+        // "contains_any" or "contains_all"
+        if peek_keyword(rest_after, 0, "any") {
+            *pos += 3; // skip "any"
+            let values = parse_in_list_values(input, pos)?;
+            return Ok(FilterExpr::ArrayContainsAny { field, values });
+        }
+        if peek_keyword(rest_after, 0, "all") {
+            *pos += 3; // skip "all"
+            let values = parse_in_list_values(input, pos)?;
+            return Ok(FilterExpr::ArrayContainsAll { field, values });
+        }
+        // Plain "contains" — single value
+        let value_str = read_value_token(input, *pos);
+        if value_str.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing value after 'contains'",
+            ));
+        }
+        *pos += value_str.len();
+        let value = parse_value(value_str.trim())?;
+        return Ok(FilterExpr::ArrayContains { field, value });
     }
 
     // 3. Default: comparison clause (field op value)
@@ -547,6 +735,46 @@ fn to_i64(value: &FieldValue) -> Option<i64> {
     }
 }
 
+/// Simple SQL LIKE pattern match.
+///
+/// `%` matches any sequence of characters (including empty).
+/// `_` matches exactly one character.
+/// All other characters match literally.
+fn like_match(text: &str, pattern: &str) -> bool {
+    like_match_impl(text.as_bytes(), pattern.as_bytes())
+}
+
+fn like_match_impl(text: &[u8], pattern: &[u8]) -> bool {
+    match (text.first(), pattern.first()) {
+        (None, None) => true,
+        (None, Some(&b'%')) => like_match_impl(text, &pattern[1..]),
+        (None, _) => false,
+        (Some(_), None) => false,
+        (Some(_), Some(b'%')) => {
+            // Try matching 0..N chars
+            like_match_impl(text, &pattern[1..]) || like_match_impl(&text[1..], pattern)
+        }
+        (Some(_), Some(b'_')) => like_match_impl(&text[1..], &pattern[1..]),
+        (Some(&tc), Some(&pc)) => {
+            if tc == pc {
+                like_match_impl(&text[1..], &pattern[1..])
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Parse a LIKE pattern from a token — either a quoted string or a bare word.
+fn parse_pattern(input: &str) -> io::Result<String> {
+    if input.starts_with('"') && input.ends_with('"') && input.len() >= 2 {
+        let value = serde_json::from_str::<String>(input).map_err(json_to_io_error)?;
+        Ok(value)
+    } else {
+        Ok(input.to_string())
+    }
+}
+
 fn values_equal(left: &FieldValue, right: &FieldValue) -> bool {
     match (left, right) {
         (FieldValue::String(a), FieldValue::String(b)) => a == b,
@@ -558,6 +786,7 @@ fn values_equal(left: &FieldValue, right: &FieldValue) -> bool {
         (FieldValue::UInt64(a), FieldValue::UInt64(b)) => a == b,
         (FieldValue::Float(a), FieldValue::Float(b)) => a == b,
         (FieldValue::Float64(a), FieldValue::Float64(b)) => a == b,
+        (FieldValue::Array(a), FieldValue::Array(b)) => a == b,
         // Cross-type: try exact integer comparison first, then fall back to f64
         _ => {
             if let (Some(a), Some(b)) = (to_i64(left), to_i64(right)) {
@@ -885,7 +1114,190 @@ mod tests {
         let expr = parse_filter("nickname is null and score > 5").unwrap();
         let f1 = field_map(vec![("score", FieldValue::Int64(10))]);
         assert!(expr.matches(&f1));
-        let f2 = field_map(vec![("nickname", FieldValue::String("x".into())), ("score", FieldValue::Int64(10))]);
+        let f2 = field_map(vec![
+            ("nickname", FieldValue::String("x".into())),
+            ("score", FieldValue::Int64(10)),
+        ]);
         assert!(!expr.matches(&f2));
+    }
+
+    // -- LIKE tests --
+
+    #[test]
+    fn like_prefix_match() {
+        let expr = parse_filter("name like \"%son\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("John".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_suffix_match() {
+        let expr = parse_filter("name like \"John%\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Jane".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_contains_match() {
+        let expr = parse_filter("name like \"%hn%\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Jane".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_exact_match() {
+        let expr = parse_filter("name like \"John\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("John".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_underscore_match() {
+        let expr = parse_filter("code like \"A_C\"").unwrap();
+        let f1 = field_map(vec![("code", FieldValue::String("ABC".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("code", FieldValue::String("ABBC".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn not_like_match() {
+        let expr = parse_filter("name not like \"%son\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("Johnson".into()))]);
+        assert!(!expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("Smith".into()))]);
+        assert!(expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_missing_field() {
+        let expr = parse_filter("name like \"%test%\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("test".into()))]);
+        assert!(!expr.matches(&fields));
+    }
+
+    // -- Array contains tests --
+
+    #[test]
+    fn array_contains_single_value() {
+        let expr = parse_filter("tags contains \"rust\"").unwrap();
+        let f1 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![
+                FieldValue::String("rust".into()),
+                FieldValue::String("python".into()),
+            ]),
+        )]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![FieldValue::String("java".into())]),
+        )]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn array_contains_integer() {
+        let expr = parse_filter("groups contains 5").unwrap();
+        let f1 = field_map(vec![(
+            "groups",
+            FieldValue::Array(vec![
+                FieldValue::Int64(3),
+                FieldValue::Int64(5),
+                FieldValue::Int64(7),
+            ]),
+        )]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![(
+            "groups",
+            FieldValue::Array(vec![FieldValue::Int64(1), FieldValue::Int64(2)]),
+        )]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn array_contains_any() {
+        let expr = parse_filter("tags contains any (\"rust\", \"go\")").unwrap();
+        let f1 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![
+                FieldValue::String("python".into()),
+                FieldValue::String("go".into()),
+            ]),
+        )]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![FieldValue::String("java".into())]),
+        )]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn array_contains_all() {
+        let expr = parse_filter("tags contains all (\"rust\", \"go\")").unwrap();
+        let f1 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![
+                FieldValue::String("rust".into()),
+                FieldValue::String("go".into()),
+                FieldValue::String("python".into()),
+            ]),
+        )]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![(
+            "tags",
+            FieldValue::Array(vec![FieldValue::String("rust".into())]),
+        )]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn array_contains_missing_field() {
+        let expr = parse_filter("tags contains \"rust\"").unwrap();
+        let fields = field_map(vec![("other", FieldValue::String("rust".into()))]);
+        assert!(!expr.matches(&fields));
+    }
+
+    #[test]
+    fn array_contains_on_non_array_field() {
+        let expr = parse_filter("name contains \"rust\"").unwrap();
+        let f1 = field_map(vec![("name", FieldValue::String("rust".into()))]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![("name", FieldValue::String("python".into()))]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn like_combined_with_and() {
+        let expr = parse_filter("name like \"%son\" and age > 30").unwrap();
+        let f1 = field_map(vec![
+            ("name", FieldValue::String("Johnson".into())),
+            ("age", FieldValue::Int64(35)),
+        ]);
+        assert!(expr.matches(&f1));
+        let f2 = field_map(vec![
+            ("name", FieldValue::String("Johnson".into())),
+            ("age", FieldValue::Int64(25)),
+        ]);
+        assert!(!expr.matches(&f2));
+    }
+
+    #[test]
+    fn array_contains_any_with_integers() {
+        let expr = parse_filter("groups contains any (1, 3)").unwrap();
+        let f1 = field_map(vec![(
+            "groups",
+            FieldValue::Array(vec![FieldValue::Int64(2), FieldValue::Int64(3)]),
+        )]);
+        assert!(expr.matches(&f1));
     }
 }

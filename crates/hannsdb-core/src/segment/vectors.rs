@@ -16,7 +16,17 @@ pub fn append_vectors(path: &Path, vectors: &[BTreeMap<String, Vec<f32>>]) -> io
     Ok(vectors.len())
 }
 
+/// Load vectors from Arrow IPC if available, otherwise JSONL.
 pub fn load_vectors(path: &Path) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    let arrow_path = path.with_extension("arrow");
+    if arrow_path.exists() {
+        return super::arrow_io::load_vectors_arrow(&arrow_path);
+    }
+    load_vectors_jsonl(path)
+}
+
+/// Load vectors from JSONL format (used by active segments and legacy data).
+pub fn load_vectors_jsonl(path: &Path) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
     let file = OpenOptions::new().read(true).open(path)?;
     let reader = BufReader::new(file);
     let mut vectors = Vec::new();
@@ -33,4 +43,27 @@ pub fn load_vectors(path: &Path) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> 
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+/// Ensure the vectors JSONL file has exactly `existing_rows` rows by padding
+/// missing rows with empty maps.
+pub fn ensure_vector_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
+    match super::payloads::count_jsonl_lines(path) {
+        Ok(count) => {
+            if count != existing_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector row count is misaligned with existing records",
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if existing_rows > 0 {
+                let _ = append_vectors(path, &vec![BTreeMap::new(); existing_rows])?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }

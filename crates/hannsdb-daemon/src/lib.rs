@@ -1,5 +1,7 @@
 pub mod api;
 pub mod routes;
+pub mod routes_mutation;
+pub mod routes_search;
 
 pub fn startup_banner() -> &'static str {
     "hannsdb-daemon bootstrap"

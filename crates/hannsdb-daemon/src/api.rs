@@ -32,11 +32,23 @@ impl HealthResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SparseVectorRequest {
+    pub indices: Vec<u32>,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct InsertRecordsRequest {
     pub ids: Vec<String>,
+    #[serde(default)]
     pub vectors: Vec<Vec<f32>>,
     #[serde(default)]
     pub fields: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub named_vectors: Option<Vec<BTreeMap<String, Vec<f32>>>>,
+    #[serde(default)]
+    pub sparse_vectors: Option<Vec<BTreeMap<String, SparseVectorRequest>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,13 +114,18 @@ pub struct TypedSearchRequest {
     pub group_by: Option<TypedQueryGroupByRequest>,
     #[serde(default)]
     pub reranker: Option<TypedQueryRerankerRequest>,
+    #[serde(default)]
+    pub order_by: Option<TypedQueryOrderByRequest>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypedVectorQueryRequest {
     pub field_name: String,
-    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub vector: Option<Vec<f32>>,
+    #[serde(default)]
+    pub sparse_vector: Option<SparseVectorRequest>,
     #[serde(default)]
     pub param: Option<TypedVectorQueryParamRequest>,
 }
@@ -137,6 +154,14 @@ pub struct TypedQueryRerankerRequest {
     pub rank_constant: Option<u64>,
     #[serde(default)]
     pub weights: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedQueryOrderByRequest {
+    pub field_name: String,
+    #[serde(default)]
+    pub descending: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{
     default_hnsw_ef_construction, default_hnsw_m, default_primary_vector_name, CollectionSchema,
-    ScalarFieldSchema, VectorFieldSchema, VectorIndexSchema,
+    FieldType, ScalarFieldSchema, VectorFieldSchema, VectorIndexSchema,
 };
+use crate::segment::atomic_write;
 
 use super::CATALOG_FORMAT_VERSION;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollectionMetadata {
     pub format_version: u32,
     pub name: String,
@@ -50,6 +51,14 @@ impl CollectionMetadata {
         }
     }
 
+    /// Return true if the primary vector field uses FP16 storage.
+    pub fn primary_is_fp16(&self) -> bool {
+        self.vectors
+            .iter()
+            .find(|v| v.name == self.primary_vector)
+            .map_or(false, |v| v.data_type == FieldType::VectorFp16)
+    }
+
     pub fn save_to_path(&self, path: &Path) -> io::Result<()> {
         let persisted = PersistedCollectionMetadata {
             format_version: self.format_version,
@@ -59,7 +68,7 @@ impl CollectionMetadata {
             vectors: self.vectors.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).map_err(json_to_io_error)?;
-        fs::write(path, bytes)
+        atomic_write(path, &bytes)
     }
 
     pub fn load_from_path(path: &Path) -> io::Result<Self> {
@@ -143,7 +152,7 @@ impl CollectionMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct PersistedCollectionMetadata {
     pub format_version: u32,
     pub name: String,
@@ -154,7 +163,7 @@ struct PersistedCollectionMetadata {
     pub vectors: Vec<VectorFieldSchema>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 enum PersistedCollectionMetadataCompat {
     Current(PersistedCollectionMetadata),

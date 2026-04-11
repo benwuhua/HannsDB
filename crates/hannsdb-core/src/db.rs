@@ -1,44 +1,46 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use hannsdb_index::adapter::{AdapterError, VectorIndexBackend};
+use hannsdb_index::adapter::VectorIndexBackend;
 use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind};
 use hannsdb_index::factory::DefaultIndexFactory;
 use hannsdb_index::scalar::{InvertedScalarIndex, RangeOp, ScalarValue};
+use hannsdb_index::sparse::{SparseIndexBackend, SparseVectorData};
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
-    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, VectorIndexSchema,
+    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
+    VectorIndexSchema,
 };
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
-    ComparisonOp, FilterExpr,
-    QueryContext, QueryExecutor, QueryPlan, QueryPlanner, SearchHit,
+    search_sparse_bruteforce, ComparisonOp, FilterExpr, OrderBy, QueryContext, QueryExecutor,
+    QueryPlan, QueryPlanner, SearchHit,
+};
+#[cfg(feature = "hanns-backend")]
+use crate::segment::index_runtime::ann_search_with_bitset;
+#[cfg(feature = "hanns-backend")]
+use crate::segment::index_runtime::HNSW_INDEX_FILE;
+use crate::segment::index_runtime::{
+    ann_blob_path, ann_ids_path, ann_search, build_optimized_ann_state, invalidate_ann_blobs,
+    persist_ann_blob, CachedSearchState, OptimizedAnnState,
 };
 use crate::segment::{
-    append_payloads, append_record_ids, append_records, append_vectors, load_payloads,
-    load_record_ids, load_records, load_vectors, SegmentManager, SegmentMetadata, SegmentPaths,
-    SegmentSet, TombstoneMask, VersionSet,
+    append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
+    append_vectors, ensure_payload_rows, ensure_vector_rows, load_payloads, load_payloads_jsonl,
+    load_payloads_with_fields, load_record_ids, load_records, load_records_f16,
+    load_sparse_vectors, load_vectors, load_vectors_jsonl, write_payloads_arrow,
+    write_vectors_arrow, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
+    VersionSet,
 };
 use crate::wal::{append_wal_record, load_wal_records, WalRecord};
 
 const DEFAULT_EF_SEARCH: usize = 32;
-const HNSW_INDEX_FILE: &str = "hnsw_index.bin";
 const INDEX_CATALOG_FILE: &str = "indexes.json";
-
-#[cfg(feature = "hanns-backend")]
-fn ann_blob_path(collection_dir: &Path, field_name: &str) -> PathBuf {
-    collection_dir.join("ann").join(format!("{field_name}.bin"))
-}
-
-#[cfg(feature = "hanns-backend")]
-fn ann_ids_path(collection_dir: &Path, field_name: &str) -> PathBuf {
-    collection_dir.join("ann").join(format!("{field_name}.ids.bin"))
-}
 
 pub struct HannsDb {
     root: PathBuf,
@@ -73,25 +75,6 @@ pub struct DocumentHit {
 }
 
 #[derive(Clone)]
-struct CachedSearchState {
-    records: Arc<Vec<f32>>,
-    external_ids: Arc<Vec<i64>>,
-    tombstone: Arc<TombstoneMask>,
-    dimension: usize,
-    metric: String,
-    field_name: String,
-    descriptor: VectorIndexDescriptor,
-    optimized_ann: Option<OptimizedAnnState>,
-}
-
-#[derive(Clone)]
-struct OptimizedAnnState {
-    backend: Arc<dyn VectorIndexBackend>,
-    ann_external_ids: Arc<Vec<i64>>,
-    metric: String,
-}
-
-#[derive(Clone)]
 struct CachedDocumentState {
     documents: Arc<HashMap<i64, Document>>,
     collection_meta: Arc<CollectionMetadata>,
@@ -109,6 +92,7 @@ pub struct CollectionHandle {
     index_registry: Arc<IndexRegistry>,
     search_cache: Mutex<HashMap<String, CachedSearchState>>,
     scalar_cache: Mutex<HashMap<String, InvertedScalarIndex>>,
+    sparse_index_cache: Mutex<HashMap<String, Box<dyn SparseIndexBackend>>>,
     document_cache: Mutex<Option<CachedDocumentState>>,
 }
 
@@ -270,11 +254,7 @@ impl HannsDb {
         Ok(())
     }
 
-    pub fn add_column(
-        &mut self,
-        collection: &str,
-        field: ScalarFieldSchema,
-    ) -> io::Result<()> {
+    pub fn add_column(&mut self, collection: &str, field: ScalarFieldSchema) -> io::Result<()> {
         self.require_write()?;
         self.add_column_internal(collection, field, true)
     }
@@ -581,7 +561,12 @@ impl HannsDb {
             }
 
             let segment_paths = SegmentPaths::from_segment_dir(segment_dir, segment_id.clone());
-            let segment_records = load_records(&segment_paths.records, collection_meta.dimension)?;
+            let fp16 = collection_meta.primary_is_fp16();
+            let segment_records = if fp16 {
+                load_records_f16(&segment_paths.records, collection_meta.dimension)?
+            } else {
+                load_records(&segment_paths.records, collection_meta.dimension)?
+            };
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
                 load_payloads_or_empty(&segment_paths.payloads, segment_external_ids.len())?;
@@ -614,11 +599,20 @@ impl HannsDb {
             }
         }
 
-        let inserted = append_records(
-            &compacted_paths.records,
-            collection_meta.dimension,
-            &compacted_records,
-        )?;
+        let fp16 = collection_meta.primary_is_fp16();
+        let inserted = if fp16 {
+            append_records_f16(
+                &compacted_paths.records,
+                collection_meta.dimension,
+                &compacted_records,
+            )?
+        } else {
+            append_records(
+                &compacted_paths.records,
+                collection_meta.dimension,
+                &compacted_records,
+            )?
+        };
         if inserted != compacted_ids.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -626,16 +620,26 @@ impl HannsDb {
             ));
         }
         let _ = append_record_ids(&compacted_paths.external_ids, &compacted_ids)?;
-        let _ = append_payloads(&compacted_paths.payloads, &compacted_payloads)?;
-        let _ = append_vectors(&compacted_paths.vectors, &compacted_vectors)?;
+        write_payloads_arrow(
+            &compacted_paths.payloads_arrow,
+            &compacted_payloads,
+            &collection_meta.fields,
+        )?;
+        write_vectors_arrow(
+            &compacted_paths.vectors_arrow,
+            &compacted_vectors,
+            &collection_meta.vectors,
+            &collection_meta.primary_vector,
+        )?;
         TombstoneMask::new(compacted_ids.len()).save_to_path(&compacted_paths.tombstones)?;
-        SegmentMetadata::new(
+        let mut compacted_meta = SegmentMetadata::new(
             compacted_segment_id.clone(),
             collection_meta.dimension,
             compacted_ids.len(),
             0,
-        )
-        .save_to_path(&compacted_dir.join("segment.json"))?;
+        );
+        compacted_meta.storage_format = "arrow".to_string();
+        compacted_meta.save_to_path(&compacted_dir.join("segment.json"))?;
 
         version_set = VersionSet::new(
             version_set.active_segment_id().to_string(),
@@ -745,12 +749,19 @@ impl HannsDb {
 
         ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
         ensure_vector_rows(&paths.vectors, segment_meta.record_count)?;
-        let inserted = append_records(&paths.records, collection_meta.dimension, vectors)?;
+        let fp16 = collection_meta.primary_is_fp16();
+        let inserted = if fp16 {
+            append_records_f16(&paths.records, collection_meta.dimension, vectors)?
+        } else {
+            append_records(&paths.records, collection_meta.dimension, vectors)?
+        };
         let _ = append_record_ids(&paths.external_ids, external_ids)?;
         let empty_payloads = vec![BTreeMap::new(); inserted];
         let empty_vectors = vec![BTreeMap::new(); inserted];
+        let empty_sparse = vec![BTreeMap::new(); inserted];
         let _ = append_payloads(&paths.payloads, &empty_payloads)?;
         let _ = append_vectors(&paths.vectors, &empty_vectors)?;
+        let _ = append_sparse_vectors(&paths.sparse_vectors, &empty_sparse)?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
 
@@ -762,6 +773,9 @@ impl HannsDb {
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
         self.maybe_trigger_segment_rollover(&paths, &segment_meta)?;
+        if self.should_auto_compact(collection)? {
+            self.compact_collection_internal(collection, true)?;
+        }
         self.invalidate_search_cache(collection);
         Ok(inserted)
     }
@@ -815,6 +829,7 @@ impl HannsDb {
             segment_meta.record_count,
             &collection_meta.primary_vector,
             documents,
+            collection_meta.primary_is_fp16(),
         )?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
@@ -826,6 +841,9 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        if self.should_auto_compact(collection)? {
+            self.compact_collection_internal(collection, true)?;
+        }
         self.invalidate_search_cache(collection);
         Ok(inserted)
     }
@@ -879,6 +897,7 @@ impl HannsDb {
             segment_meta.record_count,
             &collection_meta.primary_vector,
             documents,
+            collection_meta.primary_is_fp16(),
         )?;
         segment_meta.record_count += inserted;
         segment_meta.deleted_count = tombstone.deleted_count();
@@ -890,6 +909,9 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        if self.should_auto_compact(collection)? {
+            self.compact_collection_internal(collection, true)?;
+        }
         self.invalidate_search_cache(collection);
         Ok(inserted)
     }
@@ -925,10 +947,8 @@ impl HannsDb {
             return Ok(0);
         }
 
-        let existing_map: HashMap<i64, Document> = existing
-            .into_iter()
-            .map(|doc| (doc.id, doc))
-            .collect();
+        let existing_map: HashMap<i64, Document> =
+            existing.into_iter().map(|doc| (doc.id, doc)).collect();
 
         // Merge updates into full documents.
         let merged: Vec<Document> = updates
@@ -938,18 +958,31 @@ impl HannsDb {
                 let mut fields = existing.fields.clone();
                 for (key, value) in &update.fields {
                     match value {
-                        Some(v) => { fields.insert(key.clone(), v.clone()); }
-                        None => { fields.remove(key); }
+                        Some(v) => {
+                            fields.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            fields.remove(key);
+                        }
                     }
                 }
                 let mut vectors = existing.vectors.clone();
                 for (key, value) in &update.vectors {
                     match value {
-                        Some(v) => { vectors.insert(key.clone(), v.clone()); }
-                        None => { vectors.remove(key); }
+                        Some(v) => {
+                            vectors.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            vectors.remove(key);
+                        }
                     }
                 }
-                Some(Document { id: update.id, fields, vectors })
+                Some(Document {
+                    id: update.id,
+                    fields,
+                    vectors,
+                    sparse_vectors: existing.sparse_vectors.clone(),
+                })
             })
             .collect();
 
@@ -1058,6 +1091,9 @@ impl HannsDb {
             }
         }
 
+        if self.should_auto_compact(collection)? {
+            self.compact_collection_internal(collection, true)?;
+        }
         self.invalidate_search_cache(collection);
         Ok(newly_deleted)
     }
@@ -1076,12 +1112,17 @@ impl HannsDb {
 
         for segment in segment_paths {
             let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let records = load_records_or_empty(
+                &segment.records,
+                collection_meta.dimension,
+                collection_meta.primary_is_fp16(),
+            )?;
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
             let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
-            let row_limit = segment_meta.record_count
+            let row_limit = segment_meta
+                .record_count
                 .min(stored_ids.len())
                 .min(records.len() / collection_meta.dimension);
             if row_limit == 0 {
@@ -1145,8 +1186,33 @@ impl HannsDb {
             .query_with_context(context)
     }
 
+    /// Search a sparse vector field by brute force.
+    ///
+    /// Returns top-k hits ranked by sparse inner product (descending similarity).
+    pub fn search_sparse(
+        &self,
+        collection: &str,
+        field_name: &str,
+        query: &SparseVector,
+        top_k: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.open_collection_handle(collection)?
+            .search_sparse(field_name, query, top_k)
+    }
+
     fn collection_paths(&self, name: &str) -> CollectionPaths {
         collection_paths_for_root(&self.root, name)
+    }
+
+    fn should_auto_compact(&self, collection: &str) -> io::Result<bool> {
+        let paths = self.collection_paths(collection);
+        if !paths.segment_set.exists() {
+            return Ok(false);
+        }
+        let version_set = VersionSet::load_from_path(&paths.segment_set)?;
+        Ok(SegmentSet::should_compact(
+            version_set.immutable_segment_ids().len(),
+        ))
     }
 
     fn invalidate_search_cache(&self, collection: &str) {
@@ -1175,9 +1241,104 @@ impl HannsDb {
             return Ok(());
         }
 
-        let _ = (paths, segment_meta);
-        // Auto-rollover is intentionally disabled until the mutable segment
-        // writer can initialize a fully readable multi-segment layout.
+        let mut version_set = if paths.segment_set.exists() {
+            VersionSet::load_from_path(&paths.segment_set)?
+        } else {
+            VersionSet::single(&segment_meta.segment_id)
+        };
+
+        let new_id = version_set.rollover();
+
+        // If no segment_set.json exists, migrate root-level files into segments/
+        let old_seg_dir = if !paths.segment_set.exists() {
+            let segments_dir = paths.segments_dir.clone();
+            let old_dir = segments_dir.join(&segment_meta.segment_id);
+            fs::create_dir_all(&segments_dir)?;
+            fs::create_dir_all(&old_dir)?;
+
+            let files_to_move = [
+                "segment.json",
+                "records.bin",
+                "ids.bin",
+                "payloads.jsonl",
+                "vectors.jsonl",
+                "tombstones.json",
+            ];
+            for file_name in &files_to_move {
+                let src = paths.dir.join(file_name);
+                if src.exists() {
+                    fs::rename(&src, old_dir.join(file_name))?;
+                }
+            }
+            old_dir
+        } else {
+            paths.segments_dir.join(&segment_meta.segment_id)
+        };
+
+        // Convert JSONL → Arrow IPC for the now-immutable segment.
+        if let Err(e) = Self::convert_segment_jsonl_to_arrow(&old_seg_dir, &paths.dir) {
+            log::warn!(
+                "JSONL→Arrow conversion failed for {}, keeping JSONL: {}",
+                segment_meta.segment_id,
+                e
+            );
+        }
+
+        // Create the new active segment directory
+        let seg_manager = SegmentManager::new(paths.dir.clone());
+        seg_manager.create_segment_dir(&new_id, segment_meta.dimension)?;
+
+        // Persist the updated version set
+        version_set.save_to_path(&paths.segment_set)?;
+
+        log::info!("Segment rollover: {} → {}", segment_meta.segment_id, new_id);
+
+        Ok(())
+    }
+
+    /// Convert JSONL files to Arrow IPC for an immutable segment directory.
+    fn convert_segment_jsonl_to_arrow(
+        seg_dir: &std::path::Path,
+        collection_dir: &std::path::Path,
+    ) -> io::Result<()> {
+        let collection_meta_path = collection_dir.join("collection.json");
+        if !collection_meta_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "collection.json not found",
+            ));
+        }
+        let collection_meta = CollectionMetadata::load_from_path(&collection_meta_path)?;
+
+        let jsonl_payloads = seg_dir.join("payloads.jsonl");
+        let jsonl_vectors = seg_dir.join("vectors.jsonl");
+        let arrow_payloads = seg_dir.join("payloads.arrow");
+        let arrow_vectors = seg_dir.join("vectors.arrow");
+
+        if jsonl_payloads.exists() {
+            let payloads = load_payloads_jsonl(&jsonl_payloads)?;
+            write_payloads_arrow(&arrow_payloads, &payloads, &collection_meta.fields)?;
+            let _ = fs::remove_file(&jsonl_payloads);
+        }
+
+        if jsonl_vectors.exists() {
+            let vectors = load_vectors_jsonl(&jsonl_vectors)?;
+            write_vectors_arrow(
+                &arrow_vectors,
+                &vectors,
+                &collection_meta.vectors,
+                &collection_meta.primary_vector,
+            )?;
+            let _ = fs::remove_file(&jsonl_vectors);
+        }
+
+        let meta_path = seg_dir.join("segment.json");
+        if meta_path.exists() {
+            let mut meta = SegmentMetadata::load_from_path(&meta_path)?;
+            meta.storage_format = "arrow".to_string();
+            meta.save_to_path(&meta_path)?;
+        }
+
         Ok(())
     }
 
@@ -1256,10 +1417,9 @@ impl HannsDb {
             } => self
                 .update_documents_internal(collection, updates, false)
                 .map(|_| ()),
-            WalRecord::AddColumn {
-                collection,
-                field,
-            } => self.add_column_internal(collection, field.clone(), false),
+            WalRecord::AddColumn { collection, field } => {
+                self.add_column_internal(collection, field.clone(), false)
+            }
             WalRecord::DropColumn {
                 collection,
                 field_name,
@@ -1289,6 +1449,7 @@ impl CollectionHandle {
             index_registry,
             search_cache: Mutex::new(HashMap::new()),
             scalar_cache: Mutex::new(HashMap::new()),
+            sparse_index_cache: Mutex::new(HashMap::new()),
             document_cache: Mutex::new(None),
         }
     }
@@ -1309,6 +1470,89 @@ impl CollectionHandle {
     ) -> io::Result<Vec<SearchHit>> {
         let field_name = self.collection_primary_vector_name()?;
         self.search_field_with_ef_internal(&field_name, query, top_k, _ef_search)
+    }
+
+    /// Brute-force search over a sparse vector field.
+    ///
+    /// Returns top-k hits ranked by sparse inner product (descending similarity).
+    pub fn search_sparse(
+        &self,
+        field_name: &str,
+        query: &SparseVector,
+        top_k: usize,
+    ) -> io::Result<Vec<SearchHit>> {
+        let paths = self.collection_paths();
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        // Verify the field is a sparse vector field in the schema.
+        collection_meta
+            .vectors
+            .iter()
+            .find(|v| {
+                v.name == field_name && v.data_type == crate::document::FieldType::VectorSparse
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "sparse vector field '{}' is not defined in collection '{}'",
+                        field_name, collection_meta.name
+                    ),
+                )
+            })?;
+
+        // Try cached sparse index first.
+        {
+            let sparse_cache = self
+                .sparse_index_cache
+                .lock()
+                .expect("sparse index cache mutex poisoned");
+            if let Some(index) = sparse_cache.get(field_name) {
+                let query_data = SparseVectorData::new(query.indices.clone(), query.values.clone());
+                let hits = index.search(&query_data, top_k, None).map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("sparse index search: {e:?}"))
+                })?;
+                return Ok(hits
+                    .into_iter()
+                    .map(|hit| SearchHit {
+                        id: hit.id,
+                        distance: -hit.score, // score → distance (negate for consistency)
+                    })
+                    .collect());
+            }
+        }
+
+        // Fallback: brute-force scan.
+        let segment_paths = self.segment_manager.segment_paths()?;
+
+        // Collect all live sparse vectors for the target field across segments.
+        let mut all_sparse: Vec<SparseVector> = Vec::new();
+        let mut all_ids: Vec<i64> = Vec::new();
+        let mut shadowed: HashSet<i64> = HashSet::new();
+
+        for segment in &segment_paths {
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let sparse_rows =
+                load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
+            let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+            for row_idx in (0..stored_ids.len()).rev() {
+                let ext_id = stored_ids[row_idx];
+                if !shadowed.insert(ext_id) {
+                    continue;
+                }
+                if tombstone.is_deleted(row_idx) {
+                    continue;
+                }
+                if let Some(sv) = sparse_rows[row_idx].get(field_name) {
+                    all_sparse.push(sv.clone());
+                    all_ids.push(ext_id);
+                }
+            }
+        }
+
+        let tombstone = TombstoneMask::new(all_ids.len());
+        search_sparse_bruteforce(&all_sparse, &all_ids, &tombstone, query, top_k)
     }
 
     pub fn query_with_context(&self, context: &QueryContext) -> io::Result<Vec<DocumentHit>> {
@@ -1337,23 +1581,30 @@ impl CollectionHandle {
                     if let Some(optimized) = state.optimized_ann.as_ref() {
                         // Fetch payloads for all indexed vectors to evaluate filter
                         let documents = self.fetch_documents(&optimized.ann_external_ids)?;
-                        let bitset = hannsdb_index::bitset::filter_to_bitset(
-                            documents.len(),
-                            |i| filter.matches(&documents[i].fields),
-                        );
-                        let ann_hits = ann_search_with_bitset(
-                            optimized.backend.as_ref(),
-                            &optimized.ann_external_ids,
-                            &optimized.metric,
-                            &plan.vector,
-                            plan.top_k,
-                            ef_search,
-                            &bitset,
-                        )?;
+                        let bitset =
+                            hannsdb_index::bitset::filter_to_bitset(documents.len(), |i| {
+                                filter.matches(&documents[i].fields)
+                            });
+                        let ann_hits = match &plan.vector {
+                            crate::query::QueryVector::Dense(v) => ann_search_with_bitset(
+                                optimized.backend.as_ref(),
+                                &optimized.ann_external_ids,
+                                &optimized.metric,
+                                v,
+                                plan.top_k,
+                                ef_search,
+                                &bitset,
+                            )?,
+                            crate::query::QueryVector::Sparse(_) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "sparse queries cannot use ANN pre-filter path",
+                                ));
+                            }
+                        };
                         // Hits already have correct external IDs; fetch for output fields
-                        let fetched = self.fetch_documents(
-                            &ann_hits.iter().map(|h| h.id).collect::<Vec<_>>(),
-                        )?;
+                        let fetched = self
+                            .fetch_documents(&ann_hits.iter().map(|h| h.id).collect::<Vec<_>>())?;
                         let mut doc_hits: Vec<DocumentHit> = ann_hits
                             .into_iter()
                             .zip(fetched)
@@ -1376,10 +1627,19 @@ impl CollectionHandle {
                 } else {
                     plan.top_k
                 };
+                let query_vec = match &plan.vector {
+                    crate::query::QueryVector::Dense(v) => v.clone(),
+                    crate::query::QueryVector::Sparse(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "sparse queries cannot use the legacy single-vector fast path",
+                        ));
+                    }
+                };
                 let mut hits = self.query_documents_for_field_with_ef_internal(
                     &collection_meta,
                     &plan.field_name,
-                    &plan.vector,
+                    &query_vec,
                     search_k,
                     ef_search,
                     context.include_vector,
@@ -1388,6 +1648,14 @@ impl CollectionHandle {
                 if let Some(filter) = &plan.filter {
                     hits.retain(|hit| filter.matches(&hit.fields));
                     hits.truncate(plan.top_k);
+                }
+
+                if let Some(order_by) = &plan.order_by {
+                    sort_document_hits_by_field(
+                        &mut hits,
+                        &order_by.field_name,
+                        order_by.descending,
+                    );
                 }
 
                 project_document_hits(&mut hits, plan.output_fields.as_deref());
@@ -1418,11 +1686,8 @@ impl CollectionHandle {
 
         for vector_schema in &collection_meta.vectors {
             let field_name = &vector_schema.name;
-            let Some(descriptor) = resolve_vector_descriptor_for_field(
-                &collection_meta,
-                &index_catalog,
-                field_name,
-            )?
+            let Some(descriptor) =
+                resolve_vector_descriptor_for_field(&collection_meta, &index_catalog, field_name)?
             else {
                 continue;
             };
@@ -1436,10 +1701,7 @@ impl CollectionHandle {
                 let blob_path = ann_blob_path(&paths.dir, field_name);
                 if let Some(parent) = blob_path.parent() {
                     if let Err(e) = fs::create_dir_all(parent) {
-                        log::warn!(
-                            "Failed to create ANN dir for field '{}': {e}",
-                            field_name
-                        );
+                        log::warn!("Failed to create ANN dir for field '{}': {e}", field_name);
                         cache.insert(state.field_name.clone(), state);
                         continue;
                     }
@@ -1463,10 +1725,7 @@ impl CollectionHandle {
                             .flat_map(|id| id.to_le_bytes())
                             .collect();
                         if let Err(e) = fs::write(&ids_path, &ids_bytes) {
-                            log::warn!(
-                                "Failed to persist ANN ids for '{}': {e}",
-                                field_name
-                            );
+                            log::warn!("Failed to persist ANN ids for '{}': {e}", field_name);
                         }
                     }
                 }
@@ -1485,8 +1744,7 @@ impl CollectionHandle {
             let mut all_ids: Vec<i64> = Vec::new();
             for segment in &segment_paths {
                 let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-                let payloads =
-                    load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+                let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
                 let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
                 for (row_idx, ext_id) in stored_ids.iter().enumerate() {
                     if tombstone.is_deleted(row_idx) {
@@ -1526,6 +1784,122 @@ impl CollectionHandle {
                     index.all_indexed_ids().len(),
                 );
                 scalar_cache.insert(field_name.clone(), index);
+            }
+        }
+
+        // Build sparse indexes for sparse vector fields.
+        use crate::document::FieldType;
+        use hannsdb_index::descriptor::{SparseIndexDescriptor, SparseIndexKind};
+        use hannsdb_index::factory::DefaultIndexFactory;
+
+        let sparse_fields: Vec<_> = collection_meta
+            .vectors
+            .iter()
+            .filter(|v| v.data_type == FieldType::VectorSparse)
+            .collect();
+
+        if !sparse_fields.is_empty() {
+            let segment_paths = self.segment_manager.segment_paths()?;
+
+            for vector_schema in &sparse_fields {
+                let field_name = &vector_schema.name;
+                let mut all_sparse: Vec<(i64, SparseVectorData)> = Vec::new();
+                let mut shadowed: HashSet<i64> = HashSet::new();
+
+                for segment in &segment_paths {
+                    let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+                    let sparse_rows =
+                        load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
+                    let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+                    for row_idx in (0..stored_ids.len()).rev() {
+                        let ext_id = stored_ids[row_idx];
+                        if !shadowed.insert(ext_id) {
+                            continue;
+                        }
+                        if tombstone.is_deleted(row_idx) {
+                            continue;
+                        }
+                        if let Some(sv) = sparse_rows[row_idx].get(field_name) {
+                            all_sparse.push((
+                                ext_id,
+                                SparseVectorData::new(sv.indices.clone(), sv.values.clone()),
+                            ));
+                        }
+                    }
+                }
+
+                if all_sparse.is_empty() {
+                    continue;
+                }
+
+                let descriptor = SparseIndexDescriptor {
+                    field_name: field_name.clone(),
+                    kind: SparseIndexKind::SparseInverted,
+                    metric: Some("ip".to_string()),
+                    params: serde_json::Value::Object(serde_json::Map::new()),
+                };
+
+                let factory = DefaultIndexFactory::default();
+                let mut index = factory
+                    .create_sparse_index(&descriptor, None)
+                    .map_err(|e| {
+                        io::Error::new(io::ErrorKind::Other, format!("sparse index create: {e:?}"))
+                    })?;
+
+                index.add(&all_sparse).map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("sparse index build: {e:?}"))
+                })?;
+
+                // Pass BM25 params from the vector field schema to the sparse index.
+                if let Some(bm25_params) = &vector_schema.bm25_params {
+                    index.set_bm25_params(bm25_params.k1, bm25_params.b, bm25_params.avgdl);
+                    log::info!(
+                        "Set BM25 params (k1={}, b={}, avgdl={}) on sparse index for field '{}' in collection '{}'",
+                        bm25_params.k1, bm25_params.b, bm25_params.avgdl,
+                        field_name,
+                        self.name,
+                    );
+                }
+
+                log::info!(
+                    "Built sparse index for field '{}' in collection '{}' ({} vectors)",
+                    field_name,
+                    self.name,
+                    index.len(),
+                );
+
+                // Persist to disk.
+                if let Ok(Some(bytes)) = index.serialize_to_bytes() {
+                    let blob_path = paths
+                        .dir
+                        .join("ann")
+                        .join(format!("{field_name}.sparse.bin"));
+                    if let Some(parent) = blob_path.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            log::warn!(
+                                "Failed to create ANN dir for sparse field '{}': {e}",
+                                field_name
+                            );
+                        }
+                    }
+                    if let Err(e) = fs::write(&blob_path, &bytes) {
+                        log::warn!("Failed to persist sparse index for '{}': {e}", field_name);
+                    } else {
+                        log::info!(
+                            "Persisted sparse index ({} bytes) for field '{}' in collection '{}'",
+                            bytes.len(),
+                            field_name,
+                            self.name
+                        );
+                    }
+                }
+
+                let mut sparse_cache = self
+                    .sparse_index_cache
+                    .lock()
+                    .expect("sparse index cache mutex poisoned");
+                sparse_cache.insert(field_name.clone(), index);
             }
         }
 
@@ -1641,16 +2015,17 @@ impl CollectionHandle {
                     .into_iter()
                     .zip(documents)
                     .map(|(hit, document)| {
-                        let vectors = if include_vector {
-                            document.vectors_with_primary(
+                        let vectors =
+                            if include_vector {
+                                document.vectors_with_primary(
                                 collection_meta
                                     .expect("collection metadata must exist when include_vector")
                                     .primary_vector
                                     .as_str(),
                             ).clone()
-                        } else {
-                            BTreeMap::new()
-                        };
+                            } else {
+                                BTreeMap::new()
+                            };
                         DocumentHit {
                             id: hit.id,
                             distance: hit.distance,
@@ -1698,7 +2073,9 @@ impl CollectionHandle {
             .zip(documents)
             .map(|(hit, document)| {
                 let vectors = if include_vector {
-                    document.vectors_with_primary(collection_meta.primary_vector.as_str()).clone()
+                    document
+                        .vectors_with_primary(collection_meta.primary_vector.as_str())
+                        .clone()
                 } else {
                     BTreeMap::new()
                 };
@@ -1775,7 +2152,9 @@ impl CollectionHandle {
         }
 
         for (hit, document) in hits.iter_mut().zip(documents) {
-            hit.vectors = document.vectors_with_primary(collection_meta.primary_vector.as_str()).clone();
+            hit.vectors = document
+                .vectors_with_primary(collection_meta.primary_vector.as_str())
+                .clone();
         }
         Ok(())
     }
@@ -1794,6 +2173,14 @@ impl CollectionHandle {
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let segment_paths = self.segment_manager.segment_paths()?;
 
+        // Compute the minimal set of payload fields needed for filter evaluation.
+        let filter_fields: Vec<String> = filter_expr.referenced_fields().into_iter().collect();
+        let projection = if filter_fields.is_empty() {
+            None
+        } else {
+            Some(filter_fields.as_slice())
+        };
+
         // Try to extract candidate IDs from scalar indexes.
         // For now we handle the simplest case: a single Eq or InList clause
         // on a field that has a scalar index.
@@ -1801,9 +2188,17 @@ impl CollectionHandle {
 
         let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
         for segment in segment_paths {
-            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let records = load_records_or_empty(
+                &segment.records,
+                collection_meta.dimension,
+                collection_meta.primary_is_fp16(),
+            )?;
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let payloads = if projection.is_some() {
+                load_payloads_with_fields_or_empty(&segment.payloads, stored_ids.len(), projection)?
+            } else {
+                load_payloads_or_empty(&segment.payloads, stored_ids.len())?
+            };
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
             if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
@@ -1879,21 +2274,11 @@ impl CollectionHandle {
                 let scalar_value = field_value_to_scalar(value);
                 match op {
                     ComparisonOp::Eq => Some(index.lookup_eq(&scalar_value)),
-                    ComparisonOp::Ne => {
-                        Some(index.lookup_range(RangeOp::Ne, &scalar_value))
-                    }
-                    ComparisonOp::Gt => {
-                        Some(index.lookup_range(RangeOp::Gt, &scalar_value))
-                    }
-                    ComparisonOp::Gte => {
-                        Some(index.lookup_range(RangeOp::Gte, &scalar_value))
-                    }
-                    ComparisonOp::Lt => {
-                        Some(index.lookup_range(RangeOp::Lt, &scalar_value))
-                    }
-                    ComparisonOp::Lte => {
-                        Some(index.lookup_range(RangeOp::Lte, &scalar_value))
-                    }
+                    ComparisonOp::Ne => Some(index.lookup_range(RangeOp::Ne, &scalar_value)),
+                    ComparisonOp::Gt => Some(index.lookup_range(RangeOp::Gt, &scalar_value)),
+                    ComparisonOp::Gte => Some(index.lookup_range(RangeOp::Gte, &scalar_value)),
+                    ComparisonOp::Lt => Some(index.lookup_range(RangeOp::Lt, &scalar_value)),
+                    ComparisonOp::Lte => Some(index.lookup_range(RangeOp::Lte, &scalar_value)),
                 }
             }
             FilterExpr::InList {
@@ -1914,8 +2299,7 @@ impl CollectionHandle {
                     match (result.take(), sub) {
                         (None, Some(s)) => result = Some(s),
                         (Some(r), Some(s)) => {
-                            let intersection: BTreeSet<i64> =
-                                r.intersection(&s).cloned().collect();
+                            let intersection: BTreeSet<i64> = r.intersection(&s).cloned().collect();
                             result = Some(intersection);
                         }
                         (prior, None) => result = prior,
@@ -1983,7 +2367,11 @@ impl CollectionHandle {
             })?;
 
         let (records, external_ids) = if field_name == collection_meta.primary_vector {
-            load_shadowed_live_records(&self.segment_manager, vector_schema.dimension)?
+            load_shadowed_live_records(
+                &self.segment_manager,
+                vector_schema.dimension,
+                collection_meta.primary_is_fp16(),
+            )?
         } else {
             load_shadowed_live_vector_records(
                 &self.segment_manager,
@@ -2069,16 +2457,17 @@ impl CollectionHandle {
 
         for segment in &segment_paths {
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let records = load_records_or_empty(&segment.records, collection_meta.dimension)?;
+            let records = load_records_or_empty(
+                &segment.records,
+                collection_meta.dimension,
+                collection_meta.primary_is_fp16(),
+            )?;
             let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
             let vectors = load_vectors_or_empty(&segment.vectors, stored_ids.len())?;
+            let sparse = load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
-            if stored_ids
-                .len()
-                .saturating_mul(collection_meta.dimension)
-                != records.len()
-            {
+            if stored_ids.len().saturating_mul(collection_meta.dimension) != records.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "records and ids are not aligned",
@@ -2106,6 +2495,7 @@ impl CollectionHandle {
                         id: ext_id,
                         fields: payloads[row_idx].clone(),
                         vectors: doc_vectors,
+                        sparse_vectors: sparse.get(row_idx).cloned().unwrap_or_default(),
                     },
                 );
             }
@@ -2133,14 +2523,11 @@ impl CollectionHandle {
             let paths = self.collection_paths();
             let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
             let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
-            let descriptor = resolve_vector_descriptor_for_field(
-                &collection_meta,
-                &index_catalog,
-                field_name,
-            )?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "no descriptor for field")
-            })?;
+            let descriptor =
+                resolve_vector_descriptor_for_field(&collection_meta, &index_catalog, field_name)?
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "no descriptor for field")
+                    })?;
 
             // Try new per-field path first
             let new_path = ann_blob_path(&paths.dir, field_name);
@@ -2177,7 +2564,7 @@ impl CollectionHandle {
             match fs::read(&blob_path).and_then(|bytes| {
                 DefaultIndexFactory::default()
                     .create_vector_index(vector_schema.dimension, &descriptor, Some(&bytes))
-                    .map_err(adapter_error_to_io)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
             }) {
                 Ok(backend) => {
                     // Try to load persisted external IDs (avoids needing records.bin).
@@ -2245,6 +2632,11 @@ impl CollectionHandle {
             .lock()
             .expect("document cache mutex poisoned");
         *doc_cache = None;
+        let mut sparse_cache = self
+            .sparse_index_cache
+            .lock()
+            .expect("sparse index cache mutex poisoned");
+        sparse_cache.clear();
     }
 
     fn refresh_version_set(&self) -> io::Result<()> {
@@ -2269,16 +2661,50 @@ fn project_document_hits(hits: &mut [DocumentHit], output_fields: Option<&[Strin
     }
 }
 
+fn sort_document_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bool) {
+    hits.sort_by(|a, b| {
+        let av = a.fields.get(field_name);
+        let bv = b.fields.get(field_name);
+        let ord = match (av, bv) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(av), Some(bv)) => compare_field_values_for_sort(av, bv),
+        };
+        if descending { ord.reverse() } else { ord }.then_with(|| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        })
+    });
+}
+
+fn compare_field_values_for_sort(a: &FieldValue, b: &FieldValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
+        (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
+        (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
+        (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
+        (FieldValue::UInt64(va), FieldValue::UInt64(vb)) => va.cmp(vb),
+        (FieldValue::Float(va), FieldValue::Float(vb)) => va.total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Float64(vb)) => va.total_cmp(vb),
+        (FieldValue::Bool(va), FieldValue::Bool(vb)) => va.cmp(vb),
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
+}
+
 fn load_shadowed_live_records(
     segment_manager: &SegmentManager,
     dimension: usize,
+    fp16: bool,
 ) -> io::Result<(Vec<f32>, Vec<i64>)> {
     let mut records = Vec::new();
     let mut external_ids = Vec::new();
     let mut shadowed_ids = HashSet::new();
 
     for segment in segment_manager.segment_paths()? {
-        let segment_records = load_records_or_empty(&segment.records, dimension)?;
+        let segment_records = load_records_or_empty(&segment.records, dimension, fp16)?;
         let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
@@ -2378,6 +2804,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
         external_ids: dir.join("ids.bin"),
         payloads: dir.join("payloads.jsonl"),
         vectors: dir.join("vectors.jsonl"),
+        sparse_vectors: dir.join("sparse_vectors.jsonl"),
         tombstones: dir.join("tombstones.json"),
     }
 }
@@ -2393,6 +2820,7 @@ struct CollectionPaths {
     external_ids: PathBuf,
     payloads: PathBuf,
     vectors: PathBuf,
+    sparse_vectors: PathBuf,
     tombstones: PathBuf,
 }
 
@@ -2590,6 +3018,14 @@ fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
         FieldValue::Float(v) => ScalarValue::Float64(*v as f64),
         FieldValue::Float64(v) => ScalarValue::Float64(*v),
         FieldValue::Bool(b) => ScalarValue::Bool(*b),
+        FieldValue::Array(items) => {
+            // Flatten: use first element's scalar value if available.
+            // Array fields are not directly indexable as scalar indexes.
+            match items.first() {
+                Some(first) => field_value_to_scalar(first),
+                None => ScalarValue::String("[]".to_string()),
+            }
+        }
     }
 }
 
@@ -2605,8 +3041,13 @@ fn next_compacted_segment_id<'a>(segment_ids: impl Iterator<Item = &'a String>) 
     format!("seg-{:06}", max_id.saturating_add(1))
 }
 
-fn load_records_or_empty(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {
-    match load_records(path, dimension) {
+fn load_records_or_empty(path: &Path, dimension: usize, fp16: bool) -> io::Result<Vec<f32>> {
+    let result = if fp16 {
+        load_records_f16(path, dimension)
+    } else {
+        load_records(path, dimension)
+    };
+    match result {
         Ok(records) => Ok(records),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err),
@@ -2680,6 +3121,58 @@ fn load_vectors_or_empty(
     }
 }
 
+fn load_payloads_with_fields_or_empty(
+    path: &Path,
+    expected_rows: usize,
+    fields: Option<&[String]>,
+) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    match load_payloads_with_fields(path, fields) {
+        Ok(mut payloads) => {
+            if payloads.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload row count exceeds record row count",
+                ));
+            }
+            if payloads.len() < expected_rows {
+                payloads.resize_with(expected_rows, BTreeMap::new);
+            }
+            Ok(payloads)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(vec![BTreeMap::new(); expected_rows])
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn load_sparse_vectors_or_empty(
+    path: &Path,
+    expected_rows: usize,
+) -> io::Result<Vec<BTreeMap<String, crate::document::SparseVector>>> {
+    match load_sparse_vectors(path) {
+        Ok(vectors) => {
+            if vectors.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse vector row count exceeds record row count",
+                ));
+            }
+            if vectors.len() < expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse vector row count is shorter than record row count",
+                ));
+            }
+            Ok(vectors)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(vec![BTreeMap::new(); expected_rows])
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn validate_documents(
     documents: &[Document],
     collection_meta: &CollectionMetadata,
@@ -2704,15 +3197,18 @@ fn validate_documents(
                 format!("duplicate external id in batch: {}", document.id),
             ));
         }
-        let primary_vector = document.vectors.get(collection_meta.primary_vector.as_str()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "document is missing primary vector '{}'",
-                    collection_meta.primary_vector
-                ),
-            )
-        })?;
+        let primary_vector = document
+            .vectors
+            .get(collection_meta.primary_vector.as_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document is missing primary vector '{}'",
+                        collection_meta.primary_vector
+                    ),
+                )
+            })?;
         if primary_vector.len() != collection_meta.dimension {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2756,12 +3252,14 @@ fn append_documents(
     existing_rows: usize,
     primary_vector_name: &str,
     documents: &[Document],
+    fp16: bool,
 ) -> io::Result<usize> {
     ensure_vector_rows(&paths.vectors, existing_rows)?;
     let mut ids = Vec::with_capacity(documents.len());
     let mut records = Vec::with_capacity(documents.len().saturating_mul(dimension));
     let mut payloads = Vec::with_capacity(documents.len());
     let mut vectors = Vec::with_capacity(documents.len());
+    let mut sparse_vecs = Vec::with_capacity(documents.len());
     for document in documents {
         ids.push(document.id);
         let primary = document.vectors.get(primary_vector_name).ok_or_else(|| {
@@ -2778,66 +3276,19 @@ fn append_documents(
         let mut secondary = document.vectors.clone();
         secondary.remove(primary_vector_name);
         vectors.push(secondary);
+        sparse_vecs.push(document.sparse_vectors.clone());
     }
 
-    let inserted = append_records(&paths.records, dimension, &records)?;
+    let inserted = if fp16 {
+        append_records_f16(&paths.records, dimension, &records)?
+    } else {
+        append_records(&paths.records, dimension, &records)?
+    };
     let _ = append_record_ids(&paths.external_ids, &ids)?;
     let _ = append_payloads(&paths.payloads, &payloads)?;
     let _ = append_vectors(&paths.vectors, &vectors)?;
+    let _ = append_sparse_vectors(&paths.sparse_vectors, &sparse_vecs)?;
     Ok(inserted)
-}
-
-/// Count non-empty lines in a JSONL file without parsing the content.
-fn count_jsonl_lines(path: &Path) -> io::Result<usize> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    Ok(reader.lines().filter(|l| l.as_ref().map_or(false, |s| !s.is_empty())).count())
-}
-
-fn ensure_vector_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
-    match count_jsonl_lines(path) {
-        Ok(count) => {
-            if count != existing_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vector row count is misaligned with existing records",
-                ));
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            if existing_rows > 0 {
-                let _ = append_vectors(path, &vec![BTreeMap::new(); existing_rows])?;
-            }
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn ensure_payload_rows(path: &Path, expected_rows: usize) -> io::Result<()> {
-    match count_jsonl_lines(path) {
-        Ok(count) => {
-            if count > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload row count exceeds record row count",
-                ));
-            }
-            if count < expected_rows {
-                let missing = vec![BTreeMap::new(); expected_rows - count];
-                let _ = append_payloads(path, &missing)?;
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            if expected_rows > 0 {
-                let _ = append_payloads(path, &vec![BTreeMap::new(); expected_rows])?;
-            }
-            Ok(())
-        }
-        Err(err) => Err(err),
-    }
 }
 
 fn has_live_id(stored_ids: &[i64], tombstone: &TombstoneMask, external_id: i64) -> bool {
@@ -2957,19 +3408,6 @@ fn validate_vector_index_descriptor(
         .create_vector_index(dimension, descriptor, None)
         .map(|_| ())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
-}
-
-fn invalidate_ann_blobs(collection_dir: &Path) -> io::Result<()> {
-    let ann_dir = collection_dir.join("ann");
-    if ann_dir.exists() {
-        fs::remove_dir_all(&ann_dir)?;
-    }
-    // Also clean up legacy single-file blob if it exists
-    let old_path = collection_dir.join(HNSW_INDEX_FILE);
-    if old_path.exists() {
-        fs::remove_file(&old_path)?;
-    }
-    Ok(())
 }
 
 fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::Result<()> {
@@ -3115,156 +3553,6 @@ fn resolve_primary_vector_descriptor(
         metric,
         params,
     })
-}
-
-fn build_optimized_ann_state(
-    state: &CachedSearchState,
-    index_bytes_out: Option<&mut Option<Vec<u8>>>,
-) -> io::Result<OptimizedAnnState> {
-    let metric = state
-        .descriptor
-        .metric
-        .clone()
-        .unwrap_or_else(|| state.metric.clone())
-        .to_ascii_lowercase();
-    let (ann_external_ids, flat_vectors) = if state.tombstone.deleted_count() == 0 {
-        // No tombstones: pass Arc references directly — no 293MB clone needed.
-        (
-            Arc::clone(&state.external_ids),
-            Arc::clone(&state.records),
-        )
-    } else {
-        let live_count = state
-            .external_ids
-            .len()
-            .saturating_sub(state.tombstone.deleted_count());
-        let mut live_external_ids = Vec::with_capacity(live_count);
-        let mut flat_vectors = Vec::with_capacity(live_count.saturating_mul(state.dimension));
-        for (row_idx, vector) in state.records.chunks_exact(state.dimension).enumerate() {
-            if state.tombstone.is_deleted(row_idx) {
-                continue;
-            }
-            flat_vectors.extend_from_slice(vector);
-            live_external_ids.push(state.external_ids[row_idx]);
-        }
-        (Arc::new(live_external_ids), Arc::new(flat_vectors))
-    };
-
-    let mut backend = DefaultIndexFactory::default()
-        .create_vector_index(state.dimension, &state.descriptor, None)
-        .map_err(adapter_error_to_io)?;
-    if !flat_vectors.is_empty() {
-        backend
-            .insert_flat_identity(&flat_vectors, state.dimension)
-            .map_err(adapter_error_to_io)?;
-    }
-    if let Some(index_bytes_out) = index_bytes_out {
-        *index_bytes_out = backend.serialize_to_bytes().map_err(adapter_error_to_io)?;
-    }
-
-    Ok(OptimizedAnnState {
-        backend: Arc::from(backend),
-        ann_external_ids,
-        metric,
-    })
-}
-
-fn ann_search(
-    backend: &dyn VectorIndexBackend,
-    ann_external_ids: &[i64],
-    metric: &str,
-    query: &[f32],
-    top_k: usize,
-    ef_search: usize,
-) -> io::Result<Vec<SearchHit>> {
-    if top_k == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut ids_buf = vec![0_i64; top_k];
-    let mut dists_buf = vec![0.0_f32; top_k];
-    let n = backend
-        .search_into(query, top_k, ef_search, &mut ids_buf, &mut dists_buf)
-        .map_err(adapter_error_to_io)?;
-    let mut mapped = Vec::with_capacity(n);
-    for i in 0..n {
-        let ann_idx = usize::try_from(ids_buf[i]).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "optimized ANN hit id cannot be converted to usize",
-            )
-        })?;
-        let external_id = ann_external_ids.get(ann_idx).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("optimized ANN hit id out of range: {}", ids_buf[i]),
-            )
-        })?;
-        let distance = match metric {
-            "l2" => dists_buf[i].max(0.0),
-            "ip" => -dists_buf[i],
-            _ => dists_buf[i],
-        };
-        mapped.push(SearchHit {
-            id: external_id,
-            distance,
-        });
-    }
-    Ok(mapped)
-}
-
-#[cfg(feature = "hanns-backend")]
-fn ann_search_with_bitset(
-    backend: &dyn VectorIndexBackend,
-    ann_external_ids: &[i64],
-    metric: &str,
-    query: &[f32],
-    top_k: usize,
-    ef_search: usize,
-    bitset: &hannsdb_index::BitsetView,
-) -> io::Result<Vec<SearchHit>> {
-    if top_k == 0 {
-        return Ok(Vec::new());
-    }
-    let hits = backend
-        .search_with_bitset(query, top_k, ef_search, bitset)
-        .map_err(adapter_error_to_io)?;
-    let mut mapped = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let ann_idx = usize::try_from(hit.id).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "optimized ANN hit id cannot be converted to usize",
-            )
-        })?;
-        let external_id = ann_external_ids.get(ann_idx).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("optimized ANN hit id out of range: {}", hit.id),
-            )
-        })?;
-        let distance = match metric {
-            "l2" => hit.distance.max(0.0),
-            "ip" => -hit.distance,
-            _ => hit.distance,
-        };
-        mapped.push(SearchHit {
-            id: external_id,
-            distance,
-        });
-    }
-    Ok(mapped)
-}
-
-fn adapter_error_to_io(err: AdapterError) -> io::Error {
-    match err {
-        AdapterError::InvalidDimension { expected, got } => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("dimension mismatch: expected {expected}, got {got}"),
-        ),
-        AdapterError::EmptyInsert => io::Error::new(io::ErrorKind::InvalidInput, "empty insert"),
-        AdapterError::Backend(msg) => io::Error::other(msg),
-    }
 }
 
 #[cfg(test)]
@@ -3434,5 +3722,397 @@ mod tests {
         )
         .expect("insert documents");
         db
+    }
+
+    #[test]
+    fn auto_compact_triggers_after_threshold() {
+        use crate::segment::segment_set::COMPACTION_THRESHOLD;
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        let dim = 2usize;
+
+        // Manually create COMPACTION_THRESHOLD immutable segments + an active one.
+        let paths = collection_paths_for_root(tempdir.path(), "docs");
+        let seg_manager = SegmentManager::new(paths.dir.clone());
+
+        // Create immutable segments
+        let mut immutable_ids = Vec::new();
+        for i in 0..COMPACTION_THRESHOLD {
+            let seg_id = format!("seg-{:06}", i + 1);
+            seg_manager
+                .create_segment_dir(&seg_id, dim)
+                .expect("create seg");
+            let seg_paths =
+                SegmentPaths::from_segment_dir(paths.segments_dir.join(&seg_id), seg_id.clone());
+            let ids = vec![i as i64 * 10 + 1];
+            let vectors = vec![1.0_f32, 0.0];
+            append_records(&seg_paths.records, dim, &vectors).expect("append");
+            append_record_ids(&seg_paths.external_ids, &ids).expect("append ids");
+            let mut meta = SegmentMetadata::load_from_path(&seg_paths.metadata).expect("meta");
+            meta.record_count = 1;
+            meta.save_to_path(&seg_paths.metadata).expect("save meta");
+            TombstoneMask::new(1)
+                .save_to_path(&seg_paths.tombstones)
+                .expect("save tombstones");
+            immutable_ids.push(seg_id);
+        }
+
+        // Create active segment
+        let active_id = format!("seg-{:06}", COMPACTION_THRESHOLD + 1);
+        seg_manager
+            .create_segment_dir(&active_id, dim)
+            .expect("create active seg");
+        let active_paths =
+            SegmentPaths::from_segment_dir(paths.segments_dir.join(&active_id), active_id.clone());
+        let active_ids = vec![999];
+        let active_vectors = vec![1.0_f32, 0.0];
+        append_records(&active_paths.records, dim, &active_vectors).expect("append");
+        append_record_ids(&active_paths.external_ids, &active_ids).expect("append ids");
+        let mut meta = SegmentMetadata::load_from_path(&active_paths.metadata).expect("meta");
+        meta.record_count = 1;
+        meta.save_to_path(&active_paths.metadata)
+            .expect("save meta");
+        TombstoneMask::new(1)
+            .save_to_path(&active_paths.tombstones)
+            .expect("save tombstones");
+
+        let vs = VersionSet::new(active_id, immutable_ids);
+        vs.save_to_path(&seg_manager.version_set_path())
+            .expect("save vs");
+
+        // Call compact_collection directly — same code path as auto-trigger.
+        db.compact_collection("docs").expect("compact");
+
+        let segments = db.list_collection_segments("docs").expect("segments");
+        assert!(
+            segments.len() <= 2,
+            "expected compaction to reduce segments to <= 2 (active + compacted), got {}",
+            segments.len()
+        );
+
+        // Verify data is intact.
+        let info = db.get_collection_info("docs").expect("info");
+        assert_eq!(
+            info.live_count,
+            COMPACTION_THRESHOLD + 1,
+            "all live documents should survive compaction"
+        );
+
+        let hits = db.search("docs", &[1.0, 0.0], 5).expect("search");
+        assert_eq!(hits.len(), COMPACTION_THRESHOLD + 1);
+    }
+
+    #[test]
+    fn compact_output_is_arrow_format() {
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        let dim = 2usize;
+        let paths = collection_paths_for_root(tempdir.path(), "docs");
+        let seg_manager = SegmentManager::new(paths.dir.clone());
+
+        // Create 3 immutable segments with data.
+        let mut immutable_ids = Vec::new();
+        for i in 0..3 {
+            let seg_id = format!("seg-{:06}", i + 1);
+            seg_manager
+                .create_segment_dir(&seg_id, dim)
+                .expect("create seg");
+            let seg_paths =
+                SegmentPaths::from_segment_dir(paths.segments_dir.join(&seg_id), seg_id.clone());
+            let ids = vec![i as i64 * 10 + 1];
+            let vectors = vec![1.0_f32, 0.0];
+            append_records(&seg_paths.records, dim, &vectors).expect("append");
+            append_record_ids(&seg_paths.external_ids, &ids).expect("append ids");
+            let mut meta = SegmentMetadata::load_from_path(&seg_paths.metadata).expect("meta");
+            meta.record_count = 1;
+            meta.save_to_path(&seg_paths.metadata).expect("save meta");
+            TombstoneMask::new(1)
+                .save_to_path(&seg_paths.tombstones)
+                .expect("save tombstones");
+            immutable_ids.push(seg_id);
+        }
+
+        // Create active segment.
+        let active_id = "seg-0004".to_string();
+        seg_manager
+            .create_segment_dir(&active_id, dim)
+            .expect("create active seg");
+        let vs = VersionSet::new(active_id, immutable_ids);
+        vs.save_to_path(&seg_manager.version_set_path())
+            .expect("save vs");
+
+        db.compact_collection("docs").expect("compact");
+
+        // Verify compacted segment has arrow files.
+        let version_set = VersionSet::load_from_path(&paths.segment_set).expect("vs");
+        let immutables = version_set.immutable_segment_ids();
+        assert_eq!(immutables.len(), 1, "should have 1 compacted segment");
+
+        let compacted_dir = paths.segments_dir.join(&immutables[0]);
+        assert!(
+            compacted_dir.join("payloads.arrow").exists(),
+            "compacted segment should have payloads.arrow"
+        );
+        assert!(
+            compacted_dir.join("vectors.arrow").exists(),
+            "compacted segment should have vectors.arrow"
+        );
+    }
+
+    #[test]
+    fn atomic_save_no_tmp_residual() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("test.json");
+        let vs = VersionSet::single("seg-0001");
+        vs.save_to_path(&path).expect("save");
+        assert!(path.exists(), "file should exist");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "tmp file should not remain after atomic save"
+        );
+        let loaded = VersionSet::load_from_path(&path).expect("load");
+        assert_eq!(loaded, vs);
+    }
+
+    #[test]
+    fn order_by_scalar_field_ascending() {
+        use crate::query::{OrderBy, QueryContext, QueryVector, VectorQuery};
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        db.insert_documents(
+            "docs",
+            &[
+                Document::new(1, [("score".into(), FieldValue::Int64(10))], vec![1.0, 0.0]),
+                Document::new(2, [("score".into(), FieldValue::Int64(30))], vec![0.5, 0.0]),
+                Document::new(3, [("score".into(), FieldValue::Int64(20))], vec![0.8, 0.0]),
+            ],
+        )
+        .expect("insert");
+
+        let ctx = QueryContext {
+            top_k: 10,
+            queries: vec![VectorQuery {
+                field_name: "vector".to_string(),
+                vector: QueryVector::Dense(vec![0.0, 0.0]),
+                param: None,
+            }],
+            order_by: Some(OrderBy {
+                field_name: "score".to_string(),
+                descending: false,
+            }),
+            ..Default::default()
+        };
+
+        let hits = db.query_with_context("docs", &ctx).expect("query");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[1].id, 3);
+        assert_eq!(hits[2].id, 2);
+    }
+
+    #[test]
+    fn order_by_scalar_field_descending() {
+        use crate::query::{OrderBy, QueryContext, QueryVector, VectorQuery};
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        db.insert_documents(
+            "docs",
+            &[
+                Document::new(
+                    1,
+                    [("name".into(), FieldValue::String("alice".into()))],
+                    vec![1.0, 0.0],
+                ),
+                Document::new(
+                    2,
+                    [("name".into(), FieldValue::String("charlie".into()))],
+                    vec![0.5, 0.0],
+                ),
+                Document::new(
+                    3,
+                    [("name".into(), FieldValue::String("bob".into()))],
+                    vec![0.8, 0.0],
+                ),
+            ],
+        )
+        .expect("insert");
+
+        let ctx = QueryContext {
+            top_k: 10,
+            queries: vec![VectorQuery {
+                field_name: "vector".to_string(),
+                vector: QueryVector::Dense(vec![0.0, 0.0]),
+                param: None,
+            }],
+            order_by: Some(OrderBy {
+                field_name: "name".to_string(),
+                descending: true,
+            }),
+            ..Default::default()
+        };
+
+        let hits = db.query_with_context("docs", &ctx).expect("query");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[1].id, 3);
+        assert_eq!(hits[2].id, 1);
+    }
+
+    #[test]
+    fn order_by_rejects_vector_field() {
+        use crate::query::{OrderBy, QueryContext, QueryVector, VectorQuery};
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        let ctx = QueryContext {
+            top_k: 10,
+            queries: vec![VectorQuery {
+                field_name: "vector".to_string(),
+                vector: QueryVector::Dense(vec![0.0, 0.0]),
+                param: None,
+            }],
+            order_by: Some(OrderBy {
+                field_name: "vector".to_string(),
+                descending: false,
+            }),
+            ..Default::default()
+        };
+
+        let result = db.query_with_context("docs", &ctx);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn order_by_rejects_empty_field_name() {
+        use crate::query::{OrderBy, QueryContext, QueryVector, VectorQuery};
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        db.create_collection("docs", 2, "l2").expect("create");
+
+        let ctx = QueryContext {
+            top_k: 10,
+            queries: vec![VectorQuery {
+                field_name: "vector".to_string(),
+                vector: QueryVector::Dense(vec![0.0, 0.0]),
+                param: None,
+            }],
+            order_by: Some(OrderBy {
+                field_name: "".to_string(),
+                descending: false,
+            }),
+            ..Default::default()
+        };
+
+        let result = db.query_with_context("docs", &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sparse_vector_crud_and_search() {
+        use crate::document::{FieldType, SparseVector, VectorFieldSchema};
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+
+        // Create collection with a primary dense vector and a sparse vector field.
+        let mut schema = CollectionSchema::new("dense", 2, "l2", Vec::new());
+        schema.vectors.push(VectorFieldSchema {
+            name: "sparse_title".to_string(),
+            data_type: FieldType::VectorSparse,
+            dimension: 0, // sparse vectors have no fixed dimension
+            index_param: None,
+            bm25_params: None,
+        });
+        db.create_collection_with_schema("docs", &schema)
+            .expect("create collection");
+
+        let docs = &[
+            Document::with_sparse_vectors(
+                1,
+                [("label".into(), FieldValue::String("a".into()))],
+                "dense",
+                vec![1.0_f32, 0.0],
+                [(
+                    "sparse_title".to_string(),
+                    SparseVector::new(vec![0, 3, 7], vec![1.0, 2.0, 0.5]),
+                )],
+            ),
+            Document::with_sparse_vectors(
+                2,
+                [("label".into(), FieldValue::String("b".into()))],
+                "dense",
+                vec![0.0_f32, 1.0],
+                [(
+                    "sparse_title".to_string(),
+                    SparseVector::new(vec![1, 3, 5], vec![0.5, 3.0, 1.0]),
+                )],
+            ),
+            Document::with_sparse_vectors(
+                3,
+                [("label".into(), FieldValue::String("c".into()))],
+                "dense",
+                vec![0.5_f32, 0.5],
+                [(
+                    "sparse_title".to_string(),
+                    SparseVector::new(vec![0, 5], vec![2.0, 1.0]),
+                )],
+            ),
+        ];
+        db.insert_documents("docs", docs).expect("insert documents");
+
+        // Fetch and verify sparse vectors round-trip.
+        let fetched = db.fetch_documents("docs", &[1, 2, 3]).expect("fetch");
+        assert_eq!(fetched.len(), 3);
+        let doc1 = fetched.iter().find(|d| d.id == 1).expect("doc 1");
+        let sv1 = doc1
+            .sparse_vectors
+            .get("sparse_title")
+            .expect("sparse field");
+        assert_eq!(sv1.indices, vec![0, 3, 7]);
+        assert_eq!(sv1.values, vec![1.0, 2.0, 0.5]);
+
+        // Search sparse with a query that has high overlap with doc 2.
+        // Query: indices [1, 3, 5], values [1.0, 1.0, 1.0]
+        // IP(doc1): index 3 → 1.0*2.0 = 2.0
+        // IP(doc2): index 1→0.5*1.0, 3→3.0*1.0, 5→1.0*1.0 = 4.5
+        // IP(doc3): index 5→1.0*1.0 = 1.0
+        // Distance = -IP, so smallest distance wins: doc2 (−4.5) < doc1 (−2.0) < doc3 (−1.0)
+        let query = SparseVector::new(vec![1, 3, 5], vec![1.0, 1.0, 1.0]);
+        let hits = db
+            .search_sparse("docs", "sparse_title", &query, 3)
+            .expect("sparse search");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, 2);
+        assert!(hits[0].distance < hits[1].distance);
+        assert_eq!(hits[1].id, 1);
+        assert_eq!(hits[2].id, 3);
+    }
+
+    #[test]
+    fn sparse_inner_product_correctness() {
+        use crate::document::SparseVector;
+        use crate::query::sparse_inner_product;
+
+        let a = SparseVector::new(vec![0, 3, 7], vec![1.0, 2.0, 0.5]);
+        let b = SparseVector::new(vec![1, 3, 5], vec![0.5, 3.0, 1.0]);
+        // Only index 3 matches: 2.0 * 3.0 = 6.0
+        assert!((sparse_inner_product(&a, &b) - 6.0).abs() < 1e-6);
+
+        // Self product: 1*1 + 2*2 + 0.5*0.5 = 5.25
+        assert!((sparse_inner_product(&a, &a) - 5.25).abs() < 1e-6);
+
+        // No overlap
+        let c = SparseVector::new(vec![10, 20], vec![1.0, 1.0]);
+        assert!((sparse_inner_product(&a, &c)).abs() < 1e-6);
     }
 }

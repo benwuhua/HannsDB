@@ -1,10 +1,12 @@
 use std::io;
 
 use crate::catalog::{CollectionMetadata, IndexCatalog};
-use crate::document::{Document, VectorFieldSchema};
+use crate::document::{Document, FieldType, VectorFieldSchema};
 use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 
-use super::{parse_filter, FilterExpr, QueryContext, QueryGroupBy, VectorQuery};
+use super::{
+    parse_filter, FilterExpr, OrderBy, QueryContext, QueryGroupBy, QueryVector, VectorQuery,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum QueryPlan {
@@ -16,10 +18,11 @@ pub(crate) enum QueryPlan {
 pub(crate) struct LegacySingleVectorPlan {
     pub(crate) field_name: String,
     pub(crate) top_k: usize,
-    pub(crate) vector: Vec<f32>,
+    pub(crate) vector: QueryVector,
     pub(crate) ef_search: Option<usize>,
     pub(crate) output_fields: Option<Vec<String>>,
     pub(crate) filter: Option<FilterExpr>,
+    pub(crate) order_by: Option<OrderBy>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ pub(crate) struct BruteForceQueryPlan {
     pub(crate) group_by: Option<PlannedGroupBy>,
     pub(crate) output_fields: Option<Vec<String>>,
     pub(crate) reranker: Option<super::QueryReranker>,
+    pub(crate) order_by: Option<OrderBy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +46,7 @@ pub(crate) enum BruteForceExecutionMode {
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedRecallSource {
     pub(crate) kind: RecallSourceKind,
-    pub(crate) vector: Vec<f32>,
+    pub(crate) vector: QueryVector,
     pub(crate) metric: String,
 }
 
@@ -113,6 +117,11 @@ impl QueryPlanner {
         if is_single_vector_fast_path {
             let query = &context.queries[0];
             validate_vector_query(collection, index_catalog, query, true, false)?;
+            let order_by = context
+                .order_by
+                .as_ref()
+                .map(|ob| validate_order_by(collection, ob))
+                .transpose()?;
             return Ok(QueryPlan::LegacySingleVector(LegacySingleVectorPlan {
                 field_name: query.field_name.clone(),
                 top_k: context.top_k,
@@ -120,6 +129,7 @@ impl QueryPlanner {
                 ef_search: query.param.as_ref().and_then(|param| param.ef_search),
                 output_fields: context.output_fields.clone(),
                 filter: parsed_filter,
+                order_by,
             }));
         }
 
@@ -205,7 +215,7 @@ impl QueryPlanner {
                         id: *id,
                         field_name: query_by_id_field_name.clone(),
                     },
-                    vector: vector.to_vec(),
+                    vector: QueryVector::Dense(vector.to_vec()),
                     metric: resolve_vector_metric(
                         collection,
                         index_catalog,
@@ -234,6 +244,12 @@ impl QueryPlanner {
             .map(|group_by| validate_group_by(collection, group_by, mode))
             .transpose()?;
 
+        let order_by = context
+            .order_by
+            .as_ref()
+            .map(|ob| validate_order_by(collection, ob))
+            .transpose()?;
+
         Ok(QueryPlan::BruteForce(BruteForceQueryPlan {
             top_k: context.top_k,
             filter,
@@ -242,6 +258,7 @@ impl QueryPlanner {
             group_by,
             output_fields: context.output_fields.clone(),
             reranker: context.reranker.clone(),
+            order_by,
         }))
     }
 }
@@ -289,15 +306,41 @@ fn validate_vector_query(
         ));
     }
 
-    if query.vector.len() != vector_schema.dimension {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "query vector dimension mismatch: expected {}, got {}",
-                vector_schema.dimension,
-                query.vector.len()
-            ),
-        ));
+    let field_data_type = vector_schema.data_type.clone();
+    match (&query.vector, field_data_type) {
+        (QueryVector::Dense(vec), FieldType::VectorSparse) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "dense query vector provided for sparse field '{}' — use QueryVector::Sparse",
+                    query.field_name
+                ),
+            ));
+        }
+        (QueryVector::Sparse(_), _) => {
+            if vector_schema.data_type != FieldType::VectorSparse {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "sparse query vector provided for dense field '{}'",
+                        query.field_name
+                    ),
+                ));
+            }
+            // Sparse → sparse: no dimension check needed.
+        }
+        (QueryVector::Dense(vec), _) => {
+            if vec.len() != vector_schema.dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "query vector dimension mismatch: expected {}, got {}",
+                        vector_schema.dimension,
+                        vec.len()
+                    ),
+                ));
+            }
+        }
     }
 
     resolve_vector_metric(collection, index_catalog, vector_schema)
@@ -495,4 +538,40 @@ fn validate_group_by(
             field_name, collection.name
         ),
     ))
+}
+
+fn validate_order_by(collection: &CollectionMetadata, order_by: &OrderBy) -> io::Result<OrderBy> {
+    let field_name = order_by.field_name.trim();
+    if field_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "order_by field name must not be empty",
+        ));
+    }
+    if let Some(field) = collection.fields.iter().find(|f| f.name == field_name) {
+        if field.array {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "order_by field '{}' must reference a scalar field in collection '{}'",
+                    field_name, collection.name
+                ),
+            ));
+        }
+    }
+    // Reject vector fields
+    if collection.vectors.iter().any(|v| v.name == field_name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "order_by field '{}' must reference a scalar field, not a vector field",
+                field_name
+            ),
+        ));
+    }
+    // Allow undeclared fields (schema-less payloads); missing values sort last.
+    Ok(OrderBy {
+        field_name: field_name.to_string(),
+        descending: order_by.descending,
+    })
 }

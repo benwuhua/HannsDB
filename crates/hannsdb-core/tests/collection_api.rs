@@ -360,15 +360,30 @@ fn collection_api_delete_uses_segment_aware_runtime_layout() {
     )
     .expect("load seg-0002 tombstones");
 
-    assert!(!seg1_tombstones.is_deleted(0), "older shadowed row 10 must stay live");
-    assert!(!seg1_tombstones.is_deleted(1), "older shadowed row 20 must stay live");
-    assert!(seg2_tombstones.is_deleted(0), "newest visible row 10 must be deleted");
-    assert!(seg2_tombstones.is_deleted(1), "newer tombstoned row 20 must stay deleted");
+    assert!(
+        !seg1_tombstones.is_deleted(0),
+        "older shadowed row 10 must stay live"
+    );
+    assert!(
+        !seg1_tombstones.is_deleted(1),
+        "older shadowed row 20 must stay live"
+    );
+    assert!(
+        seg2_tombstones.is_deleted(0),
+        "newest visible row 10 must be deleted"
+    );
+    assert!(
+        seg2_tombstones.is_deleted(1),
+        "newer tombstoned row 20 must stay deleted"
+    );
 
     let fetched = db
         .fetch_documents("docs", &[10, 20, 30, 40])
         .expect("fetch after delete");
-    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![30, 40]);
 }
 
@@ -390,13 +405,16 @@ fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layou
     db.insert("docs", &[200], &[0.0_f32, 0.0])
         .expect("follow-up insert after rollover threshold");
 
+    // Tombstone ratio (21/100 = 21%) exceeds the 20% threshold, so
+    // the insert triggers an auto-rollover. Verify multi-segment layout.
+    let collection_dir = root.join("collections").join("docs");
     assert!(
-        !root
-            .join("collections")
-            .join("docs")
-            .join("segment_set.json")
-            .exists(),
-        "incomplete auto-rollover must stay disabled"
+        collection_dir.join("segment_set.json").exists(),
+        "auto-rollover should create segment_set.json"
+    );
+    assert!(
+        collection_dir.join("segments").exists(),
+        "auto-rollover should create segments/ directory"
     );
 
     let info = db.get_collection_info("docs").expect("collection info");
@@ -471,7 +489,10 @@ fn collection_api_delete_by_filter_deletes_matching_live_rows() {
     let fetched = db
         .fetch_documents("docs", &[10, 20, 30])
         .expect("fetch after delete");
-    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![30]);
 }
 
@@ -525,13 +546,15 @@ fn collection_api_delete_by_filter_uses_latest_live_view_across_segments() {
     let fetched = db
         .fetch_documents("docs", &[10, 20, 30])
         .expect("fetch after delete");
-    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![20, 30]);
 }
 
 #[test]
-fn collection_api_delete_by_filter_newer_nonmatching_row_shadows_older_matching_row_returns_zero()
-{
+fn collection_api_delete_by_filter_newer_nonmatching_row_shadows_older_matching_row_returns_zero() {
     let root = unique_temp_dir("hannsdb_collection_api_delete_by_filter_latest_live_negative");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -580,7 +603,10 @@ fn collection_api_delete_by_filter_newer_nonmatching_row_shadows_older_matching_
     let fetched = db
         .fetch_documents("docs", &[10, 20, 30])
         .expect("fetch after delete");
-    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![10, 20, 30]);
 }
 
@@ -620,7 +646,10 @@ fn collection_api_delete_by_filter_newer_tombstone_shadows_older_matching_row() 
     let fetched = db
         .fetch_documents("docs", &[10])
         .expect("fetch after delete");
-    assert!(fetched.is_empty(), "newer tombstone must shadow older matching row");
+    assert!(
+        fetched.is_empty(),
+        "newer tombstone must shadow older matching row"
+    );
 }
 
 #[test]
@@ -659,7 +688,10 @@ fn collection_api_delete_by_filter_no_match_returns_zero() {
     let fetched = db
         .fetch_documents("docs", &[10, 20])
         .expect("fetch after delete");
-    let fetched_ids = fetched.into_iter().map(|document| document.id).collect::<Vec<_>>();
+    let fetched_ids = fetched
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![10, 20]);
 }
 
@@ -751,10 +783,16 @@ fn collection_api_delete_ignores_stale_trailing_ids_beyond_record_count() {
     assert_eq!(info.live_count, 1);
 
     let tombstones = TombstoneMask::load_from_path(
-        &root.join("collections").join("docs").join("tombstones.json"),
+        &root
+            .join("collections")
+            .join("docs")
+            .join("tombstones.json"),
     )
     .expect("load tombstones");
-    assert!(tombstones.is_deleted(0), "real in-range row 42 must be deleted");
+    assert!(
+        tombstones.is_deleted(0),
+        "real in-range row 42 must be deleted"
+    );
     assert!(!tombstones.is_deleted(1), "row 84 must remain live");
 }
 
@@ -1777,6 +1815,7 @@ fn update_documents_partially_modifies_fields_and_vectors() {
                     m
                 },
                 vectors: BTreeMap::new(),
+                sparse_vectors: BTreeMap::new(),
             }],
         )
         .expect("update documents");
@@ -1784,7 +1823,10 @@ fn update_documents_partially_modifies_fields_and_vectors() {
 
     let fetched = db.fetch_documents("docs", &[1]).expect("fetch");
     assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].fields.get("label"), Some(&FieldValue::String("alpha".into())));
+    assert_eq!(
+        fetched[0].fields.get("label"),
+        Some(&FieldValue::String("alpha".into()))
+    );
     assert_eq!(fetched[0].fields.get("score"), Some(&FieldValue::Int64(99)));
     assert_eq!(fetched[0].primary_vector(), &[0.0_f32, 0.0]);
 
@@ -1796,7 +1838,10 @@ fn update_documents_partially_modifies_fields_and_vectors() {
                 id: 2,
                 fields: {
                     let mut m = BTreeMap::new();
-                    m.insert("label".to_string(), Some(FieldValue::String("gamma".into())));
+                    m.insert(
+                        "label".to_string(),
+                        Some(FieldValue::String("gamma".into())),
+                    );
                     m
                 },
                 vectors: {
@@ -1804,14 +1849,21 @@ fn update_documents_partially_modifies_fields_and_vectors() {
                     m.insert("vector".to_string(), Some(vec![0.5, 0.5]));
                     m
                 },
+                sparse_vectors: BTreeMap::new(),
             }],
         )
         .expect("update doc 2");
     assert_eq!(updated2, 1);
 
     let fetched2 = db.fetch_documents("docs", &[2]).expect("fetch 2");
-    assert_eq!(fetched2[0].fields.get("label"), Some(&FieldValue::String("gamma".into())));
-    assert_eq!(fetched2[0].fields.get("score"), Some(&FieldValue::Int64(20)));
+    assert_eq!(
+        fetched2[0].fields.get("label"),
+        Some(&FieldValue::String("gamma".into()))
+    );
+    assert_eq!(
+        fetched2[0].fields.get("score"),
+        Some(&FieldValue::Int64(20))
+    );
     assert_eq!(fetched2[0].primary_vector(), &[0.5_f32, 0.5]);
 
     let stats = db.get_collection_info("docs").expect("stats");
@@ -1836,6 +1888,7 @@ fn update_documents_returns_zero_for_nonexistent_id() {
                 id: 999,
                 fields: BTreeMap::new(),
                 vectors: BTreeMap::new(),
+                sparse_vectors: BTreeMap::new(),
             }],
         )
         .expect("update nonexistent");
@@ -1858,7 +1911,11 @@ fn update_documents_wal_replay_preserves_updates() {
 
     db.insert_documents(
         "docs",
-        &[Document::new(1, [("val".to_string(), FieldValue::Int64(10))], vec![0.0, 0.0])],
+        &[Document::new(
+            1,
+            [("val".to_string(), FieldValue::Int64(10))],
+            vec![0.0, 0.0],
+        )],
     )
     .expect("insert");
 
@@ -1872,13 +1929,16 @@ fn update_documents_wal_replay_preserves_updates() {
                 m
             },
             vectors: BTreeMap::new(),
+            sparse_vectors: BTreeMap::new(),
         }],
     )
     .expect("update");
 
     // Replay WAL on a fresh open.
     let db2 = HannsDb::open(&temp).expect("reopen db");
-    let fetched = db2.fetch_documents("docs", &[1]).expect("fetch after replay");
+    let fetched = db2
+        .fetch_documents("docs", &[1])
+        .expect("fetch after replay");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].fields.get("val"), Some(&FieldValue::Int64(42)));
 }
@@ -1908,15 +1968,15 @@ fn add_column_extends_schema_and_old_rows_return_none() {
     .expect("insert");
 
     // Add a new column after data already exists.
-    db.add_column(
-        "docs",
-        ScalarFieldSchema::new("score", FieldType::Int64),
-    )
-    .expect("add column");
+    db.add_column("docs", ScalarFieldSchema::new("score", FieldType::Int64))
+        .expect("add column");
 
     // Old row should not have "score".
     let fetched = db.fetch_documents("docs", &[1]).expect("fetch old");
-    assert_eq!(fetched[0].fields.get("label"), Some(&FieldValue::String("alpha".into())));
+    assert_eq!(
+        fetched[0].fields.get("label"),
+        Some(&FieldValue::String("alpha".into()))
+    );
     assert_eq!(fetched[0].fields.get("score"), None);
 
     // New insert with the new field works.
@@ -1934,7 +1994,10 @@ fn add_column_extends_schema_and_old_rows_return_none() {
     .expect("insert with new field");
 
     let fetched2 = db.fetch_documents("docs", &[2]).expect("fetch new");
-    assert_eq!(fetched2[0].fields.get("score"), Some(&FieldValue::Int64(42)));
+    assert_eq!(
+        fetched2[0].fields.get("score"),
+        Some(&FieldValue::Int64(42))
+    );
 }
 
 #[test]
@@ -1966,11 +2029,8 @@ fn add_column_wal_replay_preserves_new_field() {
     db.create_collection_with_schema("docs", &schema)
         .expect("create");
 
-    db.add_column(
-        "docs",
-        ScalarFieldSchema::new("tag", FieldType::String),
-    )
-    .expect("add column");
+    db.add_column("docs", ScalarFieldSchema::new("tag", FieldType::String))
+        .expect("add column");
 
     db.insert_documents(
         "docs",
@@ -1984,7 +2044,10 @@ fn add_column_wal_replay_preserves_new_field() {
 
     let db2 = HannsDb::open(&temp).expect("reopen for replay");
     let fetched = db2.fetch_documents("docs", &[1]).expect("fetch");
-    assert_eq!(fetched[0].fields.get("tag"), Some(&FieldValue::String("x".into())));
+    assert_eq!(
+        fetched[0].fields.get("tag"),
+        Some(&FieldValue::String("x".into()))
+    );
 }
 
 #[test]
@@ -2009,11 +2072,8 @@ fn drop_column_removes_field_from_schema() {
     assert!(fetched.is_empty());
 
     // Can add a new field with the same name after dropping
-    db.add_column(
-        "docs",
-        ScalarFieldSchema::new("score", FieldType::Float64),
-    )
-    .expect("re-add");
+    db.add_column("docs", ScalarFieldSchema::new("score", FieldType::Float64))
+        .expect("re-add");
 }
 
 #[test]
@@ -2022,7 +2082,9 @@ fn drop_column_nonexistent_returns_not_found() {
     let mut db = HannsDb::open(&temp).expect("open db");
     db.create_collection("docs", 2, "l2").expect("create");
 
-    let err = db.drop_column("docs", "nonexistent").expect_err("should fail");
+    let err = db
+        .drop_column("docs", "nonexistent")
+        .expect_err("should fail");
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
 }
 
@@ -2091,9 +2153,7 @@ fn alter_column_conflicting_new_name_returns_already_exists() {
     db.create_collection_with_schema("docs", &schema)
         .expect("create");
 
-    let err = db
-        .alter_column("docs", "a", "b")
-        .expect_err("should fail");
+    let err = db.alter_column("docs", "a", "b").expect_err("should fail");
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 }
 
@@ -2112,11 +2172,8 @@ fn drop_column_wal_replay_preserves_removal() {
     db.drop_column("docs", "tag").expect("drop column");
 
     let mut db2 = HannsDb::open(&temp).expect("reopen");
-    db2.add_column(
-        "docs",
-        ScalarFieldSchema::new("tag", FieldType::String),
-    )
-    .expect("re-add after replay");
+    db2.add_column("docs", ScalarFieldSchema::new("tag", FieldType::String))
+        .expect("re-add after replay");
 }
 
 #[test]
@@ -2135,11 +2192,8 @@ fn alter_column_wal_replay_preserves_rename() {
         .expect("rename");
 
     let mut db2 = HannsDb::open(&temp).expect("reopen");
-    db2.add_column(
-        "docs",
-        ScalarFieldSchema::new("old_name", FieldType::Int64),
-    )
-    .expect("re-add old name");
+    db2.add_column("docs", ScalarFieldSchema::new("old_name", FieldType::Int64))
+        .expect("re-add old name");
 }
 
 #[test]
@@ -2163,9 +2217,7 @@ fn collection_api_read_only_rejects_mutations() {
         .expect_err("insert should fail");
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 
-    let err = db
-        .delete("docs", &[1])
-        .expect_err("delete should fail");
+    let err = db.delete("docs", &[1]).expect_err("delete should fail");
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
 
@@ -2215,7 +2267,8 @@ fn collection_api_filtered_search_uses_ann_path_with_post_filter() {
     db.insert_documents("docs", &docs).expect("insert docs");
 
     // Build ANN index
-    db.optimize_collection("docs").expect("optimize builds ANN cache");
+    db.optimize_collection("docs")
+        .expect("optimize builds ANN cache");
 
     // Filtered query: only "red" docs near origin
     let hits = db
@@ -2232,7 +2285,7 @@ fn collection_api_filtered_search_uses_ann_path_with_post_filter() {
 
 #[test]
 fn collection_api_filtered_query_context_uses_ann_with_post_filter() {
-    use hannsdb_core::query::{QueryContext, VectorQuery};
+    use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery};
 
     let root = unique_temp_dir("hannsdb_filtered_ann_context");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -2261,7 +2314,7 @@ fn collection_api_filtered_query_context_uses_ann_with_post_filter() {
         top_k: 10,
         queries: vec![VectorQuery {
             field_name: "vector".to_string(),
-            vector: vec![0.0, 0.0],
+            vector: QueryVector::Dense(vec![0.0, 0.0]),
             param: None,
         }],
         filter: Some("group == 1".to_string()),
@@ -2273,10 +2326,9 @@ fn collection_api_filtered_query_context_uses_ann_with_post_filter() {
     assert!(hits.iter().all(|hit| hit.id == 1 || hit.id == 3));
 }
 
-
 #[test]
 fn collection_api_group_by_with_group_topk_and_group_count() {
-    use hannsdb_core::query::{QueryContext, QueryGroupBy, VectorQuery};
+    use hannsdb_core::query::{QueryContext, QueryGroupBy, QueryVector, VectorQuery};
 
     let root = unique_temp_dir("hannsdb_group_by_topk_count");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -2292,18 +2344,58 @@ fn collection_api_group_by_with_group_topk_and_group_count() {
     // 10 docs across 3 categories, spread at different distances from origin.
     let docs = vec![
         // category "A" — 4 docs
-        Document::new(1, [("category".into(), FieldValue::String("A".into()))], vec![0.0, 0.0]),
-        Document::new(2, [("category".into(), FieldValue::String("A".into()))], vec![0.1, 0.0]),
-        Document::new(3, [("category".into(), FieldValue::String("A".into()))], vec![0.2, 0.0]),
-        Document::new(4, [("category".into(), FieldValue::String("A".into()))], vec![0.3, 0.0]),
+        Document::new(
+            1,
+            [("category".into(), FieldValue::String("A".into()))],
+            vec![0.0, 0.0],
+        ),
+        Document::new(
+            2,
+            [("category".into(), FieldValue::String("A".into()))],
+            vec![0.1, 0.0],
+        ),
+        Document::new(
+            3,
+            [("category".into(), FieldValue::String("A".into()))],
+            vec![0.2, 0.0],
+        ),
+        Document::new(
+            4,
+            [("category".into(), FieldValue::String("A".into()))],
+            vec![0.3, 0.0],
+        ),
         // category "B" — 3 docs
-        Document::new(5, [("category".into(), FieldValue::String("B".into()))], vec![0.4, 0.0]),
-        Document::new(6, [("category".into(), FieldValue::String("B".into()))], vec![0.5, 0.0]),
-        Document::new(7, [("category".into(), FieldValue::String("B".into()))], vec![0.6, 0.0]),
+        Document::new(
+            5,
+            [("category".into(), FieldValue::String("B".into()))],
+            vec![0.4, 0.0],
+        ),
+        Document::new(
+            6,
+            [("category".into(), FieldValue::String("B".into()))],
+            vec![0.5, 0.0],
+        ),
+        Document::new(
+            7,
+            [("category".into(), FieldValue::String("B".into()))],
+            vec![0.6, 0.0],
+        ),
         // category "C" — 3 docs
-        Document::new(8, [("category".into(), FieldValue::String("C".into()))], vec![0.7, 0.0]),
-        Document::new(9, [("category".into(), FieldValue::String("C".into()))], vec![0.8, 0.0]),
-        Document::new(10, [("category".into(), FieldValue::String("C".into()))], vec![0.9, 0.0]),
+        Document::new(
+            8,
+            [("category".into(), FieldValue::String("C".into()))],
+            vec![0.7, 0.0],
+        ),
+        Document::new(
+            9,
+            [("category".into(), FieldValue::String("C".into()))],
+            vec![0.8, 0.0],
+        ),
+        Document::new(
+            10,
+            [("category".into(), FieldValue::String("C".into()))],
+            vec![0.9, 0.0],
+        ),
     ];
     db.insert_documents("docs", &docs).expect("insert docs");
 
@@ -2312,7 +2404,7 @@ fn collection_api_group_by_with_group_topk_and_group_count() {
         top_k: 10,
         queries: vec![VectorQuery {
             field_name: "vector".to_string(),
-            vector: vec![0.0, 0.0],
+            vector: QueryVector::Dense(vec![0.0, 0.0]),
             param: None,
         }],
         group_by: Some(QueryGroupBy {
@@ -2326,15 +2418,21 @@ fn collection_api_group_by_with_group_topk_and_group_count() {
     let hits = db.query_with_context("docs", &ctx).expect("group_by query");
 
     // At most 2 groups, at most 2 docs per group => at most 4 hits.
-    assert!(hits.len() <= 4, "should have at most 4 hits, got {}", hits.len());
+    assert!(
+        hits.len() <= 4,
+        "should have at most 4 hits, got {}",
+        hits.len()
+    );
 
     // Collect the categories present in results.
     let categories: std::collections::HashSet<&str> = hits
         .iter()
-        .filter_map(|hit| hit.fields.get("category").and_then(|v| match v {
-            FieldValue::String(s) => Some(s.as_str()),
-            _ => None,
-        }))
+        .filter_map(|hit| {
+            hit.fields.get("category").and_then(|v| match v {
+                FieldValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+        })
         .collect();
     assert!(
         categories.len() <= 2,
@@ -2373,7 +2471,6 @@ fn collection_api_group_by_with_group_topk_and_group_count() {
         categories,
     );
 }
-
 
 #[test]
 fn collection_api_new_field_types_int32_uint32_uint64_float() {
@@ -2425,13 +2522,19 @@ fn collection_api_new_field_types_int32_uint32_uint64_float() {
     assert_eq!(doc1.fields.get("a_int32"), Some(&FieldValue::Int32(-10)));
     assert_eq!(doc1.fields.get("b_uint32"), Some(&FieldValue::UInt32(100)));
     assert_eq!(doc1.fields.get("c_uint64"), Some(&FieldValue::UInt64(999)));
-    assert_eq!(doc1.fields.get("d_float"), Some(&FieldValue::Float(1.5_f32)));
+    assert_eq!(
+        doc1.fields.get("d_float"),
+        Some(&FieldValue::Float(1.5_f32))
+    );
 
     let doc2 = fetched.iter().find(|d| d.id == 2).expect("doc 2");
     assert_eq!(doc2.fields.get("a_int32"), Some(&FieldValue::Int32(42)));
     assert_eq!(doc2.fields.get("b_uint32"), Some(&FieldValue::UInt32(200)));
     assert_eq!(doc2.fields.get("c_uint64"), Some(&FieldValue::UInt64(1000)));
-    assert_eq!(doc2.fields.get("d_float"), Some(&FieldValue::Float(2.5_f32)));
+    assert_eq!(
+        doc2.fields.get("d_float"),
+        Some(&FieldValue::Float(2.5_f32))
+    );
 
     // Filter on Int32
     let hits = db
@@ -2556,7 +2659,10 @@ fn collection_api_ivf_filtered_search_returns_correct_results() {
     let hits = db
         .query_documents("docs", &[0.0, 0.0], 3, Some("group == 1"))
         .expect("filtered search");
-    assert!(!hits.is_empty(), "filtered IVF search should return results");
+    assert!(
+        !hits.is_empty(),
+        "filtered IVF search should return results"
+    );
     // All results should be from group 1
     for hit in &hits {
         let group = hit.fields.get("group").expect("group field");

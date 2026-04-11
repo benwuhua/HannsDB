@@ -17,8 +17,7 @@ fn stored_schema_value() -> Value {
         vectors: vec![
             VectorFieldSchema::new("title", 384),
             VectorFieldSchema::new("dense", 384).with_index_param(
-                VectorIndexSchema::hnsw(Some("cosine"), 32, 128)
-                    .with_quantize_type(Some("fp16")),
+                VectorIndexSchema::hnsw(Some("cosine"), 32, 128).with_quantize_type(Some("fp16")),
             ),
         ],
     };

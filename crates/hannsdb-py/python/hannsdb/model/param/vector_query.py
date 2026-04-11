@@ -31,14 +31,44 @@ def _normalize_vector(vector: Any) -> list[float]:
     raise TypeError("vector must be a list, tuple, or numpy.ndarray of numbers")
 
 
+class SparseVector:
+    """Sparse vector with separate indices and values arrays."""
+
+    __slots__ = ("_indices", "_values")
+
+    def __init__(self, indices: list[int], values: list[float]):
+        if len(indices) != len(values):
+            raise ValueError("indices and values must have the same length")
+        self._indices = list(indices)
+        self._values = [float(v) for v in values]
+
+    @property
+    def indices(self) -> list[int]:
+        return list(self._indices)
+
+    @property
+    def values(self) -> list[float]:
+        return list(self._values)
+
+    def __repr__(self) -> str:
+        return f"SparseVector(indices={self._indices}, values={self._values})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SparseVector):
+            return NotImplemented
+        return self._indices == other._indices and self._values == other._values
+
+
 @dataclass
 class VectorQuery:
     field_name: str
-    vector: Any
+    vector: Any  # Can be list[float], numpy.ndarray, or SparseVector
     param: Optional[Any] = None
 
     def __post_init__(self) -> None:
-        self.vector = _normalize_vector(self.vector)
+        # Only normalize if it's a dense vector (not SparseVector)
+        if not isinstance(self.vector, SparseVector):
+            self.vector = _normalize_vector(self.vector)
 
 
 @dataclass
@@ -75,4 +105,4 @@ class QueryContext:
             self.output_fields = list(self.output_fields)
 
 
-__all__ = ["QueryContext", "QueryGroupBy", "VectorQuery"]
+__all__ = ["QueryContext", "QueryGroupBy", "SparseVector", "VectorQuery"]

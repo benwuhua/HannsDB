@@ -1,7 +1,8 @@
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{SegmentMetadata, VersionSet};
+use super::{SegmentMetadata, TombstoneMask, VersionSet};
 
 #[derive(Debug, Clone)]
 pub struct SegmentPaths {
@@ -11,7 +12,10 @@ pub struct SegmentPaths {
     pub records: PathBuf,
     pub external_ids: PathBuf,
     pub payloads: PathBuf,
+    pub payloads_arrow: PathBuf,
     pub vectors: PathBuf,
+    pub vectors_arrow: PathBuf,
+    pub sparse_vectors: PathBuf,
     pub tombstones: PathBuf,
 }
 
@@ -24,7 +28,10 @@ impl SegmentPaths {
             records: collection_dir.join("records.bin"),
             external_ids: collection_dir.join("ids.bin"),
             payloads: collection_dir.join("payloads.jsonl"),
+            payloads_arrow: collection_dir.join("payloads.arrow"),
             vectors: collection_dir.join("vectors.jsonl"),
+            vectors_arrow: collection_dir.join("vectors.arrow"),
+            sparse_vectors: collection_dir.join("sparse_vectors.jsonl"),
             tombstones: collection_dir.join("tombstones.json"),
         }
     }
@@ -36,7 +43,10 @@ impl SegmentPaths {
             records: segment_dir.join("records.bin"),
             external_ids: segment_dir.join("ids.bin"),
             payloads: segment_dir.join("payloads.jsonl"),
+            payloads_arrow: segment_dir.join("payloads.arrow"),
             vectors: segment_dir.join("vectors.jsonl"),
+            vectors_arrow: segment_dir.join("vectors.arrow"),
+            sparse_vectors: segment_dir.join("sparse_vectors.jsonl"),
             tombstones: segment_dir.join("tombstones.json"),
             dir: segment_dir,
         }
@@ -115,5 +125,35 @@ impl SegmentManager {
         paths.push(self.active_segment_path()?);
         paths.extend(self.immutable_segment_paths()?);
         Ok(paths)
+    }
+
+    /// Create a new segment directory under `segments/<segment_id>/` with
+    /// initialized metadata and tombstone files. Returns the segment paths.
+    pub fn create_segment_dir(
+        &self,
+        segment_id: &str,
+        dimension: usize,
+    ) -> io::Result<SegmentPaths> {
+        let seg_dir = self.segments_dir().join(segment_id);
+        fs::create_dir_all(&seg_dir)?;
+        let paths = SegmentPaths::from_segment_dir(seg_dir, segment_id.to_string());
+        SegmentMetadata::new(segment_id, dimension, 0, 0).save_to_path(&paths.metadata)?;
+        TombstoneMask::new(0).save_to_path(&paths.tombstones)?;
+        Ok(paths)
+    }
+
+    /// Return the next segment ID after all existing segments.
+    pub fn next_segment_id(&self) -> io::Result<String> {
+        let version_set = self.version_set()?;
+        let max_id = version_set
+            .all_segment_ids()
+            .iter()
+            .filter_map(|id| {
+                id.strip_prefix("seg-")
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        Ok(format!("seg-{:06}", max_id.saturating_add(1)))
     }
 }

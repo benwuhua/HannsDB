@@ -147,12 +147,14 @@ impl InvertedScalarIndex {
         payloads: &[BTreeMap<String, ScalarValue>],
         external_ids: &[i64],
     ) -> Self {
-        assert_eq!(payloads.len(), external_ids.len(), "payloads and external_ids must have the same length");
+        assert_eq!(
+            payloads.len(),
+            external_ids.len(),
+            "payloads and external_ids must have the same length"
+        );
 
         // Determine the type from the first non-empty value found.
-        let first_value = payloads
-            .iter()
-            .find_map(|payload| payload.get(field_name));
+        let first_value = payloads.iter().find_map(|payload| payload.get(field_name));
 
         let field_type = match first_value {
             Some(ScalarValue::String(_)) => "string",
@@ -183,7 +185,10 @@ impl InvertedScalarIndex {
                         entries.entry(*v).or_default().insert(ext_id);
                     }
                 }
-                Self::Int64 { descriptor, entries }
+                Self::Int64 {
+                    descriptor,
+                    entries,
+                }
             }
             "int32" => {
                 let mut entries: BTreeMap<i32, BTreeSet<i64>> = BTreeMap::new();
@@ -192,7 +197,10 @@ impl InvertedScalarIndex {
                         entries.entry(*v).or_default().insert(ext_id);
                     }
                 }
-                Self::Int32 { descriptor, entries }
+                Self::Int32 {
+                    descriptor,
+                    entries,
+                }
             }
             "uint32" => {
                 let mut entries: BTreeMap<u32, BTreeSet<i64>> = BTreeMap::new();
@@ -201,7 +209,10 @@ impl InvertedScalarIndex {
                         entries.entry(*v).or_default().insert(ext_id);
                     }
                 }
-                Self::UInt32 { descriptor, entries }
+                Self::UInt32 {
+                    descriptor,
+                    entries,
+                }
             }
             "uint64" => {
                 let mut entries: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
@@ -210,31 +221,34 @@ impl InvertedScalarIndex {
                         entries.entry(*v).or_default().insert(ext_id);
                     }
                 }
-                Self::UInt64 { descriptor, entries }
+                Self::UInt64 {
+                    descriptor,
+                    entries,
+                }
             }
             "float" => {
                 let mut entries: BTreeMap<OrderedF32, BTreeSet<i64>> = BTreeMap::new();
                 for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
                     if let Some(ScalarValue::Float(v)) = payload.get(field_name) {
-                        entries
-                            .entry(OrderedF32(*v))
-                            .or_default()
-                            .insert(ext_id);
+                        entries.entry(OrderedF32(*v)).or_default().insert(ext_id);
                     }
                 }
-                Self::Float { descriptor, entries }
+                Self::Float {
+                    descriptor,
+                    entries,
+                }
             }
             "float64" => {
                 let mut entries: BTreeMap<OrderedF64, BTreeSet<i64>> = BTreeMap::new();
                 for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
                     if let Some(ScalarValue::Float64(v)) = payload.get(field_name) {
-                        entries
-                            .entry(OrderedF64(*v))
-                            .or_default()
-                            .insert(ext_id);
+                        entries.entry(OrderedF64(*v)).or_default().insert(ext_id);
                     }
                 }
-                Self::Float64 { descriptor, entries }
+                Self::Float64 {
+                    descriptor,
+                    entries,
+                }
             }
             "bool" => {
                 let mut true_ids = BTreeSet::new();
@@ -302,20 +316,14 @@ impl InvertedScalarIndex {
             }
             InvertedScalarIndex::Float { entries, .. } => {
                 if let ScalarValue::Float(v) = value {
-                    entries
-                        .get(&OrderedF32(*v))
-                        .cloned()
-                        .unwrap_or_default()
+                    entries.get(&OrderedF32(*v)).cloned().unwrap_or_default()
                 } else {
                     BTreeSet::new()
                 }
             }
             InvertedScalarIndex::Float64 { entries, .. } => {
                 if let ScalarValue::Float64(v) = value {
-                    entries
-                        .get(&OrderedF64(*v))
-                        .cloned()
-                        .unwrap_or_default()
+                    entries.get(&OrderedF64(*v)).cloned().unwrap_or_default()
                 } else {
                     BTreeSet::new()
                 }
@@ -342,11 +350,7 @@ impl InvertedScalarIndex {
         }
         if op == RangeOp::Ne {
             let eq = self.lookup_eq(value);
-            return self
-                .all_indexed_ids()
-                .difference(&eq)
-                .cloned()
-                .collect();
+            return self.all_indexed_ids().difference(&eq).cloned().collect();
         }
 
         match self {
@@ -605,8 +609,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
 
         let result = index.lookup_eq(&ScalarValue::String("alice".into()));
         assert_eq!(result, BTreeSet::from([1, 3]));
@@ -627,8 +630,7 @@ mod tests {
         ];
         let ids = vec![10, 20];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
         assert_eq!(index.all_indexed_ids(), BTreeSet::from([10, 20]));
     }
 
@@ -642,18 +644,23 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
 
         let result = index.lookup_in(
-            &[ScalarValue::String("alice".into()), ScalarValue::String("bob".into())],
+            &[
+                ScalarValue::String("alice".into()),
+                ScalarValue::String("bob".into()),
+            ],
             false,
         );
         assert_eq!(result, BTreeSet::from([1, 2]));
 
         // Negated: everything except alice and bob
         let result = index.lookup_in(
-            &[ScalarValue::String("alice".into()), ScalarValue::String("bob".into())],
+            &[
+                ScalarValue::String("alice".into()),
+                ScalarValue::String("bob".into()),
+            ],
             true,
         );
         assert_eq!(result, BTreeSet::from([3]));
@@ -671,8 +678,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
 
         let result = index.lookup_eq(&ScalarValue::Int64(25));
         assert_eq!(result, BTreeSet::from([1, 3]));
@@ -692,8 +698,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3, 4];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
 
         let result = index.lookup_range(RangeOp::Gt, &ScalarValue::Int64(20));
         assert_eq!(result, BTreeSet::from([3, 4]));
@@ -718,8 +723,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "age", &payloads, &ids);
 
         let result = index.lookup_range(RangeOp::Ne, &ScalarValue::Int64(20));
         assert_eq!(result, BTreeSet::from([1]));
@@ -736,19 +740,12 @@ mod tests {
         ];
         let ids = vec![10, 20, 30, 40];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "group", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "group", &payloads, &ids);
 
-        let result = index.lookup_in(
-            &[ScalarValue::Int64(1), ScalarValue::Int64(3)],
-            false,
-        );
+        let result = index.lookup_in(&[ScalarValue::Int64(1), ScalarValue::Int64(3)], false);
         assert_eq!(result, BTreeSet::from([10, 30]));
 
-        let result = index.lookup_in(
-            &[ScalarValue::Int64(1), ScalarValue::Int64(3)],
-            true,
-        );
+        let result = index.lookup_in(&[ScalarValue::Int64(1), ScalarValue::Int64(3)], true);
         assert_eq!(result, BTreeSet::from([20, 40]));
     }
 
@@ -764,8 +761,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "score", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "score", &payloads, &ids);
 
         let result = index.lookup_eq(&ScalarValue::Float64(1.5));
         assert_eq!(result, BTreeSet::from([1, 3]));
@@ -782,8 +778,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3, 4];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "score", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "score", &payloads, &ids);
 
         let result = index.lookup_range(RangeOp::Gt, &ScalarValue::Float64(2.0));
         assert_eq!(result, BTreeSet::from([3, 4]));
@@ -807,8 +802,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "active", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "active", &payloads, &ids);
 
         let result = index.lookup_eq(&ScalarValue::Bool(true));
         assert_eq!(result, BTreeSet::from([1, 3]));
@@ -826,8 +820,7 @@ mod tests {
         ];
         let ids = vec![1, 2];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "active", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "active", &payloads, &ids);
         assert_eq!(index.all_indexed_ids(), BTreeSet::from([1, 2]));
     }
 
@@ -836,10 +829,7 @@ mod tests {
     #[test]
     fn empty_index_when_no_values() {
         let descriptor = test_descriptor("missing");
-        let payloads: Vec<BTreeMap<String, ScalarValue>> = vec![
-            BTreeMap::new(),
-            BTreeMap::new(),
-        ];
+        let payloads: Vec<BTreeMap<String, ScalarValue>> = vec![BTreeMap::new(), BTreeMap::new()];
         let ids = vec![1, 2];
 
         let index =
@@ -878,8 +868,7 @@ mod tests {
         ];
         let ids = vec![1, 2, 3];
 
-        let index =
-            InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
 
         assert_eq!(index.all_indexed_ids(), BTreeSet::from([1, 3]));
     }

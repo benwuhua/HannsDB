@@ -48,12 +48,15 @@ pub fn rename_field_in_schema(
             format!("field already exists: {new_name}"),
         ));
     }
-    let field = fields.iter_mut().find(|f| f.name == old_name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("field not found: {old_name}"),
-        )
-    })?;
+    let field = fields
+        .iter_mut()
+        .find(|f| f.name == old_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("field not found: {old_name}"),
+            )
+        })?;
     field.name = new_name.to_string();
     Ok(())
 }
@@ -66,8 +69,11 @@ mod tests {
     #[test]
     fn add_field_appends_to_empty_schema() {
         let mut fields = Vec::new();
-        add_field_to_schema(&mut fields, ScalarFieldSchema::new("name", FieldType::String))
-            .expect("add field should succeed");
+        add_field_to_schema(
+            &mut fields,
+            ScalarFieldSchema::new("name", FieldType::String),
+        )
+        .expect("add field should succeed");
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "name");
     }
@@ -75,8 +81,11 @@ mod tests {
     #[test]
     fn add_field_appends_to_existing_schema() {
         let mut fields = vec![ScalarFieldSchema::new("id", FieldType::Int64)];
-        add_field_to_schema(&mut fields, ScalarFieldSchema::new("score", FieldType::Float64))
-            .expect("add field should succeed");
+        add_field_to_schema(
+            &mut fields,
+            ScalarFieldSchema::new("score", FieldType::Float64),
+        )
+        .expect("add field should succeed");
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[1].name, "score");
     }

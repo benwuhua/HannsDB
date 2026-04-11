@@ -55,13 +55,12 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
         .expect("insert document");
     assert_eq!(inserted, 1);
 
-    let fetched = db.fetch_documents("docs", &[7]).expect("fetch inserted doc");
+    let fetched = db
+        .fetch_documents("docs", &[7])
+        .expect("fetch inserted doc");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].primary_vector_for("dense").unwrap(), &[0.1, 0.2]);
-    assert_eq!(
-        fetched[0].vectors.get("title"),
-        Some(&vec![0.3, 0.4])
-    );
+    assert_eq!(fetched[0].vectors.get("title"), Some(&vec![0.3, 0.4]));
     assert_eq!(
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("inserted".to_string()))
@@ -75,13 +74,12 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
         .expect("upsert document");
     assert_eq!(upserted, 1);
 
-    let fetched = db.fetch_documents("docs", &[7]).expect("fetch upserted doc");
+    let fetched = db
+        .fetch_documents("docs", &[7])
+        .expect("fetch upserted doc");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].primary_vector_for("dense").unwrap(), &[1.1, 1.2]);
-    assert_eq!(
-        fetched[0].vectors.get("title"),
-        Some(&vec![1.3, 1.4])
-    );
+    assert_eq!(fetched[0].vectors.get("title"), Some(&vec![1.3, 1.4]));
     assert_eq!(
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("upserted".to_string()))
@@ -99,11 +97,11 @@ fn multi_vector_document_insert_upsert_fetch_and_reopen_round_trip() {
         .fetch_documents("docs", &[7])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[1.1, 1.2]);
     assert_eq!(
-        replayed[0].vectors.get("title"),
-        Some(&vec![1.3, 1.4])
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[1.1, 1.2]
     );
+    assert_eq!(replayed[0].vectors.get("title"), Some(&vec![1.3, 1.4]));
     assert_eq!(
         replayed[0].fields.get("session_id"),
         Some(&FieldValue::String("upserted".to_string()))
@@ -131,11 +129,11 @@ fn multi_vector_document_reopen_rebuilds_truncated_vectors_sidecar() {
         .fetch_documents("docs", &[7])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].vectors.get("title"), Some(&vec![0.3, 0.4]));
     assert_eq!(
-        replayed[0].vectors.get("title"),
-        Some(&vec![0.3, 0.4])
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[0.1, 0.2]
     );
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[0.1, 0.2]);
 }
 
 #[test]
@@ -170,11 +168,8 @@ fn multi_vector_document_appends_secondary_vectors_after_legacy_rows_without_mis
     )
     .expect("insert legacy docs");
 
-    db.insert_documents(
-        "docs",
-        &[sample_document(3, [2.0, 2.0], [3.0, 3.0], "new")],
-    )
-    .expect("insert multi-vector doc");
+    db.insert_documents("docs", &[sample_document(3, [2.0, 2.0], [3.0, 3.0], "new")])
+        .expect("insert multi-vector doc");
     drop(db);
 
     let reopened = HannsDb::open(&root).expect("reopen db");
@@ -221,7 +216,10 @@ fn single_vector_document_reopen_rebuilds_truncated_vectors_sidecar() {
         .fetch_documents("docs", &[11])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[0.5, 0.6]);
+    assert_eq!(
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[0.5, 0.6]
+    );
     // Legacy insert has no secondary vectors; only the primary is reconstructed.
     assert_eq!(replayed[0].vectors.len(), 1);
     assert_eq!(
@@ -248,7 +246,10 @@ fn legacy_insert_reopen_rebuilds_truncated_vectors_sidecar() {
         .fetch_documents("docs", &[21])
         .expect("fetch replayed doc");
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].primary_vector_for("dense").unwrap(), &[0.7, 0.8]);
+    assert_eq!(
+        replayed[0].primary_vector_for("dense").unwrap(),
+        &[0.7, 0.8]
+    );
     // Legacy insert has no secondary vectors; only the primary is reconstructed.
     assert_eq!(replayed[0].vectors.len(), 1);
 }
@@ -294,9 +295,9 @@ fn multi_vector_document_rejects_primary_vector_duplicate_in_secondary_map() {
     // This test verifies that such documents can be inserted (the secondary entry
     // silently overrides the primary via BTreeMap semantics).
     let mut vectors = BTreeMap::new();
-    vectors.insert("dense".to_string(), vec![0.1, 0.2]);     // primary
-    vectors.insert("dense".to_string(), vec![9.9, 9.8]);     // overrides primary
-    vectors.insert("title".to_string(), vec![0.3, 0.4]);     // valid secondary
+    vectors.insert("dense".to_string(), vec![0.1, 0.2]); // primary
+    vectors.insert("dense".to_string(), vec![9.9, 9.8]); // overrides primary
+    vectors.insert("title".to_string(), vec![0.3, 0.4]); // valid secondary
     let doc = Document {
         id: 9,
         fields: BTreeMap::from([(
@@ -304,6 +305,7 @@ fn multi_vector_document_rejects_primary_vector_duplicate_in_secondary_map() {
             FieldValue::String("duplicate".to_string()),
         )]),
         vectors,
+        sparse_vectors: BTreeMap::new(),
     };
 
     // The document passes validation because "dense" exists with correct dimension.

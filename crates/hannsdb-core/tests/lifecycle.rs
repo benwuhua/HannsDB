@@ -42,11 +42,12 @@ fn write_segment(
         payloads.push(d.fields.clone());
     }
 
-    let inserted =
-        append_records(&segment_dir.join("records.bin"), dimension, &vectors).expect("write records");
+    let inserted = append_records(&segment_dir.join("records.bin"), dimension, &vectors)
+        .expect("write records");
     assert_eq!(inserted, documents.len(), "record count mismatch");
     let _ = append_record_ids(&segment_dir.join("ids.bin"), &ids).expect("write ids");
-    let _ = append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
+    let _ =
+        append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
 
     let mut tombstone = TombstoneMask::new(documents.len());
     for &row in deleted_rows {
@@ -56,9 +57,14 @@ fn write_segment(
         .save_to_path(&segment_dir.join("tombstones.json"))
         .expect("write tombstones");
 
-    SegmentMetadata::new(segment_id, dimension, documents.len(), tombstone.deleted_count())
-        .save_to_path(&segment_dir.join("segment.json"))
-        .expect("write segment metadata");
+    SegmentMetadata::new(
+        segment_id,
+        dimension,
+        documents.len(),
+        tombstone.deleted_count(),
+    )
+    .save_to_path(&segment_dir.join("segment.json"))
+    .expect("write segment metadata");
 }
 
 fn segments_dir(root: &Path, collection: &str) -> std::path::PathBuf {
@@ -66,7 +72,9 @@ fn segments_dir(root: &Path, collection: &str) -> std::path::PathBuf {
 }
 
 fn segment_set_path(root: &Path, collection: &str) -> std::path::PathBuf {
-    root.join("collections").join(collection).join("segment_set.json")
+    root.join("collections")
+        .join(collection)
+        .join("segment_set.json")
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -87,7 +95,8 @@ fn lifecycle_compact_reopen_search_returns_correct_results() {
     // exist, then remove the WAL so that future reopens see no owned collections.
     {
         let mut db = HannsDb::open(root).expect("open db");
-        db.create_collection("docs", 2, "l2").expect("create collection");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
     }
     fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
 
@@ -150,7 +159,8 @@ fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let mut db = HannsDb::open(root).expect("open db");
-    db.create_collection("docs", 2, "l2").expect("create collection");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
 
     // Insert 100 docs.
     let ids: Vec<i64> = (0..100).collect();
@@ -168,7 +178,8 @@ fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
 
     // One more insert triggers maybe_trigger_segment_rollover:
     //   record_count=101, deleted_count=21, ratio≈20.8 % > 20 % threshold.
-    db.insert("docs", &[200], &[99.0_f32, 99.0]).expect("trigger insert");
+    db.insert("docs", &[200], &[99.0_f32, 99.0])
+        .expect("trigger insert");
 
     assert!(
         segment_set_path(root, "docs").exists(),
@@ -178,7 +189,9 @@ fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
     let set =
         SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("load segment_set");
     assert!(
-        segments_dir(root, "docs").join(&set.active_segment_id).exists(),
+        segments_dir(root, "docs")
+            .join(&set.active_segment_id)
+            .exists(),
         "active segment directory must exist: {}",
         set.active_segment_id
     );
@@ -198,8 +211,10 @@ fn lifecycle_compact_noop_for_collection_without_segment_set() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let mut db = HannsDb::open(root).expect("open db");
-    db.create_collection("docs", 2, "l2").expect("create collection");
-    db.insert("docs", &[1, 2], &[0.0_f32, 0.0, 1.0, 1.0]).expect("insert docs");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[1, 2], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert docs");
 
     db.compact_collection("docs")
         .expect("compact must succeed as a no-op when segment_set is absent");
@@ -225,7 +240,8 @@ fn lifecycle_list_segments_returns_correct_counts_for_multi_segment_layout() {
     // Bootstrap collection metadata, then drop and remove WAL.
     {
         let mut db = HannsDb::open(root).expect("open db");
-        db.create_collection("docs", 2, "l2").expect("create collection");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
     }
     fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
 
@@ -282,14 +298,33 @@ fn lifecycle_compact_reduces_immutable_count_to_one() {
 
     {
         let mut db = HannsDb::open(root).expect("open db");
-        db.create_collection("docs", 2, "l2").expect("create collection");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
     }
     fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
 
     let segs = segments_dir(root, "docs");
-    write_segment(&segs.join("seg-000001"), "seg-000001", 2, &[doc(1, vec![0.0, 0.0])], &[]);
-    write_segment(&segs.join("seg-000002"), "seg-000002", 2, &[doc(2, vec![1.0, 0.0])], &[]);
-    write_segment(&segs.join("seg-000003"), "seg-000003", 2, &[doc(3, vec![0.0, 1.0])], &[]);
+    write_segment(
+        &segs.join("seg-000001"),
+        "seg-000001",
+        2,
+        &[doc(1, vec![0.0, 0.0])],
+        &[],
+    );
+    write_segment(
+        &segs.join("seg-000002"),
+        "seg-000002",
+        2,
+        &[doc(2, vec![1.0, 0.0])],
+        &[],
+    );
+    write_segment(
+        &segs.join("seg-000003"),
+        "seg-000003",
+        2,
+        &[doc(3, vec![0.0, 1.0])],
+        &[],
+    );
     SegmentSet {
         active_segment_id: "seg-000003".to_string(),
         immutable_segment_ids: vec!["seg-000001".to_string(), "seg-000002".to_string()],
@@ -300,9 +335,10 @@ fn lifecycle_compact_reduces_immutable_count_to_one() {
     let mut db = HannsDb::open(root).expect("reopen db");
     db.compact_collection("docs").expect("compact");
 
-    let segments = db.list_collection_segments("docs").expect("list segments after compact");
-    let immutable_segments: Vec<_> =
-        segments.iter().filter(|s| s.id != "seg-000003").collect();
+    let segments = db
+        .list_collection_segments("docs")
+        .expect("list segments after compact");
+    let immutable_segments: Vec<_> = segments.iter().filter(|s| s.id != "seg-000003").collect();
 
     assert_eq!(
         immutable_segments.len(),
@@ -330,14 +366,33 @@ fn lifecycle_wal_compact_record_written_with_correct_segment_id() {
 
     {
         let mut db = HannsDb::open(root).expect("open db");
-        db.create_collection("docs", 2, "l2").expect("create collection");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
     }
     fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
 
     let segs = segments_dir(root, "docs");
-    write_segment(&segs.join("seg-000001"), "seg-000001", 2, &[doc(1, vec![0.0, 0.0])], &[]);
-    write_segment(&segs.join("seg-000002"), "seg-000002", 2, &[doc(2, vec![1.0, 0.0])], &[]);
-    write_segment(&segs.join("seg-000003"), "seg-000003", 2, &[doc(3, vec![0.0, 1.0])], &[]);
+    write_segment(
+        &segs.join("seg-000001"),
+        "seg-000001",
+        2,
+        &[doc(1, vec![0.0, 0.0])],
+        &[],
+    );
+    write_segment(
+        &segs.join("seg-000002"),
+        "seg-000002",
+        2,
+        &[doc(2, vec![1.0, 0.0])],
+        &[],
+    );
+    write_segment(
+        &segs.join("seg-000003"),
+        "seg-000003",
+        2,
+        &[doc(3, vec![0.0, 1.0])],
+        &[],
+    );
     SegmentSet {
         active_segment_id: "seg-000003".to_string(),
         immutable_segment_ids: vec!["seg-000001".to_string(), "seg-000002".to_string()],
@@ -351,9 +406,16 @@ fn lifecycle_wal_compact_record_written_with_correct_segment_id() {
     }
 
     let records = load_wal_records(&root.join("wal.jsonl")).expect("load wal");
-    assert_eq!(records.len(), 1, "WAL must contain exactly one record after compact");
+    assert_eq!(
+        records.len(),
+        1,
+        "WAL must contain exactly one record after compact"
+    );
     match &records[0] {
-        WalRecord::CompactCollection { collection_name, compacted_segment_id } => {
+        WalRecord::CompactCollection {
+            collection_name,
+            compacted_segment_id,
+        } => {
             assert_eq!(collection_name, "docs");
             assert!(
                 segs.join(compacted_segment_id).exists(),
@@ -371,14 +433,13 @@ fn lifecycle_compact_noop_does_not_append_wal_record() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let mut db = HannsDb::open(root).expect("open db");
-    db.create_collection("docs", 2, "l2").expect("create collection");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
     db.insert("docs", &[1], &[0.0_f32, 0.0]).expect("insert");
 
-    let wal_before =
-        fs::read_to_string(root.join("wal.jsonl")).expect("read wal before compact");
+    let wal_before = fs::read_to_string(root.join("wal.jsonl")).expect("read wal before compact");
     db.compact_collection("docs").expect("no-op compact");
-    let wal_after =
-        fs::read_to_string(root.join("wal.jsonl")).expect("read wal after compact");
+    let wal_after = fs::read_to_string(root.join("wal.jsonl")).expect("read wal after compact");
 
     assert_eq!(
         wal_before.lines().count(),

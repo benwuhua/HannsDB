@@ -74,7 +74,8 @@ fn write_segment_for_bench(
     }
     append_records(&segment_dir.join("records.bin"), dimension, &vectors).expect("write records");
     let _ = append_record_ids(&segment_dir.join("ids.bin"), &ids).expect("write ids");
-    let _ = append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
+    let _ =
+        append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
     TombstoneMask::new(documents.len())
         .save_to_path(&segment_dir.join("tombstones.json"))
         .expect("write tombstones");
@@ -98,7 +99,8 @@ fn bench_insert_throughput() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let mut db = HannsDb::open(root).expect("open db");
-    db.create_collection("bench", dim, "l2").expect("create collection");
+    db.create_collection("bench", dim, "l2")
+        .expect("create collection");
 
     let ids: Vec<i64> = (0..n as i64).collect();
     let vectors = build_vectors(n, dim);
@@ -108,8 +110,14 @@ fn bench_insert_throughput() {
     let ms = t.elapsed().as_millis();
     assert_eq!(inserted, n);
 
-    let rows_per_sec = if ms == 0 { n as u128 * 1000 } else { n as u128 * 1000 / ms };
-    println!("BENCH_INSERT_THROUGHPUT phase=insert n={n} dim={dim} ms={ms} rows_per_sec={rows_per_sec}");
+    let rows_per_sec = if ms == 0 {
+        n as u128 * 1000
+    } else {
+        n as u128 * 1000 / ms
+    };
+    println!(
+        "BENCH_INSERT_THROUGHPUT phase=insert n={n} dim={dim} ms={ms} rows_per_sec={rows_per_sec}"
+    );
 }
 
 // ── bench: brute-force search scaling ────────────────────────────────────────
@@ -126,7 +134,8 @@ fn bench_brute_force_search_scaling() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let mut db = HannsDb::open(root).expect("open db");
-    db.create_collection("bench", dim, "l2").expect("create collection");
+    db.create_collection("bench", dim, "l2")
+        .expect("create collection");
 
     let query = build_vectors(1, dim);
     let mut inserted_so_far: i64 = 0;
@@ -143,9 +152,7 @@ fn bench_brute_force_search_scaling() {
         let ms = t.elapsed().as_millis();
         let us = t.elapsed().as_micros();
         assert!(!hits.is_empty());
-        println!(
-            "BENCH_BRUTE_FORCE_SEARCH phase=search n={target_n} dim={dim} ms={ms} us={us}"
-        );
+        println!("BENCH_BRUTE_FORCE_SEARCH phase=search n={target_n} dim={dim} ms={ms} us={us}");
     }
 }
 
@@ -161,7 +168,10 @@ fn bench_compaction_timing() {
     let dim = read_env_usize("HANNSDB_BENCH_DIM", 64);
     let k_segs = read_env_usize("HANNSDB_BENCH_SEGS", 5);
 
-    assert!(k_segs >= 2, "HANNSDB_BENCH_SEGS must be >= 2 to have at least one immutable");
+    assert!(
+        k_segs >= 2,
+        "HANNSDB_BENCH_SEGS must be >= 2 to have at least one immutable"
+    );
     let rows_per_seg = n / k_segs;
     assert!(rows_per_seg > 0, "n must be >= k_segs");
 
@@ -170,14 +180,12 @@ fn bench_compaction_timing() {
 
     {
         let mut db = HannsDb::open(root).expect("open db");
-        db.create_collection("bench", dim, "l2").expect("create collection");
+        db.create_collection("bench", dim, "l2")
+            .expect("create collection");
     }
     std::fs::remove_file(root.join("wal.jsonl")).expect("remove wal");
 
-    let segs_dir = root
-        .join("collections")
-        .join("bench")
-        .join("segments");
+    let segs_dir = root.join("collections").join("bench").join("segments");
 
     let mut immutable_ids: Vec<String> = Vec::new();
     let mut global_id: i64 = 0;
@@ -226,5 +234,8 @@ fn bench_compaction_timing() {
     // Sanity: search still works after compaction.
     let query = build_vectors(1, dim);
     let hits = db.search("bench", &query, 1).expect("search after compact");
-    assert!(!hits.is_empty(), "search must return results after compaction");
+    assert!(
+        !hits.is_empty(),
+        "search must return results after compaction"
+    );
 }

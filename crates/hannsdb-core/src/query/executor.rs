@@ -7,12 +7,14 @@ use crate::catalog::CollectionMetadata;
 use crate::db::DocumentHit;
 use crate::document::FieldValue;
 use crate::segment::{
-    load_payloads, load_record_ids, load_records, load_vectors, SegmentManager, TombstoneMask,
+    load_payloads, load_record_ids, load_records, load_sparse_vectors, load_vectors,
+    SegmentManager, TombstoneMask,
 };
 
 use super::planner::{BruteForceExecutionMode, BruteForceQueryPlan};
 use super::rerank::{fuse, PerFieldResults};
-use super::search::distance_by_metric;
+use super::search::{distance_by_metric, sparse_inner_product};
+use super::QueryVector;
 
 pub(crate) struct QueryExecutor;
 
@@ -45,12 +47,24 @@ impl QueryExecutor {
                 field_name != &collection.primary_vector
             }
         });
+        let needs_sparse_vectors = plan
+            .recall_sources
+            .iter()
+            .any(|source| matches!(&source.vector, QueryVector::Sparse(_)));
         for segment in segment_manager.segment_paths()? {
             let records = load_records_or_empty(&segment.records, collection.dimension)?;
             let external_ids = load_record_ids_or_empty(&segment.external_ids)?;
             let payloads = load_payloads_or_empty(&segment.payloads, external_ids.len())?;
             let vectors = if needs_secondary_vectors {
                 Some(load_vectors_or_empty(&segment.vectors, external_ids.len())?)
+            } else {
+                None
+            };
+            let sparse_vectors = if needs_sparse_vectors {
+                Some(load_sparse_vectors_or_empty(
+                    &segment.sparse_vectors,
+                    external_ids.len(),
+                )?)
             } else {
                 None
             };
@@ -87,6 +101,7 @@ impl QueryExecutor {
                     plan,
                     vector,
                     vectors.as_deref(),
+                    sparse_vectors.as_deref(),
                     row_idx,
                     &collection.primary_vector,
                 )?;
@@ -113,27 +128,31 @@ impl QueryExecutor {
             }
         }
 
-        if use_reranker {
-            return Ok(apply_reranker(collected, plan));
-        }
-
-        // Default: best-distance merge (existing behavior)
-        let mut hits = collected
-            .into_values()
-            .filter_map(|doc| {
-                let distance = match doc.best_distance {
-                    Some(d) => d,
-                    None => 0.0, // FilterOnlyScan
-                };
-                Some(DocumentHit {
-                    id: doc.id,
-                    distance,
-                    fields: doc.fields,
-                    vectors: BTreeMap::new(),
+        let mut hits = if use_reranker {
+            apply_reranker(collected, plan)
+        } else {
+            // Default: best-distance merge (existing behavior)
+            collected
+                .into_values()
+                .filter_map(|doc| {
+                    let distance = match doc.best_distance {
+                        Some(d) => d,
+                        None => 0.0, // FilterOnlyScan
+                    };
+                    Some(DocumentHit {
+                        id: doc.id,
+                        distance,
+                        fields: doc.fields,
+                        vectors: BTreeMap::new(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        hits.sort_by(compare_hits);
+                .collect::<Vec<_>>()
+        };
+        if let Some(order_by) = plan.order_by.as_ref() {
+            sort_hits_by_field(&mut hits, &order_by.field_name, order_by.descending);
+        } else {
+            hits.sort_by(compare_hits);
+        }
         if let Some(group_by) = plan.group_by.as_ref() {
             return Ok(collapse_hits_by_group(
                 hits,
@@ -155,6 +174,7 @@ fn compute_per_field_distances(
     plan: &BruteForceQueryPlan,
     primary_vector: &[f32],
     secondary_vectors: Option<&[BTreeMap<String, Vec<f32>>]>,
+    sparse_vectors: Option<&[BTreeMap<String, crate::document::SparseVector>]>,
     row_idx: usize,
     primary_vector_name: &str,
 ) -> io::Result<HashMap<String, f32>> {
@@ -163,19 +183,40 @@ fn compute_per_field_distances(
         let candidate_vector = match &source.kind {
             super::planner::RecallSourceKind::QueryById { field_name, .. }
             | super::planner::RecallSourceKind::ExplicitVector { field_name } => {
-                candidate_vector_for_field(
-                    field_name,
-                    primary_vector,
-                    secondary_vectors,
-                    row_idx,
-                    primary_vector_name,
-                )
+                // First check sparse vectors, then dense.
+                if let Some(sparse) = sparse_vectors {
+                    if let Some(sv) = sparse.get(row_idx).and_then(|row| row.get(field_name)) {
+                        Some(CandidateVector::Sparse(sv))
+                    } else {
+                        candidate_vector_for_field(
+                            field_name,
+                            primary_vector,
+                            secondary_vectors,
+                            row_idx,
+                            primary_vector_name,
+                        )
+                    }
+                } else {
+                    candidate_vector_for_field(
+                        field_name,
+                        primary_vector,
+                        secondary_vectors,
+                        row_idx,
+                        primary_vector_name,
+                    )
+                }
             }
         };
         let Some(candidate_vector) = candidate_vector else {
             continue;
         };
-        let distance = distance_by_metric(&source.vector, candidate_vector, &source.metric)?;
+        let distance = match (&source.vector, candidate_vector) {
+            (QueryVector::Dense(q), CandidateVector::Dense(v)) => {
+                distance_by_metric(q, v, &source.metric)?
+            }
+            (QueryVector::Sparse(q), CandidateVector::Sparse(v)) => -sparse_inner_product(q, v),
+            _ => continue, // type mismatch, skip
+        };
         distances.insert(source.field_key(), distance);
     }
     Ok(distances)
@@ -230,17 +271,26 @@ fn apply_reranker(
         .collect()
 }
 
+enum CandidateVector<'a> {
+    Dense(&'a [f32]),
+    Sparse(&'a crate::document::SparseVector),
+}
+
 fn candidate_vector_for_field<'a>(
     field_name: &str,
     primary_vector: &'a [f32],
     secondary_vectors: Option<&'a [BTreeMap<String, Vec<f32>>]>,
     row_idx: usize,
     primary_vector_name: &str,
-) -> Option<&'a [f32]> {
+) -> Option<CandidateVector<'a>> {
     if field_name == primary_vector_name {
-        Some(primary_vector)
+        Some(CandidateVector::Dense(primary_vector))
+    } else if let Some(vectors) = secondary_vectors {
+        vectors[row_idx]
+            .get(field_name)
+            .map(|v| CandidateVector::Dense(v.as_slice()))
     } else {
-        secondary_vectors.and_then(|vectors| vectors[row_idx].get(field_name).map(Vec::as_slice))
+        None
     }
 }
 
@@ -312,6 +362,7 @@ impl GroupByValueKey {
             FieldValue::Float(value) => Self::Float64(FloatGroupKey::new(*value as f64)),
             FieldValue::Float64(value) => Self::Float64(FloatGroupKey::new(*value)),
             FieldValue::Bool(value) => Self::Bool(*value),
+            FieldValue::Array(_) => Self::Missing, // arrays not groupable
         }
     }
 }
@@ -399,5 +450,89 @@ fn load_vectors_or_empty(
             Ok(vec![BTreeMap::new(); expected_rows])
         }
         Err(err) => Err(err),
+    }
+}
+
+fn load_sparse_vectors_or_empty(
+    path: &Path,
+    expected_rows: usize,
+) -> io::Result<Vec<BTreeMap<String, crate::document::SparseVector>>> {
+    match load_sparse_vectors(path) {
+        Ok(vectors) => {
+            if vectors.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse vector row count exceeds record row count",
+                ));
+            }
+            if vectors.len() < expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse vector row count is shorter than record row count",
+                ));
+            }
+            Ok(vectors)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(vec![BTreeMap::new(); expected_rows])
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Sort hits by a scalar field value. Missing values sort last (ascending) or first (descending).
+fn sort_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bool) {
+    hits.sort_by(|a, b| {
+        let av = a.fields.get(field_name);
+        let bv = b.fields.get(field_name);
+        let ord = match (av, bv) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(av), Some(bv)) => compare_field_value_for_sort(av, bv),
+        };
+        if descending { ord.reverse() } else { ord }.then_with(|| compare_hits(a, b))
+    });
+}
+
+/// Compare two FieldValue instances for sorting purposes.
+fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Ordering {
+    match (a, b) {
+        (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
+        (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
+        (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
+        (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
+        (FieldValue::UInt64(va), FieldValue::UInt64(vb)) => va.cmp(vb),
+        (FieldValue::Float(va), FieldValue::Float(vb)) => va.total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Float64(vb)) => va.total_cmp(vb),
+        (FieldValue::Bool(va), FieldValue::Bool(vb)) => va.cmp(vb),
+        // Cross-type numeric comparison: promote to f64
+        (FieldValue::Int64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Int64(vb)) => va.total_cmp(&(*vb as f64)),
+        (FieldValue::Int32(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Int32(vb)) => va.total_cmp(&(*vb as f64)),
+        (FieldValue::UInt64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::UInt64(vb)) => va.total_cmp(&(*vb as f64)),
+        // Int-to-Int cross-type
+        (FieldValue::Int64(va), FieldValue::Int32(vb)) => va.cmp(&(*vb as i64)),
+        (FieldValue::Int32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
+        (FieldValue::Int64(va), FieldValue::UInt32(vb)) => va.cmp(&(*vb as i64)),
+        (FieldValue::UInt32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
+        (FieldValue::Int64(va), FieldValue::UInt64(vb)) => {
+            if *va < 0 {
+                Ordering::Less
+            } else {
+                (*va as u64).cmp(vb)
+            }
+        }
+        (FieldValue::UInt64(va), FieldValue::Int64(vb)) => {
+            if *vb < 0 {
+                Ordering::Greater
+            } else {
+                va.cmp(&(*vb as u64))
+            }
+        }
+        // Fallback: stringify
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }
 }

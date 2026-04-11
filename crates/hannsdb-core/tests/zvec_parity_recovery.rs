@@ -41,11 +41,12 @@ fn write_segment(
         payloads.push(document.fields.clone());
     }
 
-    let inserted =
-        append_records(&segment_dir.join("records.bin"), dimension, &vectors).expect("write records");
+    let inserted = append_records(&segment_dir.join("records.bin"), dimension, &vectors)
+        .expect("write records");
     assert_eq!(inserted, documents.len(), "record count mismatch");
     let _ = append_record_ids(&segment_dir.join("ids.bin"), &ids).expect("write ids");
-    let _ = append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
+    let _ =
+        append_payloads(&segment_dir.join("payloads.jsonl"), &payloads).expect("write payloads");
 
     let mut tombstone = TombstoneMask::new(documents.len());
     for &row in deleted_rows {
@@ -55,9 +56,14 @@ fn write_segment(
         .save_to_path(&segment_dir.join("tombstones.json"))
         .expect("write tombstones");
 
-    SegmentMetadata::new(segment_id, dimension, documents.len(), tombstone.deleted_count())
-        .save_to_path(&segment_dir.join("segment.json"))
-        .expect("write segment metadata");
+    SegmentMetadata::new(
+        segment_id,
+        dimension,
+        documents.len(),
+        tombstone.deleted_count(),
+    )
+    .save_to_path(&segment_dir.join("segment.json"))
+    .expect("write segment metadata");
 }
 
 fn rewrite_collection_to_two_segment_layout(
@@ -127,7 +133,9 @@ fn zvec_parity_recovery_version_set_persists_format_metadata_on_disk() {
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("read version set")).expect("parse json");
     assert_eq!(
-        persisted.get("format_version").and_then(|value| value.as_u64()),
+        persisted
+            .get("format_version")
+            .and_then(|value| value.as_u64()),
         Some(COLLECTION_RUNTIME_FORMAT_VERSION as u64)
     );
 
@@ -189,8 +197,12 @@ fn zvec_parity_recovery_reopen_reads_multi_segment_version_metadata_through_hand
         vec!["seg-0002".to_string(), "seg-0001".to_string()]
     );
 
-    fs::remove_file(root.join("collections").join("docs").join("segment_set.json"))
-        .expect("remove segment_set after handle open");
+    fs::remove_file(
+        root.join("collections")
+            .join("docs")
+            .join("segment_set.json"),
+    )
+    .expect("remove segment_set after handle open");
     let cached_version_set = handle.version_set().expect("load cached version set");
     assert_eq!(cached_version_set, version_set);
 }
