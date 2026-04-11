@@ -1098,11 +1098,22 @@ impl HannsDb {
                         }
                     }
                 }
+                let mut sparse_vectors = existing.sparse_vectors.clone();
+                for (key, value) in &update.sparse_vectors {
+                    match value {
+                        Some(v) => {
+                            sparse_vectors.insert(key.clone(), v.clone());
+                        }
+                        None => {
+                            sparse_vectors.remove(key);
+                        }
+                    }
+                }
                 Some(Document {
                     id: update.id,
                     fields,
                     vectors,
-                    sparse_vectors: existing.sparse_vectors.clone(),
+                    sparse_vectors,
                 })
             })
             .collect();
