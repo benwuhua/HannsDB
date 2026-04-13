@@ -13,6 +13,9 @@ path = "src/lib.rs"
 name = "hannsdb-daemon"
 path = "src/main.rs"
 
+[features]
+hanns-backend = ["hannsdb-core/hanns-backend"]
+
 [dependencies]
 axum = { version = "0.7", features = ["json"] }
 hannsdb-core = { path = "../hannsdb-core" }

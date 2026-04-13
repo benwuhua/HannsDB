@@ -42,6 +42,22 @@ remote_ssh() {
     "$REMOTE_HOST" "$@"
 }
 
+bootstrap_remote_vdbb() {
+  sync_hannsdb
+  sync_knowhere
+  remote_ssh "set -euo pipefail && \
+    python3 -m venv $REMOTE_VENV_DIR && \
+    $REMOTE_VENV_DIR/bin/python -m pip install --upgrade pip wheel setuptools maturin && \
+    $REMOTE_VENV_DIR/bin/python -m pip install $REMOTE_VDBB_BASE_DEPS && \
+    source ~/.cargo/env && cd $REMOTE_DIR && \
+    VIRTUAL_ENV=$REMOTE_VENV_DIR PATH=$REMOTE_VENV_DIR/bin:\$PATH \
+    $REMOTE_VENV_DIR/bin/maturin develop \
+      --manifest-path $REMOTE_DIR/crates/hannsdb-py/Cargo.toml \
+      --release \
+      --no-default-features \
+      --features python-binding,hanns-backend"
+}
+
 case "${1:-}" in
   sync-knowhere)
     sync_knowhere
@@ -50,18 +66,34 @@ case "${1:-}" in
     remote_ssh "source ~/.cargo/env && cd $KNOWHERE_REMOTE_DIR && cargo build --release 2>&1 | tail -5"
     ;;
   vdbb-bootstrap)
-    sync_hannsdb
-    sync_knowhere
-    remote_ssh "set -euo pipefail && \
-      python3 -m venv $REMOTE_VENV_DIR && \
-      $REMOTE_VENV_DIR/bin/python -m pip install --upgrade pip wheel setuptools maturin && \
-      $REMOTE_VENV_DIR/bin/python -m pip install $REMOTE_VDBB_BASE_DEPS && \
-      source ~/.cargo/env && cd $REMOTE_DIR && \
-      $REMOTE_VENV_DIR/bin/maturin develop \
-        --manifest-path $REMOTE_DIR/crates/hannsdb-py/Cargo.toml \
-        --release \
-        --no-default-features \
-        --features python-binding,hanns-backend"
+    bootstrap_remote_vdbb
+    ;;
+  vdbb-perf)
+    bootstrap_remote_vdbb
+    remote_ssh "cd $REMOTE_DIR && \
+      VENV_PATH=$REMOTE_VENV_DIR \
+      VDBB_REPO=$REMOTE_VDBB_REPO \
+      SKIP_PY_REBUILD=1 \
+      DB_LABEL=${DB_LABEL:-hannsdb-remote-1536d50k} \
+      TASK_LABEL=${TASK_LABEL:-${DB_LABEL:-hannsdb-remote-1536d50k}} \
+      DB_PATH=${DB_PATH:-/tmp/${DB_LABEL:-hannsdb-remote-1536d50k}-db} \
+      K=${K:-10} M=${M:-16} EF_CONSTRUCTION=${EF_CONSTRUCTION:-64} EF_SEARCH=${EF_SEARCH:-32} \
+      NUM_CONCURRENCY=${NUM_CONCURRENCY:-1} CONCURRENCY_DURATION=${CONCURRENCY_DURATION:-1} \
+      bash scripts/run_vdbb_hannsdb_perf1536d50k.sh"
+    ;;
+  vdbb-watchdog)
+    bootstrap_remote_vdbb
+    remote_ssh "cd $REMOTE_DIR && \
+      VENV_PATH=$REMOTE_VENV_DIR \
+      VDBB_REPO=$REMOTE_VDBB_REPO \
+      SKIP_PY_REBUILD=1 \
+      DB_LABEL=${DB_LABEL:-hannsdb-remote-watchdog} \
+      TASK_LABEL=${TASK_LABEL:-${DB_LABEL:-hannsdb-remote-watchdog}} \
+      DB_PATH=${DB_PATH:-/tmp/${DB_LABEL:-hannsdb-remote-watchdog}-db} \
+      STALL_TIMEOUT_SEC=${STALL_TIMEOUT_SEC:-600} POST_LOAD_TIMEOUT_SEC=${POST_LOAD_TIMEOUT_SEC:-3600} \
+      K=${K:-10} M=${M:-16} EF_CONSTRUCTION=${EF_CONSTRUCTION:-64} EF_SEARCH=${EF_SEARCH:-32} \
+      NUM_CONCURRENCY=${NUM_CONCURRENCY:-1} CONCURRENCY_DURATION=${CONCURRENCY_DURATION:-1} \
+      bash scripts/run_vdbb_hannsdb_perf1536d50k_watchdog.sh"
     ;;
   knowhere-bench)
     remote_ssh "source ~/.cargo/env && cd $REMOTE_DIR && \
@@ -88,6 +120,6 @@ case "${1:-}" in
     ;;
   *)
     sync_hannsdb
-    echo "Synced HannsDB. Usage: $0 [build|test|bench|sync-knowhere|knowhere-build|knowhere-bench|vdbb-bootstrap]"
+    echo "Synced HannsDB. Usage: $0 [build|test|bench|sync-knowhere|knowhere-build|knowhere-bench|vdbb-bootstrap|vdbb-perf|vdbb-watchdog]"
     ;;
 esac

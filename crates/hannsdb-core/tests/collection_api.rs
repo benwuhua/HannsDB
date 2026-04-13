@@ -971,6 +971,74 @@ fn collection_api_get_collection_info_reports_stats() {
 }
 
 #[test]
+fn collection_api_get_collection_info_marks_index_complete_after_optimize() {
+    let root = unique_temp_dir("hannsdb_collection_api_info_index_complete");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.optimize_collection("docs").expect("optimize");
+
+    let info = db.get_collection_info("docs").expect("get collection info");
+    assert_eq!(info.index_completeness.get("vector"), Some(&1.0));
+}
+
+#[cfg(feature = "hanns-backend")]
+#[test]
+fn collection_api_get_collection_info_preserves_index_complete_after_reopen() {
+    let root = unique_temp_dir("hannsdb_collection_api_info_index_reopen");
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection("docs", 2, "l2")
+            .expect("create collection");
+        db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+            .expect("insert vectors");
+        db.optimize_collection("docs").expect("optimize");
+    }
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let info = reopened
+        .get_collection_info("docs")
+        .expect("get collection info after reopen");
+    assert_eq!(info.index_completeness.get("vector"), Some(&1.0));
+}
+
+#[cfg(feature = "hanns-backend")]
+#[test]
+fn collection_api_list_segments_marks_ann_ready_after_optimize() {
+    let root = unique_temp_dir("hannsdb_collection_api_segments_ann_ready");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.optimize_collection("docs").expect("optimize");
+
+    let segments = db.list_collection_segments("docs").expect("segments");
+    assert_eq!(segments.len(), 1);
+    assert!(segments[0].ann_ready);
+}
+
+#[cfg(feature = "hanns-backend")]
+#[test]
+fn collection_api_list_segments_clears_ann_ready_after_subsequent_write() {
+    let root = unique_temp_dir("hannsdb_collection_api_segments_ann_stale");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.optimize_collection("docs").expect("optimize");
+    db.insert("docs", &[33], &[2.0_f32, 2.0])
+        .expect("insert after optimize");
+
+    let segments = db.list_collection_segments("docs").expect("segments");
+    assert_eq!(segments.len(), 1);
+    assert!(!segments[0].ann_ready);
+}
+
+#[test]
 fn collection_api_get_collection_info_missing_returns_not_found() {
     let root = unique_temp_dir("hannsdb_collection_api_info_missing");
     let db = HannsDb::open(&root).expect("open db");

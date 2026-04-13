@@ -218,6 +218,17 @@ Fresh standard-path checkpoint after the latest rerun:
   - `recall=0.9441`
 - this is now a current end-to-end benchmark artifact, not just a local proxy note
 
+Fresh remote full x86 checkpoint:
+- result file:
+  - `result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
+- metrics:
+  - `insert_duration=24.1242`
+  - `optimize_duration=78.5678`
+  - `load_duration=102.692`
+  - `serial_latency_p99=0.0005`
+  - `recall=0.9442`
+- this confirms the full standard benchmark lane is now reproducible on the hk-x86 host as well
+
 Fresh remote x86 proxy checkpoint:
 - remote x86 host completed a larger release optimize proxy at `50K / 1536 / cosine`
 - output:

@@ -30,6 +30,7 @@
   - 完整 `collection_api` suite
   - 完整 `wal_recovery` suite
   - 完整 `segment_storage` suite
+  - feature-on ANN 状态合同
 - 正式文档已同步：
   - `docs/hannsdb-vs-zvec-gap-analysis.md`
   - `docs/hannsdb-hanns-vs-zvec-capability-report.md`
@@ -72,6 +73,14 @@
   - 兼容历史 `_dummy` schema sentinel
   - 通过同目录 `ids.bin` 推导真实行数，避免把非空 segment 误读成 0 行
 
+### 10. ANN 状态合同修复
+- `index_completeness` 不再只依赖内存 `search_cache`
+- 在 `hanns-backend` 下，若已存在持久化 ANN blob，重启后仍会继续报告 `1.0`
+- 数据写入（insert / insert_documents / upsert / delete）现在会失效持久化 ANN blob，避免 `ann_ready` 假阳性
+- daemon 包已增加 `hanns-backend` feature forwarding，`http_smoke` 可直接验证：
+  - optimize 后 `ann_ready=true`
+  - 后续写入后 `ann_ready=false`
+
 ## 最新验证证据
 
 ### Python focused surfaces
@@ -92,6 +101,7 @@ bash scripts/run_zvec_parity_smoke.sh
 - `collection_api` ✅
 - `wal_recovery` ✅
 - `segment_storage` ✅
+- feature-on ANN 状态合同 ✅
 - daemon `http_smoke` ✅
 - Python `168 passed, 4 skipped` ✅
 
@@ -211,3 +221,37 @@ N=200 DIM=64 METRIC=cosine TOPK=10 INDEX_KIND=hnsw QUERY_EF_SEARCH=48 REPEATS=1 
 说明：
 - 这是远端 x86 的 release optimize proxy，不是完整 VectorDBBench run
 - 但它确认了最新代码在远端 x86 上的较大规模路径可执行
+
+### 远端 hk-x86 完整 `Performance1536D50K`（2026-04-13）
+结果文件：
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
+
+关键指标：
+- `insert_duration=24.1242`
+- `optimize_duration=78.5678`
+- `load_duration=102.692`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+说明：
+- 这是 hk-x86 远端完整标准 benchmark，不是 proxy
+- 该结果是在修复远端 repo 路径、补齐 sibling `Hanns`、重建 Linux venv 并安装 `hannsdb` 扩展后得到的
+
+### 远端统一 watchdog 入口验证（2026-04-13）
+结果文件：
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-remote-watchdog-check_hannsdb.json`
+
+关键指标：
+- `insert_duration=22.057`
+- `optimize_duration=79.6991`
+- `load_duration=101.7561`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+说明：
+- 这是 `scripts/sync-remote.sh vdbb-watchdog` 新统一入口的成功验证结果
+- 说明远端 bootstrap + 统一 watchdog 路线已经可以完整复现标准 benchmark

@@ -55,7 +55,9 @@ cargo test -p hannsdb-core --test compaction -- --nocapture
 cargo test -p hannsdb-core --test collection_api -- --nocapture
 cargo test -p hannsdb-core --test wal_recovery -- --nocapture
 cargo test -p hannsdb-core --test segment_storage -- --nocapture
-cargo test -p hannsdb-daemon --test http_smoke -- --nocapture
+cargo test -p hannsdb-core collection_api_get_collection_info_preserves_index_complete_after_reopen --features hanns-backend -- --nocapture
+cargo test -p hannsdb-core collection_api_list_segments_clears_ann_ready_after_subsequent_write --features hanns-backend -- --nocapture
+cargo test -p hannsdb-daemon --features hanns-backend --test http_smoke -- --nocapture
 
 cd "$ROOT_DIR/crates/hannsdb-py"
 maturin develop --features python-binding,hanns-backend

@@ -1865,6 +1865,27 @@ async fn flush_collection_returns_not_found_if_manifest_entry_exists_but_collect
 }
 
 #[tokio::test]
+async fn collection_info_route_reports_index_complete_after_optimize() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app.clone().oneshot(Request::builder().method("POST").uri("/collections").header("content-type", "application/json").body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#)).expect("build request")).await.expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app.clone().oneshot(Request::builder().method("POST").uri("/collections/docs/records").header("content-type", "application/json").body(Body::from(r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#)).expect("build request")).await.expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let optimize = app.clone().oneshot(Request::builder().method("POST").uri("/collections/docs/admin/optimize").body(Body::empty()).expect("build request")).await.expect("send optimize request");
+    assert_eq!(optimize.status(), StatusCode::OK);
+
+    let info = app.oneshot(Request::builder().method("GET").uri("/collections/docs").body(Body::empty()).expect("build request")).await.expect("send info request");
+    assert_eq!(info.status(), StatusCode::OK);
+    let body = to_bytes(info.into_body(), usize::MAX).await.expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["index_completeness"]["vector"], serde_json::json!(1.0));
+}
+
+#[tokio::test]
 async fn collection_info_route_returns_stats() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
@@ -2238,6 +2259,103 @@ async fn admin_segments_route_returns_segment_stats_for_single_segment() {
     assert_eq!(json["segments"][0]["id"], "seg-0001");
     assert_eq!(json["segments"][0]["live"], 1);
     assert_eq!(json["segments"][0]["dead"], 1);
+    assert_eq!(json["segments"][0]["ann_ready"], false);
+}
+
+#[cfg(feature = "hanns-backend")]
+#[tokio::test]
+async fn admin_segments_route_reports_ann_ready_after_optimize_then_false_after_write() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let optimize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/admin/optimize")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send optimize request");
+    assert_eq!(optimize.status(), StatusCode::OK);
+
+    let segments_ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/admin/segments")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send segments request");
+    assert_eq!(segments_ready.status(), StatusCode::OK);
+    let body = to_bytes(segments_ready.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse segments json");
+    assert_eq!(json["segments"][0]["ann_ready"], true);
+
+    let insert_again = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["126"],"vectors":[[2.0,2.0]]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send second insert request");
+    assert_eq!(insert_again.status(), StatusCode::OK);
+
+    let segments_stale = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/admin/segments")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send stale segments request");
+    assert_eq!(segments_stale.status(), StatusCode::OK);
+    let body = to_bytes(segments_stale.into_body(), usize::MAX)
+        .await
+        .expect("read stale body");
+    let json: Value = serde_json::from_slice(&body).expect("parse stale segments json");
     assert_eq!(json["segments"][0]["ann_ready"], false);
 }
 

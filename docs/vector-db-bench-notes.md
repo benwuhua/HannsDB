@@ -1639,3 +1639,60 @@ Interpretation:
 - this is not a full VectorDBBench run; it is the remote x86 optimize proxy
 - it confirms the current larger-shape optimize/search path is executable on x86 with the latest synced code and sibling dependency layout
 - it also establishes a fresh x86-side proxy checkpoint to compare against the successful full `Performance1536D50K` local rerun
+
+
+## 50) hk-x86 full `Performance1536D50K` rerun (2026-04-13)
+
+Run label:
+- `hannsdb-hk-x86-20260413`
+
+Result file:
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
+
+Observed metrics:
+- `insert_duration=24.1242`
+- `optimize_duration=78.5678`
+- `load_duration=102.692`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+Interpretation:
+- unlike section 49, this is a full remote x86 `Performance1536D50K` result, not just a proxy
+- the main blockers were environment/bootstrap issues on the host, not current HannsDB benchmark logic
+- once the host had a real Linux venv plus the sibling `Hanns` repo synced, the full standard lane completed successfully
+
+Environment fixes required on `hk-x86` before this run succeeded:
+- sync sibling `Hanns` repo to `/data/work/Hanns` so `hannsdb-index` path dependencies resolve
+- stop relying on the copied macOS `.venv-hannsdb`; create a real Linux venv at `/data/work/HannsDB/.venv-hannsdb-remote`
+- install the VectorDBBench base dependency set into that Linux venv
+- run `maturin develop` against `crates/hannsdb-py` inside the Linux venv
+- use `PYTHONPATH=/data/work/VectorDBBench` instead of trying to editable-install VectorDBBench from a `.git`-less rsync tree
+
+Operational note:
+- `scripts/sync-remote.sh vdbb-bootstrap` is now the intended entrypoint for preparing the remote x86 benchmark environment before launching the full watchdog benchmark.
+
+
+## 51) Remote unified watchdog entrypoint validation (2026-04-13)
+
+The new `scripts/sync-remote.sh vdbb-watchdog` entrypoint completed a fresh full remote benchmark run after the remote bootstrap fixes.
+
+Run label:
+- `hannsdb-remote-watchdog-check`
+
+Result file:
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-remote-watchdog-check_hannsdb.json`
+
+Observed metrics:
+- `insert_duration=22.057`
+- `optimize_duration=79.6991`
+- `load_duration=101.7561`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+Interpretation:
+- this confirms the new first-class remote watchdog entrypoint can drive the full standard benchmark successfully
+- it is distinct from the earlier `hannsdb-hk-x86-20260413` run, but lands in the same performance/quality band

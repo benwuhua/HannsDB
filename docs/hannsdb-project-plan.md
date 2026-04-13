@@ -54,6 +54,7 @@
   - 2026-03-21 root cause of slow search identified: Python binding was installed without `knowhere-backend`, so `optimize_collection` fell back to brute-force; script patched to force maturin rebuild with correct features before each run
   - 2026-03-21 first clean end-to-end run with knowhere HNSW: `insert=121s optimize=81s serial_latency_p99=111ms recall=1.0`; result: `result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
   - 2026-04-13 fresh clean rerun: `result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
+  - 2026-04-13 remote hk-x86 full rerun: `result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
 - [ ] Convert current prototype durability into a real storage story
 
 ### Not started
@@ -141,6 +142,7 @@
 - [x] Keep a reproducible command and result artifact path for the latest standard-case run.
   - command: `DB_LABEL=hannsdb-p0-rerun-20260413 TASK_LABEL=hannsdb-p0-rerun-20260413 DB_PATH=/tmp/hannsdb-p0-rerun-20260413-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh`
   - result: `vectordb_bench/results/HannsDB/result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
+  - remote hk-x86 result: `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
 
 **Exit criteria:**
 - A full standard-case run completes end-to-end.
@@ -178,7 +180,11 @@
 
 - [x] Introduce explicit segment rollover rules.
 - [x] Add compaction/rebuild plan for tombstoned data.
-- [ ] Clarify when ANN state is rebuilt versus incrementally updated.
+- [x] Clarify when ANN state is rebuilt versus incrementally updated.
+  - 2026-04-13: persisted ANN completeness/`ann_ready` contracts are now explicit and tested:
+    - optimize marks ANN ready
+    - subsequent writes invalidate persisted ANN state
+    - reopen preserves completeness when a persisted ANN blob still exists
 - [x] Expose minimal admin controls through the daemon if needed.
 
 **Exit criteria:**

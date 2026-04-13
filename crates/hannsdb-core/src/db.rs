@@ -894,6 +894,7 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        invalidate_ann_blobs(&paths.dir)?;
         self.maybe_trigger_segment_rollover(&paths, &segment_meta)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
@@ -998,6 +999,7 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
         }
@@ -1066,6 +1068,7 @@ impl HannsDb {
 
         segment_meta.save_to_path(&paths.segment_meta)?;
         tombstone.save_to_path(&paths.tombstones)?;
+        invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
         }
@@ -1313,6 +1316,7 @@ impl HannsDb {
             }
         }
 
+        invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
         }
@@ -2181,15 +2185,24 @@ impl CollectionHandle {
             .lock()
             .expect("search cache mutex poisoned");
         for vector_schema in &collection_meta.vectors {
+            let has_persisted_ann = persisted_ann_exists(
+                &paths.dir,
+                vector_schema.name.as_str(),
+                vector_schema.name == collection_meta.primary_vector,
+            );
             let completeness = if live_count == 0 {
                 // No data: vacuously fully indexed.
                 1.0
             } else if let Some(state) = cache.get(&vector_schema.name) {
                 if state.optimized_ann.is_some() {
                     1.0
+                } else if has_persisted_ann {
+                    1.0
                 } else {
                     0.0
                 }
+            } else if has_persisted_ann {
+                1.0
             } else {
                 0.0
             };
@@ -3060,6 +3073,11 @@ fn load_shadowed_live_vector_records(
 
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("manifest.json")
+}
+
+fn persisted_ann_exists(collection_dir: &Path, field_name: &str, is_primary: bool) -> bool {
+    ann_blob_path(collection_dir, field_name).exists()
+        || (is_primary && collection_dir.join("hnsw_index.bin").exists())
 }
 
 fn wal_path(root: &Path) -> PathBuf {
