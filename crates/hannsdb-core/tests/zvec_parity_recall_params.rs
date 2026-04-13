@@ -9,7 +9,6 @@
 ///   L2     = sqrt(sum((a-b)^2))
 ///   Cosine = 1 - dot(a,b)/(norm(a)*norm(b))
 ///   IP     = -dot(a,b)   (negated so smaller = more similar)
-
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
@@ -131,7 +130,8 @@ fn insert_test_data(
         .iter()
         .map(|(id, vec)| Document::new(*id, [], vec.clone()))
         .collect();
-    db.insert_documents(collection, &docs).expect("insert documents");
+    db.insert_documents(collection, &docs)
+        .expect("insert documents");
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +658,8 @@ fn zvec_parity_filtered_recall_matches_ground_truth() {
             )
         })
         .collect();
-    db.insert_documents("filtered_recall", &docs).expect("insert");
+    db.insert_documents("filtered_recall", &docs)
+        .expect("insert");
 
     // Query: only group == 0 documents
     let query = &vectors[0].1;

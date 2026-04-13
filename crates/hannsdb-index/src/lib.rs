@@ -4,7 +4,9 @@ pub mod descriptor;
 pub mod factory;
 pub mod flat;
 pub mod hnsw;
+pub mod hnsw_hvq;
 pub mod ivf;
+pub mod ivf_usq;
 pub mod scalar;
 pub mod sparse;
 

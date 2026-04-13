@@ -171,15 +171,15 @@ def test_native_collection_delete_by_filter_invalid_filter_propagates(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "method_name,args",
+    "method_name,args,expected_error,match",
     [
-        ("add_column", ("session_id",)),
-        ("drop_column", ("session_id",)),
-        ("alter_column", ("session_id",)),
+        ("add_column", ("session_id",), TypeError, "data_type"),
+        ("drop_column", ("session_id",), FileNotFoundError, "field not found"),
+        ("alter_column", ("session_id",), TypeError, "new_name"),
     ],
 )
-def test_native_collection_column_mutation_surfaces_are_explicitly_unsupported(
-    tmp_path, method_name, args
+def test_native_collection_column_mutation_surface_requires_current_contract(
+    tmp_path, method_name, args, expected_error, match
 ):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -198,7 +198,7 @@ def test_native_collection_column_mutation_surfaces_are_explicitly_unsupported(
         schema._get_native(),
     )
 
-    with pytest.raises(NotImplementedError, match=rf"{method_name}.*not supported yet"):
+    with pytest.raises(expected_error, match=match):
         getattr(collection, method_name)(*args)
 
     collection.destroy()

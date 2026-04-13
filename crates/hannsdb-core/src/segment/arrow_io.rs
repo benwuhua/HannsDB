@@ -69,11 +69,24 @@ pub fn load_payloads_arrow_with_projection(
     path: &Path,
     fields: Option<&[String]>,
 ) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    if is_zero_byte_arrow_sentinel(path)? {
+        return Ok(vec![
+            BTreeMap::new();
+            infer_segment_row_count_from_ids(path)?
+        ]);
+    }
+
     let file = File::open(path)?;
     // Arrow FileReader projection uses column indices. We need to read the
     // schema first to map field names to indices.
     let metadata_reader = FileReader::try_new(file, None).map_err(arrow_to_io)?;
     let schema = metadata_reader.schema();
+    if is_empty_arrow_schema(schema.as_ref()) {
+        return Ok(vec![
+            BTreeMap::new();
+            infer_segment_row_count_from_ids(path)?
+        ]);
+    }
     let projection: Option<Vec<usize>> = fields.map(|names| {
         let name_set: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
         schema
@@ -179,8 +192,21 @@ pub fn write_vectors_arrow(
 // ---------------------------------------------------------------------------
 
 pub fn load_vectors_arrow(path: &Path) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    if is_zero_byte_arrow_sentinel(path)? {
+        return Ok(vec![
+            BTreeMap::new();
+            infer_segment_row_count_from_ids(path)?
+        ]);
+    }
+
     let file = File::open(path)?;
     let reader = FileReader::try_new(file, None).map_err(arrow_to_io)?;
+    if is_empty_arrow_schema(reader.schema().as_ref()) {
+        return Ok(vec![
+            BTreeMap::new();
+            infer_segment_row_count_from_ids(path)?
+        ]);
+    }
     let mut vectors = Vec::new();
     for batch_result in reader {
         let batch = batch_result.map_err(arrow_to_io)?;
@@ -229,7 +255,7 @@ fn write_batch(path: &Path, batch: &RecordBatch) -> io::Result<()> {
     let schema = batch.schema();
     // Arrow IPC requires at least one column for FileWriter. If the schema
     // is empty, write a sentinel file so the .arrow path exists.
-    if schema.fields().is_empty() {
+    if is_empty_arrow_schema(schema.as_ref()) {
         // Just write an empty file as a marker.
         return Ok(());
     }
@@ -237,6 +263,31 @@ fn write_batch(path: &Path, batch: &RecordBatch) -> io::Result<()> {
     writer.write(batch).map_err(arrow_to_io)?;
     writer.finish().map_err(arrow_to_io)?;
     Ok(())
+}
+
+fn is_zero_byte_arrow_sentinel(path: &Path) -> io::Result<bool> {
+    Ok(std::fs::metadata(path)?.len() == 0)
+}
+
+fn is_empty_arrow_schema(schema: &Schema) -> bool {
+    schema.fields().len() == 1
+        && schema.fields()[0].name() == "_dummy"
+        && matches!(schema.fields()[0].data_type(), DataType::Null)
+}
+
+fn infer_segment_row_count_from_ids(arrow_path: &Path) -> io::Result<usize> {
+    let ids_path = arrow_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("ids.bin");
+    let bytes = std::fs::read(ids_path)?;
+    if bytes.len() % 8 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ids.bin byte length is not aligned to i64 row ids",
+        ));
+    }
+    Ok(bytes.len() / 8)
 }
 
 fn build_payload_schema(field_schemas: &[ScalarFieldSchema], ad_hoc_names: &[String]) -> Schema {

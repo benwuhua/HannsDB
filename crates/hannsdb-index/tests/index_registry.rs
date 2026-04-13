@@ -41,6 +41,56 @@ fn vector_and_scalar_descriptors_round_trip_through_json() {
 }
 
 #[test]
+fn ivf_usq_vector_descriptor_round_trips_through_json() {
+    let vector = VectorIndexDescriptor {
+        field_name: "embedding".to_string(),
+        kind: VectorIndexKind::IvfUsq,
+        metric: Some("l2".to_string()),
+        params: json!({
+            "nlist": 32,
+            "bits_per_dim": 4,
+            "rotation_seed": 42,
+            "rerank_k": 64,
+            "use_high_accuracy_scan": true
+        }),
+    };
+
+    let vector_json = serde_json::to_value(&vector).expect("serialize vector descriptor");
+    assert_eq!(vector_json["kind"], "ivf_usq");
+    assert_eq!(vector_json["params"]["nlist"], 32);
+    assert_eq!(vector_json["params"]["bits_per_dim"], 4);
+
+    let restored_vector: VectorIndexDescriptor =
+        serde_json::from_value(vector_json).expect("deserialize vector descriptor");
+    assert_eq!(restored_vector, vector);
+}
+
+#[test]
+fn hnsw_hvq_vector_descriptor_round_trips_through_json() {
+    let vector = VectorIndexDescriptor {
+        field_name: "embedding".to_string(),
+        kind: VectorIndexKind::HnswHvq,
+        metric: Some("ip".to_string()),
+        params: json!({
+            "m": 16,
+            "m_max0": 32,
+            "ef_construction": 100,
+            "ef_search": 64,
+            "nbits": 4
+        }),
+    };
+
+    let vector_json = serde_json::to_value(&vector).expect("serialize vector descriptor");
+    assert_eq!(vector_json["kind"], "hnsw_hvq");
+    assert_eq!(vector_json["params"]["m"], 16);
+    assert_eq!(vector_json["params"]["nbits"], 4);
+
+    let restored_vector: VectorIndexDescriptor =
+        serde_json::from_value(vector_json).expect("deserialize vector descriptor");
+    assert_eq!(restored_vector, vector);
+}
+
+#[test]
 fn factory_creates_expected_vector_backend_for_descriptor_kind() {
     let factory = DefaultIndexFactory::default();
     let descriptor = VectorIndexDescriptor {

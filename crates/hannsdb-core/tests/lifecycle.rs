@@ -151,10 +151,8 @@ fn lifecycle_compact_reopen_search_returns_correct_results() {
 }
 
 /// Inserting past the tombstone-ratio threshold (20 %) triggers the rollover
-/// mechanism.  The mechanism creates `segment_set.json` and the segment
-/// directories; it does not yet migrate existing data files.
+/// mechanism and keeps the collection readable after reopen.
 #[test]
-#[ignore = "auto-rollover disabled until insert_internal supports multi-segment writes"]
 fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
@@ -201,6 +199,13 @@ fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
             "immutable segment directory must exist: {id}"
         );
     }
+
+    let reopened = HannsDb::open(root).expect("reopen after rollover");
+    let hits = reopened
+        .search("docs", &[0.0_f32, 0.0], 3)
+        .expect("search after rollover reopen");
+    let hit_ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
+    assert_eq!(hit_ids, vec![21, 22, 23]);
 }
 
 /// Calling compact on a collection that has no `segment_set.json` (flat

@@ -1,4 +1,7 @@
-use crate::adapter::{AdapterError, HnswSearchHit, MetricKind, VectorIndexBackend};
+use crate::adapter::{AdapterError, HnswSearchHit, VectorIndexBackend};
+
+#[cfg(feature = "hanns-backend")]
+use crate::adapter::MetricKind;
 
 #[cfg(feature = "hanns-backend")]
 use std::sync::Arc;

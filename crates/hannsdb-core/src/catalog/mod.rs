@@ -4,6 +4,7 @@ mod manifest;
 pub mod schema_mutation;
 mod version;
 
+pub use crate::pk::PrimaryKeyMode;
 pub use collection::CollectionMetadata;
 pub use index::IndexCatalog;
 pub use manifest::ManifestMetadata;

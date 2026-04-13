@@ -89,7 +89,8 @@ fn doc_sparse(id: i64, name: &str, age: i64, vec: Vec<f32>, sv: SparseVector) ->
 fn batch_insert_100_docs_all_fetched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     let docs: Vec<Document> = (0..100)
         .map(|i| doc(i, &format!("user_{i}"), 20 + i, vec![i as f32; 4]))
@@ -113,7 +114,8 @@ fn batch_insert_100_docs_all_fetched() {
 fn insert_duplicate_id_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("first insert");
@@ -137,7 +139,8 @@ fn insert_duplicate_id_fails() {
 fn upsert_existing_doc_updates_fields_and_vector() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("insert");
@@ -152,10 +155,7 @@ fn upsert_existing_doc_updates_fields_and_vector() {
         Some(&FieldValue::String("bob".into()))
     );
     assert_eq!(fetched[0].fields.get("age"), Some(&FieldValue::Int64(25)));
-    assert_eq!(
-        fetched[0].vectors.get(PV),
-        Some(&vec![0.9; 4])
-    );
+    assert_eq!(fetched[0].vectors.get(PV), Some(&vec![0.9; 4]));
 
     // Only one live doc.
     let info = db.get_collection_info("c").expect("info");
@@ -170,7 +170,8 @@ fn upsert_existing_doc_updates_fields_and_vector() {
 fn upsert_new_doc_acts_as_insert() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.upsert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("upsert as insert");
@@ -191,7 +192,8 @@ fn upsert_new_doc_acts_as_insert() {
 fn partial_field_update_preserves_untouched_fields() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("insert");
@@ -230,7 +232,8 @@ fn partial_field_update_preserves_untouched_fields() {
 fn update_vector_only_preserves_fields() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("insert");
@@ -266,7 +269,8 @@ fn update_vector_only_preserves_fields() {
 fn delete_by_filter_removes_matching_docs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents(
         "c",
@@ -279,7 +283,9 @@ fn delete_by_filter_removes_matching_docs() {
     )
     .expect("insert");
 
-    let deleted = db.delete_by_filter("c", "age > 30").expect("delete by filter");
+    let deleted = db
+        .delete_by_filter("c", "age > 30")
+        .expect("delete by filter");
     assert_eq!(deleted, 2); // carol(35), dave(40)
 
     let fetched = db.fetch_documents("c", &[1, 2, 3, 4]).expect("fetch");
@@ -295,7 +301,8 @@ fn delete_by_filter_removes_matching_docs() {
 fn delete_by_ids_removes_target_docs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents(
         "c",
@@ -323,7 +330,8 @@ fn delete_by_ids_removes_target_docs() {
 fn delete_non_existent_id_is_noop() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     // Empty collection — deleting anything is a no-op.
     let deleted = db.delete("c", &[999]).expect("delete non-existent");
@@ -338,7 +346,8 @@ fn delete_non_existent_id_is_noop() {
 fn fetch_non_existent_id_returns_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("insert");
@@ -355,7 +364,8 @@ fn fetch_non_existent_id_returns_empty() {
 fn fetch_partial_non_existent_returns_only_existing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents(
         "c",
@@ -388,7 +398,10 @@ fn insert_with_sparse_vectors_stored_and_fetchable() {
 
     let fetched = db.fetch_documents("c", &[1]).expect("fetch");
     assert_eq!(fetched.len(), 1);
-    let got = fetched[0].sparse_vectors.get("sparse").expect("sparse field");
+    let got = fetched[0]
+        .sparse_vectors
+        .get("sparse")
+        .expect("sparse field");
     assert_eq!(got.indices, vec![1, 5, 10]);
     assert_eq!(got.values, vec![0.5, 1.0, 2.0]);
 }
@@ -424,7 +437,10 @@ fn update_sparse_vector_replaces_value() {
     .expect("update sparse");
 
     let fetched = db.fetch_documents("c", &[1]).expect("fetch");
-    let got = fetched[0].sparse_vectors.get("sparse").expect("sparse field");
+    let got = fetched[0]
+        .sparse_vectors
+        .get("sparse")
+        .expect("sparse field");
     assert_eq!(got.indices, vec![2, 7]);
     assert_eq!(got.values, vec![3.0, 4.0]);
     // Other fields unchanged.
@@ -442,7 +458,8 @@ fn update_sparse_vector_replaces_value() {
 fn empty_collection_search_returns_no_hits() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     let hits = db.search("c", &[0.0; 4], 10).expect("search");
     assert!(hits.is_empty());
@@ -461,7 +478,8 @@ fn empty_collection_search_returns_no_hits() {
 fn insert_after_delete_succeeds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
         .expect("insert");
@@ -488,7 +506,8 @@ fn insert_after_delete_succeeds() {
 fn batch_upsert_mix_new_and_existing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     // Pre-insert id=1.
     db.insert_documents("c", &[doc(1, "alice", 30, vec![0.1; 4])])
@@ -526,7 +545,8 @@ fn batch_upsert_mix_new_and_existing() {
 fn delete_all_then_query_returns_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     db.insert_documents(
         "c",
@@ -554,7 +574,8 @@ fn delete_all_then_query_returns_empty() {
 fn concurrent_insert_and_query_no_deadlock() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     // Seed one document so search has something to find.
     db.insert_documents("c", &[doc(0, "seed", 0, vec![0.0; 4])])
@@ -572,7 +593,12 @@ fn concurrent_insert_and_query_no_deadlock() {
                 // Inserter.
                 let docs: Vec<Document> = (1..=5)
                     .map(|j| {
-                        doc(i * 100 + j, &format!("t{i}_d{j}"), 20 + j, vec![j as f32; 4])
+                        doc(
+                            i * 100 + j,
+                            &format!("t{i}_d{j}"),
+                            20 + j,
+                            vec![j as f32; 4],
+                        )
                     })
                     .collect();
                 db.insert_documents("c", &docs).expect("concurrent insert");
@@ -606,7 +632,8 @@ fn concurrent_insert_and_query_no_deadlock() {
 fn concurrent_mixed_operations_no_deadlock() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     // Seed 10 documents.
     let seed: Vec<Document> = (0..10)
@@ -668,7 +695,8 @@ fn concurrent_mixed_operations_no_deadlock() {
 fn concurrent_rapid_fire_operations_no_panic() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(tmp.path()).expect("open");
-    db.create_collection_with_schema("c", &make_schema()).expect("create");
+    db.create_collection_with_schema("c", &make_schema())
+        .expect("create");
 
     let db = Arc::new(Mutex::new(db));
     let mut handles = Vec::new();
@@ -682,24 +710,14 @@ fn concurrent_rapid_fire_operations_no_panic() {
                     // Insert.
                     let _ = db.insert_documents(
                         "c",
-                        &[doc(
-                            1000 + i,
-                            &format!("rapid_{i}"),
-                            i,
-                            vec![i as f32; 4],
-                        )],
+                        &[doc(1000 + i, &format!("rapid_{i}"), i, vec![i as f32; 4])],
                     );
                 }
                 1 => {
                     // Upsert.
                     let _ = db.upsert_documents(
                         "c",
-                        &[doc(
-                            2000 + i,
-                            &format!("upsert_{i}"),
-                            i,
-                            vec![i as f32; 4],
-                        )],
+                        &[doc(2000 + i, &format!("upsert_{i}"), i, vec![i as f32; 4])],
                     );
                 }
                 2 => {

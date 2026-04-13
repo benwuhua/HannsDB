@@ -195,28 +195,6 @@ pub(crate) fn ann_search_with_bitset(
 // ANN blob persistence
 // ---------------------------------------------------------------------------
 
-/// Persist ANN index blob and external IDs for a single field.
-pub(crate) fn persist_ann_blob(
-    collection_dir: &Path,
-    field_name: &str,
-    blob_bytes: &[u8],
-    ann_external_ids: &[i64],
-) -> io::Result<()> {
-    let blob_path = ann_blob_path(collection_dir, field_name);
-    if let Some(parent) = blob_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&blob_path, blob_bytes)?;
-
-    let ids_path = ann_ids_path(collection_dir, field_name);
-    let ids_bytes: Vec<u8> = ann_external_ids
-        .iter()
-        .flat_map(|id| id.to_le_bytes())
-        .collect();
-    fs::write(&ids_path, &ids_bytes)?;
-    Ok(())
-}
-
 /// Delete all persisted ANN blobs for a collection.
 pub(crate) fn invalidate_ann_blobs(collection_dir: &Path) -> io::Result<()> {
     let ann_dir = collection_dir.join("ann");

@@ -1,232 +1,236 @@
-# HannsDB vs Zvec Feature Gap Analysis (2026-04-10)
+# HannsDB vs Zvec Current Gap Analysis (2026-04-12)
 
-## 一、总体对比
+## 一、结论先行
 
-| 维度 | HannsDB | Zvec | 差距 |
-|------|---------|------|------|
+旧版本分析已经明显过时。当前 HannsDB 和 Zvec 的差距，不再是“有没有 update / group_by / sparse / 基础 filter”这种 0 到 1 问题，而是下面三类更实质的差距：
+
+1. **底层 storage/runtime 深度** 仍落后于 Zvec。
+2. **Python / public API 产品面** 仍明显不够完整，但已经继续缩小。
+3. **查询组合能力、schema mutation 深度、主键模型** 还没有达到 Zvec 的成熟度。
+
+换句话说，HannsDB 现在已经跨过“基础功能缺失”阶段，进入“底层架构和产品化深度不足”阶段。
+
+---
+
+## 二、当前对比概览
+
+| 维度 | HannsDB 当前状态 | Zvec 当前状态 | 当前 gap |
+|------|------------------|---------------|----------|
 | 核心语言 | Rust | C++17 | — |
-| 存储引擎 | JSONL + 二进制 flat 文件 | Arrow IPC + Parquet 列存 | **大** |
-| 架构 | 嵌入式 + HTTP daemon | 纯嵌入式（Python/Node.js） | — |
-| 索引类型 | 3 (HNSW, IVF, Flat) | 8 (HNSW, HNSW+RaBitQ, IVF, Flat, Sparse HNSW, Sparse Flat, Inverted) | **大** |
-| 数据类型 | 8 | 22 | **大** |
-| 多向量 | 支持 | 支持 | 平 |
-| 多段管理 | 单段 (v1) | 完整多段 + 自动分裂 (10M docs) | **大** |
-| SQL 解析 | 简单自定义 parser | ANTLR4 完整 SQL parser | **中** |
-| 量化 | 无 | FP16, INT8, INT4, RaBitQ | **大** |
-| 稀疏向量 | 不支持 | 支持 (FP32, FP16) | **大** |
+| 存储路径 | `records.bin` + `payloads.jsonl` + `vectors.jsonl` + `ids.bin`，辅以 segment/version 元数据 | Arrow IPC + Parquet forward store + version/segment runtime | **大** |
+| 段管理 | 已有 `SegmentManager` / `VersionSet`，不再是纯单段 | 完整多段、版本管理、成熟 segment lifecycle | **大** |
+| 向量索引族 | Flat / HNSW / HNSW-HVQ / IVF / IVF-USQ | Flat / HNSW / HNSW+RaBitQ / IVF 等更多产品化组合 | **中** |
+| 稀疏索引 | core 已有 sparse runtime 和 descriptor | 产品化更完整 | **中** |
+| 标量索引 | 内建倒排索引 | 更成熟的倒排与存储体系 | **中** |
+| 数据类型 | core 与 Python 暴露面不一致，Python 面仍偏窄 | Python/public surface 更完整 | **大** |
+| Query surface | core 能力比 facade 强，部分组合仍受限 | 统一 query executor 更完整 | **中** |
+| Schema mutation | 已有基础增删改列 | option/expression 更丰富 | **中** |
+| 主键模型 | Python 层仍偏 `i64` doc id | 字符串 PK 模型成熟 | **中** |
 
 ---
 
-## 二、逐项 GAP 详细分析
+## 三、已经不应再算 gap 的部分
 
-### GAP-1: 存储层 (Critical)
+下面这些结论如果还出现在对外分析里，会误导优先级判断。
 
-**Zvec**: Arrow IPC + Parquet 列存，三种前向存储实现
-- `MemForwardStore` — 内存 Arrow RecordBatch，写段缓存
-- `MmapForwardStore` — mmap 读取 Parquet/IPC 文件
-- `BufferPoolForwardStore` — 缓冲池管理读取
+### 1. 基础 mutation 已经落地
 
-**HannsDB**:
-- `records.bin` — f32 平铺二进制（追加写入）
-- `payloads.jsonl` — JSON 行格式标量字段
-- `vectors.jsonl` — JSON 行格式次向量
-- `ids.bin` — i64 平铺二进制
+HannsDB 当前已经有可工作的：
 
-**影响**:
-- Insert 性能: Zvec 4.2x 快（列存追加 vs JSONL 序列化）
-- 读取效率: Parquet 列存按需读列，JSONL 全行解析
-- 磁盘空间: 列存压缩率远高于 JSONL
+- `update`
+- `add_column`
+- `drop_column`
+- `alter_column`
 
-### GAP-2: 多段管理 (Critical)
+这些不是计划项，也不是 stub。
 
-**Zvec**: 完整多段架构
-- 写段达到 `max_doc_count_per_segment`（默认 10M）自动 dump
-- `SegmentManager` 管理不可变段
-- `Optimize()` 自动合并删除率 > 30% 的段
-- MVCC 式版本管理（protobuf Manifest）
+### 2. `query_by_id` 和 `group_by` 已经具备
 
-**HannsDB**:
-- 单段 v1，多段代码存在但 auto-rollover 被禁用
-- `compact_collection()` 需手动调用
-- 版本管理用 JSON `segment_set.json`
+当前 core 里已经有对应 query AST 与执行路径，相关 parity tests 可通过。  
+因此不能再把它们归类成“功能缺失”。
 
-### GAP-3: 索引类型 (Major)
+### 3. sparse 不是空白
 
-**Zvec** (8 种):
-| 索引 | 说明 |
-|------|------|
-| FLAT | 暴力扫描 |
-| HNSW | 默认 m=50, ef_construction=500 |
-| HNSW_RABITQ | HNSW + RaBitQ 量化（Linux x86_64） |
-| IVF | n_list=1024 |
-| HNSW_SPARSE | 稀疏向量专用 HNSW |
-| FLAT_SPARSE | 稀疏向量专用 Flat |
-| INVERTED | 标量倒排（RocksDB） |
+HannsDB core 已经具备 sparse vector 数据结构、descriptor 与 runtime，且有 parity tests。  
+当前 gap 不在“有没有 sparse”，而在“对外产品面和参数面是否达到 Zvec 水平”。
 
-**HannsDB** (3 种):
-| 索引 | 说明 |
-|------|------|
-| Flat | 暴力扫描 |
-| HNSW | 默认 m=16, ef_construction=64 |
-| IVF | — |
+### 4. filter grammar 已经明显增强
 
-**缺失**:
-- 稀疏向量索引
-- RaBitQ 量化（阿里自研，需要 AVX2/AVX-512）
-- 量化支持 (FP16, INT8, INT4)
+当前 HannsDB 已经支持的范围，至少包括：
 
-### GAP-4: 数据类型 (Major)
+- `IN / NOT IN`
+- `LIKE / NOT LIKE`
+- `IS NULL / IS NOT NULL`
+- `has_prefix / has_suffix`
+- 数组 `contains` / `contains_any` / `contains_all`
 
-**Zvec 支持 22 种数据类型**:
+因此“只支持简单比较表达式”的说法已经不成立。
 
-标量 (8): BOOL, INT32, INT64, UINT32, UINT64, FLOAT, DOUBLE, STRING
+### 5. “只有单段”这个判断已经过时
 
-密集向量 (8): VECTOR_BINARY32/64, VECTOR_FP16/FP32/FP64, VECTOR_INT4/INT8/INT16
-
-稀疏向量 (2): SPARSE_VECTOR_FP32, SPARSE_VECTOR_FP16
-
-数组 (7): ARRAY_STRING, ARRAY_BOOL, ARRAY_INT32/INT64, ARRAY_UINT32/UINT64, ARRAY_FLOAT/DOUBLE
-
-**HannsDB 支持 8 种**: String, Int64, Int32, UInt32, UInt64, Float, Float64, Bool
-
-**缺失**:
-- 所有数组类型 (ARRAY_*)
-- 稀疏向量类型 (SPARSE_VECTOR_*)
-- 二进制类型 (BINARY)
-- 量化向量类型 (FP16, INT4, INT8, INT16)
-
-### GAP-5: SQL 查询引擎 (Medium)
-
-**Zvec**: ANTLR4 完整 SQL 解析器
-- 支持: `=, !=, <, >, <=, >=, LIKE, NOT LIKE, IN, NOT IN`
-- 支持: `CONTAIN_ALL, CONTAIN_ANY, NOT_CONTAIN_ALL, NOT_CONTAIN_ANY`
-- 支持: `IS NULL, IS NOT NULL`
-- 支持: 逻辑组合 `AND, OR, ()`
-- 查询优化器自动选择 pre-filter vs post-filter
-
-**HannsDB**: 自定义简单 parser
-- 支持: `==, !=, <, >, <=, >=`
-- 支持: `and, or, ()`
-- 支持: `in, not in`（代码中实现但 parser 支持有限）
-- 基本标量索引候选集查询
-
-**缺失**: LIKE 模糊匹配、NULL 检查、数组包含操作、查询优化器
-
-### GAP-6: 标量索引能力 (Medium)
-
-**Zvec**: RocksDB 倒排索引
-- 支持 EQ, NE, LT, LE, GT, GE, LIKE, IN, CONTAIN_ALL, CONTAIN_ANY
-- IS_NULL, IS_NOT_NULL, HAS_PREFIX, HAS_SUFFIX
-- 可选范围优化和扩展通配符
-
-**HannsDB**: 内存倒排索引 `InvertedScalarIndex`
-- 支持 EQ, NE, LT, LE, GT, GE, IN, NOT IN
-- 无 LIKE、NULL 检查、数组操作
-
-### GAP-7: ID 映射 (Medium)
-
-**Zvec**: RocksDB
-- 字符串 PK → uint64 doc_id
-- 支持快照、列族、压缩
-
-**HannsDB**: `ids.bin` 二进制文件
-- i64 外部 ID，追加写入
-- 无字符串 PK 支持
-
-### GAP-8: 量化支持 (Major)
-
-**Zvec**: 每个索引可选量化
-- FP16: 半精度浮点
-- INT8: 8-bit 整数量化
-- INT4: 4-bit 整数量化
-- RaBitQ: 阿里自研量化（64-4095 维）
-
-**HannsDB**: 无量化支持
-
-### GAP-9: 稀疏向量 (Major)
-
-**Zvec**: 完整稀疏向量支持
-- 存储格式: `{indices: Vec<u32>, values: Vec<f32>}`
-- 专用索引: HNSW_SPARSE, FLAT_SPARSE
-- Python API: `SPARSE_VECTOR_FP32`, `SPARSE_VECTOR_FP16`
-
-**HannsDB**: 不支持
-
-### GAP-10: 嵌入 & 重排 (Extension)
-
-**Zvec Python 扩展**:
-
-嵌入函数 (6 种):
-- DefaultLocalDenseEmbedding (SentenceTransformers)
-- OpenAIDenseEmbedding
-- QwenDenseEmbedding (DashScope)
-- JinaDenseEmbedding
-- HTTPDenseEmbedding (通用 /v1/embeddings)
-- BM25EmbeddingFunction (DashText)
-- DefaultLocalSparseEmbedding (SPLADE)
-- QwenSparseEmbedding
-
-重排器 (4 种):
-- RrfReRanker (Reciprocal Rank Fusion)
-- WeightedReRanker (加权融合)
-- DefaultLocalReRanker (Cross-Encoder)
-- QwenReRanker (DashScope API)
-
-**HannsDB**:
-- 核心: RRF + Weighted 融合（QueryContext 中实现）
-- 无嵌入函数
-- 无 Cross-Encoder 重排
+HannsDB 现在已经存在 segment manager / version set 路径，不应继续按“纯单段 v1 原型”描述。  
+真实问题是：**虽然已经进入多段方向，但 runtime / persistence / lifecycle 的成熟度仍明显落后于 Zvec。**
 
 ---
 
-## 三、HannsDB 优势
+## 四、当前真实 gap
 
-| 维度 | HannsDB | Zvec |
-|------|---------|------|
-| HTTP API | 有 (Axum daemon, 20 routes) | 无 |
-| Rust 生态 | 纯 Rust，可嵌入 Rust 应用 | C++，绑定有限 |
-| Search QPS | 744.6 (3.8x 快) | 197.8 |
-| P99 延迟 | 1.50ms (4.3x 快) | 6.52ms |
-| ANN 持久化 | 二进制 blob + IDs 独立持久化 | 随段存储 |
-| WAL | JSONL 格式，可读性好 | 二进制 CRC 格式 |
+### GAP-1: Storage / Runtime 架构深度 (P0)
+
+这是当前最实质的差距。
+
+**Zvec**
+
+- 以 `SegmentManager`、`VersionManager`、forward store 为核心
+- forward store 建立在 Arrow IPC / Parquet 之上
+- 运行时、段版本、列存访问路径更加成熟
+
+**HannsDB**
+
+- 已有 segment manager / version set，不再是最早期单段模型
+- 但活跃持久化路径仍明显依赖：
+  - `records.bin`
+  - `payloads.jsonl`
+  - `vectors.jsonl`
+  - `ids.bin`
+- 版本与集合元数据仍偏轻量
+
+**本质差距**
+
+- 列存深度
+- 版本管理成熟度
+- segment lifecycle 完整度
+- 长期可扩展性与性能上限
+
+这也是当前 ANN optimize/build、load、QPS 收敛仍然困难的重要背景。
+
+### GAP-2: Python / Public API 产品面 (P0)
+
+HannsDB core 的能力，已经明显强于当前 Python/public surface。
+
+**现状**
+
+- Python `DataType` 暴露仍偏窄
+- index/query param 家族仍不完整，但已新增 `IvfUsq` 与 `HnswHvq` 这类 Hanns-native quantized surface
+- 没有对齐 Zvec 的更完整参数模型
+
+**和 Zvec 的差距主要体现在**
+
+- 缺少更完整的 index param 家族
+- 缺少更完整的数据类型暴露
+- 缺少更完整的 schema option / query option 产品面
+
+因此当前真正落后的不是“core 没能力”，而是“对外能稳定交付的产品面不够宽”。
+
+### GAP-3: Schema Mutation 深度 (P1)
+
+HannsDB 已经能做基础 schema mutation，但深度还没达到 Zvec。
+
+**HannsDB 当前更像**
+
+- 基础列增删改
+- 面向现有字段类型的最小可用接口
+
+**Zvec 更像**
+
+- 带 `FieldSchema`
+- 支持表达式/选项
+- schema 变更与类型系统结合得更完整
+
+所以这里不该再写成“没有 schema mutation”，而应写成“**只有基础版，没有 Zvec 等级的 schema mutation 深度**”。
+
+### GAP-4: Query Surface 与组合能力 (P1)
+
+当前 HannsDB 的一个典型问题是：**core 能做的事情，多于 Python facade 愿意公开的事情。**
+
+例如：
+
+- core 已有 `query_by_id`
+- core 已有 `group_by`
+- core 已有 reranker 结构
+- core 已有 `order_by` 相关结构
+
+但对外 surface 仍存在限制：
+
+- Python `QueryContext` 没有完整对外暴露 `order_by`
+- 一些 query 组合仍被 facade 显式限制
+- facade 与 core 的能力边界还不够整齐
+
+所以这里的 gap 是“**组合与产品化不足**”，不是“底层完全没有这些功能”。
+
+### GAP-5: 主键模型不对等 (P1)
+
+HannsDB Python 层当前仍偏向把文档 ID 当作 `i64` 处理。  
+这和 Zvec 的字符串主键模型存在真实差距。
+
+这会直接影响：
+
+- 外部业务主键映射
+- 易用性
+- 和上层应用数据模型的对接方式
+
+### GAP-6: 索引族与量化产品化 (P2)
+
+HannsDB 在 core descriptor/runtime 层面已经不止 `Flat/HNSW/IVF`，还包括 sparse 与 scalar inverted 的方向。  
+但从“可交付产品面”看，仍落后于 Zvec。
+
+**差距主要在**
+
+- 更完整的 quantized index family
+- 类似 `HnswRabitq*` 这类成熟产品化形态
+- 更丰富稳定的公共参数模型
+
+所以当前问题不是“完全没有索引扩展”，而是“**索引能力还没有整理成和 Zvec 对等的公开产品面**”。
 
 ---
 
-## 四、优先级排序
+## 五、建议优先级
 
-### P0 — 核心功能缺失（影响基本能力）
-1. **多段管理** — 当前单段限制可扩展性
-2. **Arrow 列存** — JSONL 是 insert 瓶颈的根因
+### P0
 
-### P1 — 重要功能差距（影响竞争力）
-3. **稀疏向量支持** — RAG/搜索场景刚需
-4. **量化支持** (FP16/INT8) — 降低内存占用，提升吞吐
-5. **数组类型** — 多值字段常见需求
+1. **继续补强 storage/runtime 深度**
+   - 现状已从“只有 JSONL sidecar”推进到“active segment flush 后物化 Arrow snapshot，并在后续写入时失效旧 snapshot”，但仍未达到 zvec 的 forward-store 深度
+2. **让 Python/public API 追上 core 已有能力**
 
-### P2 — 增强功能（锦上添花）
-6. **SQL 增强查询** — LIKE, NULL 检查, 数组操作
-7. **RaBitQ 量化** — 高性能量化（需要 AVX2）
-8. **RocksDB ID 映射** — 字符串 PK 支持
-9. **嵌入函数扩展** — Python 层 embedding function
+这是当前最影响外部感知和长期演进的两件事。
 
-### P3 — 不需要跟进
-- HTTP daemon — Zvec 没有但 HannsDB 有，是差异化优势
-- Node.js 绑定 — 暂不需要
+### P1
+
+3. **补齐 schema mutation 的 option/expression 深度**
+4. **统一 query surface，减少 facade 对组合能力的额外限制**
+5. **重新设计主键模型，至少明确字符串 PK 的演进路径**
+
+### P2
+
+6. **整理并公开更完整的 index family / quantization 参数面**
+7. **在产品层明确 sparse / scalar / quantized 的支持矩阵**
 
 ---
 
-## 五、性能差距回顾 (2026-04-10 Benchmark)
+## 六、和性能结论的关系
 
-**机器**: knowhere-x86-hk-proxy (x86, 4 cores, 40G disk)
-**数据集**: OpenAI Small 50K, 1536 dim, Cosine
+从近期 benchmark 与 mempal 记录看，HannsDB 已经显著压低了部分 `optimize / load / p99` 指标。  
+这说明项目当前已经不是“基本功能没通”，而是进入了“底层路径继续收敛、真实性能继续验证”的阶段。
 
-| 指标 | HannsDB | Zvec | 分析 |
-|------|---------|------|------|
-| QPS | 744.6 | 197.8 | HannsDB 3.8x 快（m=16 vs m=50，低 recall 换速度）|
-| P99 延迟 | 1.50ms | 6.52ms | 同上 |
-| Recall@100 | 0.9756 | 0.9990 | Zvec 高 2.4%（m=50 vs m=16）|
-| Insert | 19.52s | 4.64s | Zvec 4.2x 快（Arrow 列存 vs JSONL）|
+当前最新的真实标准路径结果也已经更新：
 
-**根因分析**:
-- Search 快: HannsDB 用更激进的 HNSW 参数 (m=16)，牺牲 recall
-- Insert 慢: JSONL 序列化每行 JSON + 文本写入，Zvec 用 Arrow 列式追加
+- `Performance1536D50K` rerun (`hannsdb-p0-rerun-20260413`)
+- result artifact: `result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
+- `insert_duration=14.6432`
+- `optimize_duration=114.001`
+- `load_duration=128.6442`
+- `serial_latency_p99=0.0003`
+- `recall=0.9441`
+
+这说明当前代码路径不仅在 repo-local proxy 上没有回退，而且在真实 benchmark harness 下也已经重新跑通并落盘。
+
+但要注意两点：
+
+1. 某些异常漂亮的数据点曾被确认是 brute-force 路径，不应误当成真实 HNSW 结论。
+2. 即便近期 `optimize / load / p99` 有明显改善，和 Zvec 相比，QPS、build 成本、runtime 成熟度仍然仍是主战场。
+
+---
+
+## 七、一句话判断
+
+**当前 HannsDB 相比 Zvec 的主要 gap，不再是基础功能缺失，而是 storage/runtime、public API 产品面、query/schema/PK 深度这三类“成熟度差距”。**

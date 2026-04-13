@@ -6,6 +6,7 @@ use hannsdb_core::document::{Document, FieldValue};
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
+use hannsdb_core::wal::truncate_wal;
 
 fn doc(id: i64, vector: Vec<f32>) -> Document {
     Document::new(id, Vec::<(String, FieldValue)>::new(), vector)
@@ -142,6 +143,19 @@ fn compaction_merges_multiple_immutable_segments_and_removes_old_dirs() {
         .expect("search after compact");
     let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     assert_eq!(hit_ids, vec![1, 2, 3, 4, 10]);
+
+    truncate_wal(&root.join("wal.jsonl")).expect("truncate wal before reopening manual fixture");
+    let reopened = HannsDb::open(root).expect("reopen db after compact");
+    let reopened_hits = reopened
+        .search("docs", &[0.0, 0.0], 10)
+        .expect("search after compacted reopen");
+    let reopened_hit_ids = reopened_hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(reopened_hit_ids, vec![1, 2, 3, 4, 10]);
+    let fetched = reopened
+        .fetch_documents("docs", &[1, 2, 3, 4, 10])
+        .expect("fetch after compacted Arrow-only reopen");
+    let fetched_ids = fetched.iter().map(|doc| doc.id).collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![1, 2, 3, 4, 10]);
 }
 
 #[test]

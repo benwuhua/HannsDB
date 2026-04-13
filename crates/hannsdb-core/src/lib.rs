@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod db;
 pub mod document;
+pub mod pk;
 pub mod query;
 pub mod segment;
 pub mod wal;
@@ -10,6 +11,7 @@ pub use document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
     VectorIndexSchema,
 };
+pub use pk::{PrimaryKeyMode, PrimaryKeyRegistry};
 
 pub fn core_bootstrap_marker() -> &'static str {
     "hannsdb-core-bootstrap"

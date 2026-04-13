@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "python-binding")]
 use numpy::PyReadonlyArray1;
 #[cfg(feature = "python-binding")]
-use pyo3::exceptions::{PyFileNotFoundError, PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 #[cfg(feature = "python-binding")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
@@ -18,7 +18,7 @@ use hannsdb_core::document::{
 };
 #[cfg(feature = "python-binding")]
 use hannsdb_core::query::{
-    QueryContext as CoreQueryContext, QueryGroupBy as CoreQueryGroupBy,
+    OrderBy as CoreOrderBy, QueryContext as CoreQueryContext, QueryGroupBy as CoreQueryGroupBy,
     QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
     VectorQueryParam as CoreVectorQueryParam,
 };
@@ -52,6 +52,28 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OptimizeOption {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddColumnOption {
+    pub concurrency: usize,
+}
+
+impl Default for AddColumnOption {
+    fn default() -> Self {
+        Self { concurrency: 0 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterColumnOption {
+    pub concurrency: usize,
+}
+
+impl Default for AlterColumnOption {
+    fn default() -> Self {
+        Self { concurrency: 0 }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
@@ -90,15 +112,43 @@ pub struct HnswIndexParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HnswHvqIndexParam {
+    pub metric_type: Option<MetricType>,
+    pub m: usize,
+    pub m_max0: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+    pub nbits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IvfIndexParam {
     pub metric_type: Option<MetricType>,
     pub nlist: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfUsqIndexParam {
+    pub metric_type: Option<MetricType>,
+    pub nlist: usize,
+    pub bits_per_dim: usize,
+    pub rotation_seed: usize,
+    pub rerank_k: usize,
+    pub use_high_accuracy_scan: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatIndexParam {
+    pub metric_type: Option<MetricType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexParam {
+    Flat(FlatIndexParam),
     Hnsw(HnswIndexParam),
+    HnswHvq(HnswHvqIndexParam),
     Ivf(IvfIndexParam),
+    IvfUsq(IvfUsqIndexParam),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +156,16 @@ pub struct HnswQueryParam {
     pub ef: usize,
     pub nprobe: usize,
     pub is_using_refiner: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfQueryParam {
+    pub nprobe: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvfUsqQueryParam {
+    pub nprobe: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +239,7 @@ pub struct Collection {
     pub collection_name: String,
     pub primary_vector_name: String,
     pub option: CollectionOption,
-    db: hannsdb_core::db::HannsDb,
+    pub(crate) db: hannsdb_core::db::HannsDb,
 }
 
 pub fn init(_log_level: LogLevel) {}
@@ -265,6 +325,7 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
             }
 
             let index_param = match vector.index_param.as_ref() {
+                Some(IndexParam::Flat(_params)) => None,
                 Some(IndexParam::Hnsw(params)) => Some(
                     CoreVectorIndexSchema::hnsw(
                         params.metric_type.map(metric_type_name),
@@ -273,9 +334,25 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
                     )
                     .with_quantize_type(quantize_type_value(params.quantize_type)),
                 ),
+                Some(IndexParam::HnswHvq(params)) => Some(CoreVectorIndexSchema::hnsw_hvq(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.m_max0,
+                    params.ef_construction,
+                    params.ef_search,
+                    params.nbits,
+                )),
                 Some(IndexParam::Ivf(params)) => Some(CoreVectorIndexSchema::ivf(
                     params.metric_type.map(metric_type_name),
                     params.nlist,
+                )),
+                Some(IndexParam::IvfUsq(params)) => Some(CoreVectorIndexSchema::ivf_usq(
+                    params.metric_type.map(metric_type_name),
+                    params.nlist,
+                    params.bits_per_dim,
+                    params.rotation_seed,
+                    params.rerank_k,
+                    params.use_high_accuracy_scan,
                 )),
                 None => None,
             };
@@ -297,34 +374,40 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
     })
 }
 
-fn parse_doc_id(id: &str) -> std::io::Result<i64> {
-    id.parse::<i64>().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "doc id must parse to i64")
-    })
-}
-
 #[cfg(feature = "python-binding")]
-fn parse_query_ids(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<i64>>> {
+fn parse_query_ids(
+    py: Python<'_>,
+    collection: &Collection,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Option<Vec<i64>>> {
     if value.is_none() {
         return Ok(None);
     }
 
     let items: Vec<Py<PyAny>> = value.extract()?;
-    let mut parsed = Vec::with_capacity(items.len());
+    let mut public_ids = Vec::with_capacity(items.len());
     for item in items {
         let item = item.bind(py);
         if let Ok(id) = item.extract::<i64>() {
-            parsed.push(id);
+            public_ids.push(id.to_string());
             continue;
         }
 
         let id = item.extract::<String>()?;
-        parsed.push(parse_doc_id(&id).map_err(io_to_py_err)?);
+        public_ids.push(id);
     }
-    if parsed.is_empty() {
+    if public_ids.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(parsed))
+        let resolved = collection
+            .db
+            .resolve_query_ids_by_primary_keys(&collection.collection_name, &public_ids)
+            .map_err(io_to_py_err)?;
+        if resolved.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(resolved))
+        }
     }
 }
 
@@ -347,7 +430,11 @@ fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery>
 
     let param = match query.getattr("param") {
         Ok(param) if !param.is_none() => Some(HnswQueryParam {
-            ef: param.getattr("ef")?.extract::<usize>()?,
+            ef: param
+                .getattr("ef")
+                .ok()
+                .and_then(|value| value.extract::<usize>().ok())
+                .unwrap_or(0),
             nprobe: param
                 .getattr("nprobe")
                 .ok()
@@ -372,6 +459,7 @@ fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery>
 #[cfg(feature = "python-binding")]
 fn py_query_context_to_core(
     py: Python<'_>,
+    collection: &Collection,
     context: &Bound<'_, PyAny>,
 ) -> PyResult<CoreQueryContext> {
     let top_k = context.getattr("top_k")?.extract::<usize>()?;
@@ -401,7 +489,7 @@ fn py_query_context_to_core(
     }
 
     let query_by_id_attr = context.getattr("query_by_id")?;
-    let query_by_id = parse_query_ids(py, &query_by_id_attr)?;
+    let query_by_id = parse_query_ids(py, collection, &query_by_id_attr)?;
     let query_by_id_field_name = context
         .getattr("query_by_id_field_name")?
         .extract::<Option<String>>()?;
@@ -460,6 +548,19 @@ fn py_query_context_to_core(
         }),
     };
 
+    let order_by_attr = context.getattr("order_by")?;
+    let order_by = match order_by_attr {
+        value if value.is_none() => None,
+        value => Some(CoreOrderBy {
+            field_name: value.getattr("field_name")?.extract::<String>()?,
+            descending: value
+                .getattr("descending")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false),
+        }),
+    };
+
     Ok(CoreQueryContext {
         top_k,
         queries: core_queries,
@@ -470,10 +571,15 @@ fn py_query_context_to_core(
         include_vector,
         group_by,
         reranker,
+        order_by,
     })
 }
 
-fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Result<CoreDocument> {
+fn core_document_from_doc(
+    doc: &Doc,
+    primary_vector_name: &str,
+    internal_id: i64,
+) -> std::io::Result<CoreDocument> {
     let _primary_vector = doc.vectors.get(primary_vector_name).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -482,19 +588,22 @@ fn core_document_from_doc(doc: &Doc, primary_vector_name: &str) -> std::io::Resu
     })?;
 
     Ok(CoreDocument {
-        id: parse_doc_id(&doc.id)?,
+        id: internal_id,
         fields: doc.fields.clone(),
         vectors: doc.vectors.clone(),
         sparse_vectors: Default::default(),
     })
 }
 
-fn doc_from_core_document(document: CoreDocument, primary_vector_name: &str) -> Doc {
-    let id = document.id.to_string();
+fn doc_from_core_document(
+    document: CoreDocument,
+    primary_vector_name: &str,
+    public_id: String,
+) -> Doc {
     let fields = document.fields.clone();
     let vectors = document.vectors_with_primary(primary_vector_name).clone();
     Doc {
-        id,
+        id: public_id,
         score: None,
         fields,
         vectors,
@@ -514,6 +623,52 @@ fn select_output_fields(
             .filter_map(|name| fields.get(name).cloned().map(|value| (name.clone(), value)))
             .collect(),
     }
+}
+
+fn public_ids_for_internal_ids(
+    collection: &Collection,
+    internal_ids: &[i64],
+) -> std::io::Result<Vec<String>> {
+    collection
+        .db
+        .display_primary_keys_for_document_ids(&collection.collection_name, internal_ids)
+}
+
+fn core_documents_from_docs(
+    collection: &mut Collection,
+    docs: &[Doc],
+) -> std::io::Result<Vec<(String, CoreDocument)>> {
+    let public_ids = docs.iter().map(|doc| doc.id.clone()).collect::<Vec<_>>();
+    let internal_ids = collection
+        .db
+        .assign_internal_ids_for_primary_keys(&collection.collection_name, &public_ids)?;
+
+    docs.iter()
+        .zip(public_ids)
+        .zip(internal_ids)
+        .map(|((doc, public_id), internal_id)| {
+            core_document_from_doc(doc, &collection.primary_vector_name, internal_id)
+                .map(|document| (public_id, document))
+        })
+        .collect()
+}
+
+fn docs_from_core_documents(
+    collection: &Collection,
+    documents: Vec<CoreDocument>,
+) -> std::io::Result<Vec<Doc>> {
+    let internal_ids = documents
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    let public_ids = public_ids_for_internal_ids(collection, &internal_ids)?;
+    Ok(documents
+        .into_iter()
+        .zip(public_ids)
+        .map(|(document, public_id)| {
+            doc_from_core_document(document, &collection.primary_vector_name, public_id)
+        })
+        .collect())
 }
 
 fn collection_metadata_from_root(
@@ -555,6 +710,9 @@ fn load_catalog_from_json(json: String) -> std::io::Result<IndexCatalog> {
 
 fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>) -> String {
     let (kind, metric, params) = match index_param {
+        Some(IndexParam::Flat(params)) => {
+            ("flat", metric_json(params.metric_type), "{}".to_string())
+        }
         Some(IndexParam::Hnsw(params)) => (
             "hnsw",
             metric_json(params.metric_type),
@@ -571,10 +729,30 @@ fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>)
                 ),
             },
         ),
+        Some(IndexParam::HnswHvq(params)) => (
+            "hnsw_hvq",
+            metric_json(params.metric_type),
+            format!(
+                r#"{{"m":{},"m_max0":{},"ef_construction":{},"ef_search":{},"nbits":{}}}"#,
+                params.m, params.m_max0, params.ef_construction, params.ef_search, params.nbits
+            ),
+        ),
         Some(IndexParam::Ivf(params)) => (
             "ivf",
             metric_json(params.metric_type),
             format!(r#"{{"nlist":{}}}"#, params.nlist),
+        ),
+        Some(IndexParam::IvfUsq(params)) => (
+            "ivf_usq",
+            metric_json(params.metric_type),
+            format!(
+                r#"{{"nlist":{},"bits_per_dim":{},"rotation_seed":{},"rerank_k":{},"use_high_accuracy_scan":{}}}"#,
+                params.nlist,
+                params.bits_per_dim,
+                params.rotation_seed,
+                params.rerank_k,
+                params.use_high_accuracy_scan
+            ),
         ),
         None => ("flat", "null".to_string(), "{}".to_string()),
     };
@@ -603,12 +781,20 @@ pub fn create_and_open(
     let path = path.into();
     let root = std::path::Path::new(&path);
     let option = option.unwrap_or_default();
-    let mut db = if option.read_only {
-        hannsdb_core::db::HannsDb::open_read_only(root)?
-    } else {
-        hannsdb_core::db::HannsDb::open(root)?
-    };
     let core_schema = core_schema_from_schema(&schema)?;
+    if option.read_only {
+        let mut write_db = hannsdb_core::db::HannsDb::open(root)?;
+        write_db.create_collection_with_schema(&schema.name, &core_schema)?;
+        let db = hannsdb_core::db::HannsDb::open_read_only(root)?;
+        return Ok(Collection {
+            path,
+            collection_name: schema.name,
+            primary_vector_name: core_schema.primary_vector_name().to_string(),
+            option,
+            db,
+        });
+    }
+    let mut db = hannsdb_core::db::HannsDb::open(root)?;
     db.create_collection_with_schema(&schema.name, &core_schema)?;
     Ok(Collection {
         path,
@@ -686,46 +872,42 @@ impl Collection {
         let hits = self
             .db
             .search_with_ef(&self.collection_name, dense, topk, ef_search)?;
+        let public_ids =
+            public_ids_for_internal_ids(self, &hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
         Ok(hits
             .into_iter()
-            .map(|hit| (hit.id.to_string(), hit.distance))
+            .zip(public_ids)
+            .map(|(hit, public_id)| (public_id, hit.distance))
             .collect())
     }
 
     pub fn insert(&mut self, docs: &[Doc]) -> std::io::Result<usize> {
-        let documents = docs
-            .iter()
-            .map(|doc| core_document_from_doc(doc, &self.primary_vector_name))
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let documents = core_documents_from_docs(self, docs)?;
+        let documents = documents
+            .into_iter()
+            .map(|(_, document)| document)
+            .collect::<Vec<_>>();
         self.db.insert_documents(&self.collection_name, &documents)
     }
 
     pub fn upsert(&mut self, docs: &[Doc]) -> std::io::Result<usize> {
-        let documents = docs
-            .iter()
-            .map(|doc| core_document_from_doc(doc, &self.primary_vector_name))
-            .collect::<std::io::Result<Vec<_>>>()?;
+        let documents = core_documents_from_docs(self, docs)?;
+        let documents = documents
+            .into_iter()
+            .map(|(_, document)| document)
+            .collect::<Vec<_>>();
         self.db.upsert_documents(&self.collection_name, &documents)
     }
 
     pub fn fetch(&self, ids: &[String]) -> std::io::Result<Vec<Doc>> {
-        let ids = ids
-            .iter()
-            .map(|id| parse_doc_id(id))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        let documents = self.db.fetch_documents(&self.collection_name, &ids)?;
-        Ok(documents
-            .into_iter()
-            .map(|document| doc_from_core_document(document, &self.primary_vector_name))
-            .collect())
+        let documents = self
+            .db
+            .fetch_documents_by_primary_keys(&self.collection_name, ids)?;
+        docs_from_core_documents(self, documents)
     }
 
     pub fn delete(&mut self, ids: &[String]) -> std::io::Result<usize> {
-        let ids = ids
-            .iter()
-            .map(|id| parse_doc_id(id))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        self.db.delete(&self.collection_name, &ids)
+        self.db.delete_by_primary_keys(&self.collection_name, ids)
     }
 
     pub fn flush(&self) -> std::io::Result<()> {
@@ -823,6 +1005,7 @@ impl Collection {
             }
         };
         let core_index_param = match index_param {
+            Some(IndexParam::Flat(_params)) => None,
             Some(IndexParam::Hnsw(params)) => Some(
                 hannsdb_core::document::VectorIndexSchema::hnsw(
                     params.metric_type.map(metric_type_name),
@@ -831,10 +1014,30 @@ impl Collection {
                 )
                 .with_quantize_type(quantize_type_value(params.quantize_type)),
             ),
+            Some(IndexParam::HnswHvq(params)) => {
+                Some(hannsdb_core::document::VectorIndexSchema::hnsw_hvq(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.m_max0,
+                    params.ef_construction,
+                    params.ef_search,
+                    params.nbits,
+                ))
+            }
             Some(IndexParam::Ivf(params)) => Some(hannsdb_core::document::VectorIndexSchema::ivf(
                 params.metric_type.map(metric_type_name),
                 params.nlist,
             )),
+            Some(IndexParam::IvfUsq(params)) => {
+                Some(hannsdb_core::document::VectorIndexSchema::ivf_usq(
+                    params.metric_type.map(metric_type_name),
+                    params.nlist,
+                    params.bits_per_dim,
+                    params.rotation_seed,
+                    params.rerank_k,
+                    params.use_high_accuracy_scan,
+                ))
+            }
             None => None,
         };
         let field = hannsdb_core::document::VectorFieldSchema {
@@ -879,21 +1082,25 @@ impl Collection {
         };
 
         if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
-            return self
-                .db
-                .query_documents(&self.collection_name, &dense, topk, Some(filter))
-                .map(|hits| {
-                    hits.into_iter()
-                        .map(|hit| Doc {
-                            id: hit.id.to_string(),
-                            score: Some(hit.distance),
-                            fields: select_output_fields(&hit.fields, &output_fields),
-                            vectors: BTreeMap::new(),
-                            field_name: self.primary_vector_name.clone(),
-                            group_key: None,
-                        })
-                        .collect()
-                });
+            let hits =
+                self.db
+                    .query_documents(&self.collection_name, &dense, topk, Some(filter))?;
+            let public_ids = public_ids_for_internal_ids(
+                self,
+                &hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            )?;
+            return Ok(hits
+                .into_iter()
+                .zip(public_ids)
+                .map(|(hit, public_id)| Doc {
+                    id: public_id,
+                    score: Some(hit.distance),
+                    fields: select_output_fields(&hit.fields, &output_fields),
+                    vectors: BTreeMap::new(),
+                    field_name: self.primary_vector_name.clone(),
+                    group_key: None,
+                })
+                .collect());
         }
 
         let ef_search = vectors.param.as_ref().map_or(32, |param| param.ef).max(1);
@@ -904,10 +1111,15 @@ impl Collection {
             .as_ref()
             .map_or(true, |fields| !fields.is_empty());
         if !should_fetch_fields {
+            let public_ids = public_ids_for_internal_ids(
+                self,
+                &hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            )?;
             return Ok(hits
                 .into_iter()
-                .map(|hit| Doc {
-                    id: hit.id.to_string(),
+                .zip(public_ids)
+                .map(|(hit, public_id)| Doc {
+                    id: public_id,
                     score: Some(hit.distance),
                     fields: BTreeMap::new(),
                     vectors: BTreeMap::new(),
@@ -921,11 +1133,14 @@ impl Collection {
             &self.collection_name,
             &hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
         )?;
+        let public_ids =
+            public_ids_for_internal_ids(self, &hits.iter().map(|hit| hit.id).collect::<Vec<_>>())?;
         Ok(hits
             .into_iter()
             .zip(fetched)
-            .map(|(hit, document)| Doc {
-                id: hit.id.to_string(),
+            .zip(public_ids)
+            .map(|((hit, document), public_id)| Doc {
+                id: public_id,
                 score: Some(hit.distance),
                 fields: select_output_fields(&document.fields, &output_fields),
                 vectors: BTreeMap::new(),
@@ -937,15 +1152,19 @@ impl Collection {
 
     #[cfg(feature = "python-binding")]
     pub fn query_context(&self, py: Python<'_>, context: &Bound<'_, PyAny>) -> PyResult<Vec<Doc>> {
-        let core_context = py_query_context_to_core(py, context)?;
+        let core_context = py_query_context_to_core(py, self, context)?;
         let hits = self
             .db
             .query_with_context(&self.collection_name, &core_context)
             .map_err(io_to_py_err)?;
+        let public_ids =
+            public_ids_for_internal_ids(self, &hits.iter().map(|hit| hit.id).collect::<Vec<_>>())
+                .map_err(io_to_py_err)?;
         Ok(hits
             .into_iter()
-            .map(|hit| Doc {
-                id: hit.id.to_string(),
+            .zip(public_ids)
+            .map(|(hit, public_id)| Doc {
+                id: public_id,
                 score: Some(hit.distance),
                 fields: hit.fields,
                 vectors: hit.vectors,
@@ -960,6 +1179,9 @@ impl Collection {
     }
 
     pub fn destroy(mut self) -> std::io::Result<()> {
+        if self.option.read_only {
+            return Ok(());
+        }
         self.db.drop_collection(&self.collection_name)
     }
 }
@@ -1025,20 +1247,25 @@ fn py_dict_to_vectors(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, V
 #[cfg(feature = "python-binding")]
 fn field_value_to_py<'py>(py: Python<'py>, value: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
     match value {
-        FieldValue::String(v) => v.into_bound(py).into_any(),
-        FieldValue::Int64(v) => v.into_bound(py).into_any(),
-        FieldValue::Int32(v) => v.into_bound(py).into_any(),
-        FieldValue::UInt32(v) => (*v as u64).into_bound(py).into_any(),
-        FieldValue::UInt64(v) => v.into_bound(py).into_any(),
-        FieldValue::Float(v) => v.into_bound(py).into_any(),
-        FieldValue::Float64(v) => v.into_bound(py).into_any(),
-        FieldValue::Bool(v) => v.into_bound(py).into_any(),
+        FieldValue::String(v) => Ok(v.clone().into_pyobject(py)?.into_any()),
+        FieldValue::Int64(v) => Ok(v.into_pyobject(py)?.into_any()),
+        FieldValue::Int32(v) => Ok(v.into_pyobject(py)?.into_any()),
+        FieldValue::UInt32(v) => Ok((*v as u64).into_pyobject(py)?.into_any()),
+        FieldValue::UInt64(v) => Ok(v.into_pyobject(py)?.into_any()),
+        FieldValue::Float(v) => Ok(v.into_pyobject(py)?.into_any()),
+        FieldValue::Float64(v) => Ok(v.into_pyobject(py)?.into_any()),
+        FieldValue::Bool(v) => Ok(PyBool::new(py, *v).to_owned().into_any()),
         FieldValue::Array(items) => {
-            let list = PyList::new(py, items.iter().map(|item| field_value_to_py(py, item)).collect::<PyResult<Vec<_>>>()?)?;
-            list.into_any()
+            let list = PyList::new(
+                py,
+                items
+                    .iter()
+                    .map(|item| field_value_to_py(py, item))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            Ok(list.into_any())
         }
     }
-    .map_err(Into::into)
 }
 
 #[cfg(feature = "python-binding")]
@@ -1057,6 +1284,7 @@ fn fields_to_py_dict<'py>(
             FieldValue::Float(value) => dict.set_item(name, *value)?,
             FieldValue::Float64(value) => dict.set_item(name, *value)?,
             FieldValue::Bool(value) => dict.set_item(name, *value)?,
+            FieldValue::Array(_) => dict.set_item(name, field_value_to_py(py, value)?)?,
         }
     }
     Ok(dict)
@@ -1262,6 +1490,54 @@ impl PyCollectionOption {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "AddColumnOption", module = "hannsdb")]
+#[derive(Clone)]
+struct PyAddColumnOption {
+    inner: AddColumnOption,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyAddColumnOption {
+    #[new]
+    #[pyo3(signature = (concurrency=0))]
+    fn new(concurrency: usize) -> Self {
+        Self {
+            inner: AddColumnOption { concurrency },
+        }
+    }
+
+    #[getter]
+    fn concurrency(&self) -> usize {
+        self.inner.concurrency
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "AlterColumnOption", module = "hannsdb")]
+#[derive(Clone)]
+struct PyAlterColumnOption {
+    inner: AlterColumnOption,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyAlterColumnOption {
+    #[new]
+    #[pyo3(signature = (concurrency=0))]
+    fn new(concurrency: usize) -> Self {
+        Self {
+            inner: AlterColumnOption { concurrency },
+        }
+    }
+
+    #[getter]
+    fn concurrency(&self) -> usize {
+        self.inner.concurrency
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "HnswIndexParam", module = "hannsdb")]
 #[derive(Clone)]
 struct PyHnswIndexParam {
@@ -1291,6 +1567,74 @@ impl PyHnswIndexParam {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "HnswHvqIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyHnswHvqIndexParam {
+    inner: HnswHvqIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyHnswHvqIndexParam {
+    #[new]
+    #[pyo3(signature = (metric_type=Some("ip".to_string()), m=16, m_max0=32, ef_construction=100, ef_search=64, nbits=4))]
+    fn new(
+        metric_type: Option<String>,
+        m: usize,
+        m_max0: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        nbits: usize,
+    ) -> PyResult<Self> {
+        let parsed_metric = match metric_type.as_deref() {
+            Some(value) => Some(parse_metric_type(value)?),
+            None => Some(MetricType::Ip),
+        };
+        if parsed_metric != Some(MetricType::Ip) {
+            return Err(PyValueError::new_err(
+                "hnsw_hvq currently supports only metric_type='ip'",
+            ));
+        }
+        Ok(Self {
+            inner: HnswHvqIndexParam {
+                metric_type: parsed_metric,
+                m,
+                m_max0,
+                ef_construction,
+                ef_search,
+                nbits,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "FlatIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyFlatIndexParam {
+    inner: FlatIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyFlatIndexParam {
+    #[new]
+    #[pyo3(signature = (metric_type=None))]
+    fn new(metric_type: Option<String>) -> PyResult<Self> {
+        Ok(Self {
+            inner: FlatIndexParam {
+                metric_type: metric_type.as_deref().map(parse_metric_type).transpose()?,
+            },
+        })
+    }
+
+    #[getter]
+    fn metric_type(&self) -> Option<&'static str> {
+        self.inner.metric_type.map(metric_type_name)
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "IVFIndexParam", module = "hannsdb")]
 #[derive(Clone)]
 struct PyIVFIndexParam {
@@ -1309,6 +1653,69 @@ impl PyIVFIndexParam {
                 nlist,
             },
         })
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "IvfUsqIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyIvfUsqIndexParam {
+    inner: IvfUsqIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyIvfUsqIndexParam {
+    #[new]
+    #[pyo3(signature = (metric_type=None, nlist=1024, bits_per_dim=4, rotation_seed=42, rerank_k=64, use_high_accuracy_scan=false))]
+    fn new(
+        metric_type: Option<String>,
+        nlist: usize,
+        bits_per_dim: usize,
+        rotation_seed: usize,
+        rerank_k: usize,
+        use_high_accuracy_scan: bool,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: IvfUsqIndexParam {
+                metric_type: metric_type.as_deref().map(parse_metric_type).transpose()?,
+                nlist,
+                bits_per_dim,
+                rotation_seed,
+                rerank_k,
+                use_high_accuracy_scan,
+            },
+        })
+    }
+
+    #[getter]
+    fn metric_type(&self) -> Option<&'static str> {
+        self.inner.metric_type.map(metric_type_name)
+    }
+
+    #[getter]
+    fn nlist(&self) -> usize {
+        self.inner.nlist
+    }
+
+    #[getter]
+    fn bits_per_dim(&self) -> usize {
+        self.inner.bits_per_dim
+    }
+
+    #[getter]
+    fn rotation_seed(&self) -> usize {
+        self.inner.rotation_seed
+    }
+
+    #[getter]
+    fn rerank_k(&self) -> usize {
+        self.inner.rerank_k
+    }
+
+    #[getter]
+    fn use_high_accuracy_scan(&self) -> bool {
+        self.inner.use_high_accuracy_scan
     }
 }
 
@@ -1347,6 +1754,54 @@ impl PyHnswQueryParam {
     #[getter]
     fn is_using_refiner(&self) -> bool {
         self.inner.is_using_refiner
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "IVFQueryParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyIVFQueryParam {
+    inner: IvfQueryParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyIVFQueryParam {
+    #[new]
+    #[pyo3(signature = (nprobe=1))]
+    fn new(nprobe: usize) -> Self {
+        Self {
+            inner: IvfQueryParam { nprobe },
+        }
+    }
+
+    #[getter]
+    fn nprobe(&self) -> usize {
+        self.inner.nprobe
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "IvfUsqQueryParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyIvfUsqQueryParam {
+    inner: IvfUsqQueryParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyIvfUsqQueryParam {
+    #[new]
+    #[pyo3(signature = (nprobe=1))]
+    fn new(nprobe: usize) -> Self {
+        Self {
+            inner: IvfUsqQueryParam { nprobe },
+        }
+    }
+
+    #[getter]
+    fn nprobe(&self) -> usize {
+        self.inner.nprobe
     }
 }
 
@@ -1426,10 +1881,24 @@ impl PyVectorSchema {
         let index_param = match index_param {
             Some(param) => {
                 let bound = param.bind(py);
-                if bound.is_instance_of::<PyHnswIndexParam>() {
+                if bound.is_instance_of::<PyFlatIndexParam>() {
+                    Some(IndexParam::Flat(
+                        bound
+                            .extract::<PyRef<'_, PyFlatIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswIndexParam>() {
                     Some(IndexParam::Hnsw(
                         bound
                             .extract::<PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswHvqIndexParam>() {
+                    Some(IndexParam::HnswHvq(
+                        bound
+                            .extract::<PyRef<'_, PyHnswHvqIndexParam>>()?
                             .inner
                             .clone(),
                     ))
@@ -1437,9 +1906,16 @@ impl PyVectorSchema {
                     Some(IndexParam::Ivf(
                         bound.extract::<PyRef<'_, PyIVFIndexParam>>()?.inner.clone(),
                     ))
+                } else if bound.is_instance_of::<PyIvfUsqIndexParam>() {
+                    Some(IndexParam::IvfUsq(
+                        bound
+                            .extract::<PyRef<'_, PyIvfUsqIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
                 } else {
                     return Err(PyValueError::new_err(
-                        "index_param must be HnswIndexParam or IVFIndexParam",
+                        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, or IvfUsqIndexParam",
                     ));
                 }
             }
@@ -1659,6 +2135,8 @@ impl PyDoc {
         }
     }
 }
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "SparseVector", module = "hannsdb")]
 #[derive(Clone)]
 struct PySparseVector {
     inner: SparseVectorData,
@@ -1706,7 +2184,7 @@ impl PyVectorQuery {
         py: Python<'_>,
         field_name: String,
         vector: Bound<'_, PyAny>,
-        param: Option<Py<PyHnswQueryParam>>,
+        param: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let query_vector = if vector.hasattr("indices")? && vector.hasattr("values")? {
             let indices = vector.getattr("indices")?.extract::<Vec<u32>>()?;
@@ -1716,11 +2194,46 @@ impl PyVectorQuery {
             let dense = vector.extract::<Vec<f32>>()?;
             QueryVector::Dense(dense)
         };
+        let param = match param {
+            Some(param) => {
+                let bound = param.bind(py);
+                if bound.is_instance_of::<PyHnswQueryParam>() {
+                    Some(
+                        bound
+                            .extract::<PyRef<'_, PyHnswQueryParam>>()?
+                            .inner
+                            .clone(),
+                    )
+                } else if bound.is_instance_of::<PyIVFQueryParam>() {
+                    let ivf = bound.extract::<PyRef<'_, PyIVFQueryParam>>()?.inner.clone();
+                    Some(HnswQueryParam {
+                        ef: 0,
+                        nprobe: ivf.nprobe,
+                        is_using_refiner: false,
+                    })
+                } else if bound.is_instance_of::<PyIvfUsqQueryParam>() {
+                    let ivf_usq = bound
+                        .extract::<PyRef<'_, PyIvfUsqQueryParam>>()?
+                        .inner
+                        .clone();
+                    Some(HnswQueryParam {
+                        ef: 0,
+                        nprobe: ivf_usq.nprobe,
+                        is_using_refiner: false,
+                    })
+                } else {
+                    return Err(PyValueError::new_err(
+                        "query param must be HnswQueryParam, IVFQueryParam, or IvfUsqQueryParam",
+                    ));
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             inner: VectorQuery {
                 field_name,
                 vector: query_vector,
-                param: param.map(|value| value.borrow(py).inner.clone()),
+                param,
             },
         })
     }
@@ -1937,10 +2450,19 @@ impl PyCollection {
             for (key, value) in &doc.inner.fields {
                 fields.insert(key.clone(), Some(value.clone()));
             }
+            let resolved_ids = self
+                .inner_ref()?
+                .db
+                .resolve_query_ids_by_primary_keys(&collection_name, &[doc.inner.id.clone()])
+                .map_err(io_to_py_err)?;
+            let internal_id = resolved_ids.first().copied().ok_or_else(|| {
+                PyFileNotFoundError::new_err(format!("document not found: {}", doc.inner.id))
+            })?;
             updates.push(hannsdb_core::document::DocumentUpdate {
-                id: parse_doc_id(&doc.inner.id).map_err(io_to_py_err)?,
+                id: internal_id,
                 fields,
                 vectors: BTreeMap::new(),
+                sparse_vectors: BTreeMap::new(),
             });
         }
         self.inner_mut()?
@@ -1954,7 +2476,12 @@ impl PyCollection {
         self.inner_mut()?
             .db
             .delete_by_filter(&collection_name, &filter)
-            .map_err(io_to_py_err)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    PyValueError::new_err(format!("invalid filter: {}", error))
+                }
+                _ => io_to_py_err(error),
+            })
     }
 
     #[pyo3(signature = (field_name, data_type, nullable=false, array=false))]
@@ -2058,33 +2585,11 @@ impl PyCollection {
 
     #[pyo3(signature = (context))]
     fn query_context(&self, py: Python<'_>, context: Bound<'_, PyAny>) -> PyResult<Vec<Py<PyDoc>>> {
-        let core_context = py_query_context_to_core(py, &context)?;
         let inner = self.inner_ref()?;
-        let docs = py
-            .allow_threads(|| {
-                inner
-                    .db
-                    .query_with_context(&inner.collection_name, &core_context)
-            })
-            .map_err(io_to_py_err)?;
-        Ok(docs
-            .into_iter()
-            .map(|hit| {
-                Py::new(
-                    py,
-                    PyDoc {
-                        inner: Doc {
-                            id: hit.id.to_string(),
-                            score: Some(hit.distance),
-                            fields: hit.fields,
-                            vectors: hit.vectors,
-                            field_name: inner.primary_vector_name.clone(),
-                            group_key: hit.group_key,
-                        },
-                    },
-                )
-            })
-            .collect::<PyResult<Vec<_>>>()?)
+        let docs = inner.query_context(py, &context)?;
+        docs.into_iter()
+            .map(|doc| Py::new(py, PyDoc { inner: doc }))
+            .collect()
     }
 
     #[pyo3(signature = (field_name, vector, topk, ef=32))]
@@ -2146,10 +2651,24 @@ impl PyCollection {
         let index_param = match index_param {
             Some(param) => {
                 let bound = param.bind(py);
-                if bound.is_instance_of::<PyHnswIndexParam>() {
+                if bound.is_instance_of::<PyFlatIndexParam>() {
+                    Some(IndexParam::Flat(
+                        bound
+                            .extract::<PyRef<'_, PyFlatIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswIndexParam>() {
                     Some(IndexParam::Hnsw(
                         bound
                             .extract::<PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswHvqIndexParam>() {
+                    Some(IndexParam::HnswHvq(
+                        bound
+                            .extract::<PyRef<'_, PyHnswHvqIndexParam>>()?
                             .inner
                             .clone(),
                     ))
@@ -2157,9 +2676,16 @@ impl PyCollection {
                     Some(IndexParam::Ivf(
                         bound.extract::<PyRef<'_, PyIVFIndexParam>>()?.inner.clone(),
                     ))
+                } else if bound.is_instance_of::<PyIvfUsqIndexParam>() {
+                    Some(IndexParam::IvfUsq(
+                        bound
+                            .extract::<PyRef<'_, PyIvfUsqIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
                 } else {
                     return Err(PyValueError::new_err(
-                        "index_param must be HnswIndexParam or IVFIndexParam",
+                        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, or IvfUsqIndexParam",
                     ));
                 }
             }
@@ -2213,10 +2739,24 @@ impl PyCollection {
             Some(param) => {
                 let py = unsafe { pyo3::Python::assume_gil_acquired() };
                 let bound = param.bind(py);
-                if bound.is_instance_of::<PyHnswIndexParam>() {
+                if bound.is_instance_of::<PyFlatIndexParam>() {
+                    Some(IndexParam::Flat(
+                        bound
+                            .extract::<pyo3::PyRef<'_, PyFlatIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswIndexParam>() {
                     Some(IndexParam::Hnsw(
                         bound
                             .extract::<pyo3::PyRef<'_, PyHnswIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyHnswHvqIndexParam>() {
+                    Some(IndexParam::HnswHvq(
+                        bound
+                            .extract::<pyo3::PyRef<'_, PyHnswHvqIndexParam>>()?
                             .inner
                             .clone(),
                     ))
@@ -2224,6 +2764,13 @@ impl PyCollection {
                     Some(IndexParam::Ivf(
                         bound
                             .extract::<pyo3::PyRef<'_, PyIVFIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
+                } else if bound.is_instance_of::<PyIvfUsqIndexParam>() {
+                    Some(IndexParam::IvfUsq(
+                        bound
+                            .extract::<pyo3::PyRef<'_, PyIvfUsqIndexParam>>()?
                             .inner
                             .clone(),
                     ))
@@ -2294,9 +2841,16 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyDataType>()?;
     module.add_class::<PyOptimizeOption>()?;
     module.add_class::<PyCollectionOption>()?;
+    module.add_class::<PyAddColumnOption>()?;
+    module.add_class::<PyAlterColumnOption>()?;
+    module.add_class::<PyFlatIndexParam>()?;
     module.add_class::<PyHnswIndexParam>()?;
+    module.add_class::<PyHnswHvqIndexParam>()?;
     module.add_class::<PyIVFIndexParam>()?;
+    module.add_class::<PyIvfUsqIndexParam>()?;
     module.add_class::<PyHnswQueryParam>()?;
+    module.add_class::<PyIVFQueryParam>()?;
+    module.add_class::<PyIvfUsqQueryParam>()?;
     module.add_class::<PyFieldSchema>()?;
     module.add_class::<PyVectorSchema>()?;
     module.add_class::<PyCollectionSchema>()?;
@@ -2319,9 +2873,9 @@ mod tests {
     use std::io::ErrorKind;
 
     use crate::{
-        create_and_open, init, open, CollectionOption, CollectionSchema, DataType, Doc,
-        FieldSchema, HnswIndexParam, HnswQueryParam, IndexParam, LogLevel, MetricType,
-        OptimizeOption, QuantizeType, VectorQuery, VectorSchema,
+        create_and_open, init, open, vector_index_catalog_json, CollectionOption, CollectionSchema,
+        DataType, Doc, FieldSchema, HnswIndexParam, HnswQueryParam, IndexParam, IvfUsqIndexParam,
+        LogLevel, MetricType, OptimizeOption, QuantizeType, VectorQuery, VectorSchema,
     };
     use hannsdb_core::document::FieldValue;
 
@@ -2861,5 +3415,56 @@ mod tests {
             .expect("primary IVF should now be accepted");
         assert_eq!(created.path, db_path);
         assert_eq!(created.collection_name, "primary_ivf");
+    }
+
+    #[test]
+    fn vector_index_catalog_json_preserves_ivf_usq_kind() {
+        let json = vector_index_catalog_json(
+            "dense",
+            Some(&IndexParam::IvfUsq(IvfUsqIndexParam {
+                metric_type: Some(MetricType::L2),
+                nlist: 128,
+                bits_per_dim: 4,
+                rotation_seed: 42,
+                rerank_k: 64,
+                use_high_accuracy_scan: true,
+            })),
+        );
+
+        assert!(json.contains("\"kind\":\"ivf_usq\""));
+        assert!(json.contains("\"nlist\":128"));
+        assert!(json.contains("\"bits_per_dim\":4"));
+        assert!(json.contains("\"rotation_seed\":42"));
+        assert!(json.contains("\"rerank_k\":64"));
+        assert!(json.contains("\"use_high_accuracy_scan\":true"));
+    }
+
+    #[test]
+    fn create_and_open_accepts_ivf_usq_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().to_string_lossy().to_string();
+        let schema = CollectionSchema {
+            name: "ivf_usq_docs".to_string(),
+            primary_vector: "dense".to_string(),
+            fields: vec![],
+            vectors: vec![VectorSchema {
+                name: "dense".to_string(),
+                data_type: DataType::VectorFp32,
+                dimension: 2,
+                index_param: Some(IndexParam::IvfUsq(IvfUsqIndexParam {
+                    metric_type: Some(MetricType::L2),
+                    nlist: 1,
+                    bits_per_dim: 4,
+                    rotation_seed: 42,
+                    rerank_k: 64,
+                    use_high_accuracy_scan: false,
+                })),
+            }],
+        };
+
+        let created = create_and_open(db_path.clone(), schema, Some(CollectionOption::default()))
+            .expect("ivf_usq should now be accepted");
+        assert_eq!(created.path, db_path);
+        assert_eq!(created.collection_name, "ivf_usq_docs");
     }
 }

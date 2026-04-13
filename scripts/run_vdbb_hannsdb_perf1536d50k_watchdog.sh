@@ -2,7 +2,30 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VDBB_REPO="${VDBB_REPO:-/Users/ryan/Code/VectorDBBench}"
+
+resolve_vdbb_repo() {
+  if [[ -n "${VDBB_REPO:-}" ]]; then
+    printf '%s\n' "$VDBB_REPO"
+    return 0
+  fi
+
+  local candidates=(
+    "/data/work/VectorDBBench"
+    "/Users/ryan/Code/vectorDB/VectorDBBench"
+    "/Users/ryan/Code/VectorDBBench"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "/data/work/VectorDBBench"
+}
+
+VDBB_REPO="$(resolve_vdbb_repo)"
 LOG_PATH="${LOG_PATH:-$ROOT_DIR/logs/vectordb_bench.log}"
 
 DB_LABEL="${DB_LABEL:-hannsdb-1536d50k-watchdog}"

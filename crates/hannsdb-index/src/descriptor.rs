@@ -6,7 +6,9 @@ use serde_json::Value;
 pub enum VectorIndexKind {
     Flat,
     Hnsw,
+    HnswHvq,
     Ivf,
+    IvfUsq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

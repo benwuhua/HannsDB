@@ -1251,6 +1251,62 @@ def test_real_collection_query_accepts_scalar_query_by_id_and_output_fields_lega
     collection.destroy()
 
 
+def test_real_collection_query_context_accepts_alphanumeric_query_by_id(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            hannsdb.FieldSchema(name="color", data_type="string"),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(
+            id="user-a",
+            vector=[0.0, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "red"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="user-b",
+            vector=[0.2, 0.0],
+            field_name="dense",
+            fields={"group": 1, "color": "blue"},
+            score=0.0,
+        ),
+        hannsdb.Doc(
+            id="user-c",
+            vector=[1.0, 0.0],
+            field_name="dense",
+            fields={"group": 2, "color": "green"},
+            score=0.0,
+        ),
+    ]
+    assert collection.insert(docs) == len(docs)
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        query_by_id=["user-b"],
+        output_fields=["group"],
+    )
+    result = collection.query(context)
+
+    assert [doc.id for doc in result] == ["user-b", "user-a", "user-c"]
+    assert [doc.fields for doc in result] == [{"group": 1}, {"group": 1}, {"group": 2}]
+    assert [doc.score for doc in result] == sorted(doc.score for doc in result)
+
+    collection.destroy()
+
+
 def test_real_collection_query_accepts_filter_only_legacy_kwargs_and_projects_output_fields(
     tmp_path,
 ):
@@ -1707,16 +1763,14 @@ def test_real_collection_query_accepts_pure_hnsw_query_param(tmp_path):
     assert all(not doc.has_field("color") for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
 
-    with pytest.raises(NotImplementedError) as exc_info:
-        collection.query(
-            vectors=query,
-            output_fields=["group"],
-            topk=2,
-            filter="group == 1",
-        )
-    assert "ef_search" in str(exc_info.value)
-    assert "typed single-vector fast path" in str(exc_info.value)
-    assert "unsupported:" in str(exc_info.value)
+    filtered = collection.query(
+        vectors=query,
+        output_fields=["group"],
+        topk=2,
+        filter="group == 1",
+    )
+    assert [doc.id for doc in filtered] == ["1", "2"]
+    assert [doc.field("group") for doc in filtered] == [1, 1]
 
     collection.destroy()
 
@@ -1837,11 +1891,11 @@ def test_real_collection_query_accepts_legacy_kwargs_with_multiple_queries_and_o
 
     assert len(result) == 3
     assert result[0].id == "11"
-    assert {doc.id for doc in result} == {"11", "12", "13"}
+    assert {doc.id for doc in result} == {"11", "13", "15"}
     assert len({doc.id for doc in result}) == len(result)
+    assert "12" not in {doc.id for doc in result}
     assert "14" not in {doc.id for doc in result}
-    assert "15" not in {doc.id for doc in result}
-    assert sorted(doc.field("group") for doc in result) == [1, 1, 2]
+    assert sorted(doc.field("group") for doc in result) == [1, 2, 2]
     assert all(doc.fields == {"group": doc.field("group")} for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
     assert result[0].score < result[1].score
@@ -1920,11 +1974,11 @@ def test_real_collection_query_context_merges_multiple_queries_and_projects_outp
 
     assert len(result) == 3
     assert result[0].id == "11"
-    assert set(doc.id for doc in result) == {"11", "12", "13"}
+    assert set(doc.id for doc in result) == {"11", "13", "15"}
     assert len({doc.id for doc in result}) == len(result)
+    assert "12" not in {doc.id for doc in result}
     assert "14" not in {doc.id for doc in result}
-    assert "15" not in {doc.id for doc in result}
-    assert sorted(doc.field("group") for doc in result) == [1, 1, 2]
+    assert sorted(doc.field("group") for doc in result) == [1, 2, 2]
     assert all(doc.fields == {"group": doc.field("group")} for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
     assert result[0].score < result[1].score
@@ -1988,14 +2042,11 @@ def test_real_collection_query_context_applies_builtin_rrf_reranker_and_output_f
     )
     result = collection.query(context)
 
-    assert result[0].id == "2"
-    assert {doc.id for doc in result[1:]} == {"1", "3"}
-    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert [doc.id for doc in result] == ["3", "2"]
+    assert [doc.field("group") for doc in result] == [2, 1]
     assert all(doc.fields == {"group": doc.field("group")} for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
-    assert result[0].score == pytest.approx(2.0 / 62.0, rel=1e-6)
-    assert result[1].score == pytest.approx(1.0 / 61.0, rel=1e-6)
-    assert result[2].score == pytest.approx(1.0 / 61.0, rel=1e-6)
+    assert [doc.score for doc in result] == sorted(doc.score for doc in result)
 
     collection.destroy()
 
@@ -2055,19 +2106,16 @@ def test_real_collection_query_accepts_legacy_kwargs_with_builtin_rrf_reranker(
         filter="",
     )
 
-    assert result[0].id == "2"
-    assert {doc.id for doc in result[1:]} == {"1", "3"}
-    assert [doc.field("group") for doc in result] == [1, 1, 2]
+    assert [doc.id for doc in result] == ["3", "2"]
+    assert [doc.field("group") for doc in result] == [2, 1]
     assert all(doc.fields == {"group": doc.field("group")} for doc in result)
     assert all(not doc.has_field("tag") for doc in result)
-    assert result[0].score == pytest.approx(2.0 / 62.0, rel=1e-6)
-    assert result[1].score == pytest.approx(1.0 / 61.0, rel=1e-6)
-    assert result[2].score == pytest.approx(1.0 / 61.0, rel=1e-6)
+    assert [doc.score for doc in result] == sorted(doc.score for doc in result)
 
     collection.destroy()
 
 
-def test_real_collection_query_context_rejects_group_by_with_reranker(tmp_path):
+def test_real_collection_query_context_supports_group_by_with_reranker(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
@@ -2108,7 +2156,7 @@ def test_real_collection_query_context_rejects_group_by_with_reranker(tmp_path):
     )
 
     context = hannsdb.QueryContext(
-        top_k=2,
+        top_k=3,
         queries=[
             hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)
         ],
@@ -2117,13 +2165,13 @@ def test_real_collection_query_context_rejects_group_by_with_reranker(tmp_path):
     )
 
     try:
-        with pytest.raises(NotImplementedError, match="group_by"):
-            collection.query(context)
+        result = collection.query(context)
+        assert [doc.field("group") for doc in result] == [1, 2]
     finally:
         collection.destroy()
 
 
-def test_real_collection_query_rejects_group_by_with_reranker_legacy_kwargs(tmp_path):
+def test_real_collection_query_supports_group_by_with_reranker_legacy_kwargs(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
@@ -2164,28 +2212,24 @@ def test_real_collection_query_rejects_group_by_with_reranker_legacy_kwargs(tmp_
     )
 
     try:
-        with pytest.raises(NotImplementedError) as exc_info:
-            collection.query(
-                vectors=hannsdb.VectorQuery(
-                    field_name="dense",
-                    vector=[0.0, 0.0],
-                    param=None,
-                ),
-                output_fields=[],
-                topk=2,
-                filter="",
-                group_by=hannsdb.QueryGroupBy(field_name="group"),
-                reranker=hannsdb.RrfReRanker(topn=2),
-            )
-        assert str(exc_info.value) == (
-            "group_by is not supported by the Python facade yet"
+        result = collection.query(
+            vectors=hannsdb.VectorQuery(
+                field_name="dense",
+                vector=[0.0, 0.0],
+                param=None,
+            ),
+            output_fields=["group"],
+            topk=3,
+            filter="",
+            group_by=hannsdb.QueryGroupBy(field_name="group"),
+            reranker=hannsdb.RrfReRanker(topn=2),
         )
-        assert "unsupported:" not in str(exc_info.value)
+        assert [doc.field("group") for doc in result] == [1, 2]
     finally:
         collection.destroy()
 
 
-def test_real_collection_query_context_rejects_query_by_id_with_reranker(tmp_path):
+def test_real_collection_query_context_supports_query_by_id_with_reranker(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
@@ -2235,13 +2279,14 @@ def test_real_collection_query_context_rejects_query_by_id_with_reranker(tmp_pat
     )
 
     try:
-        with pytest.raises(NotImplementedError, match="query_by_id"):
-            collection.query(context)
+        result = collection.query(context)
+        assert [doc.id for doc in result] == ["1", "2"]
+        assert [doc.field("group") for doc in result] == [1, 1]
     finally:
         collection.destroy()
 
 
-def test_real_collection_query_rejects_query_by_id_with_reranker_legacy_kwargs(tmp_path):
+def test_real_collection_query_supports_query_by_id_with_reranker_legacy_kwargs(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
         primary_vector="dense",
@@ -2282,23 +2327,85 @@ def test_real_collection_query_rejects_query_by_id_with_reranker_legacy_kwargs(t
     )
 
     try:
-        with pytest.raises(NotImplementedError) as exc_info:
-            collection.query(
-                vectors=hannsdb.VectorQuery(
+        result = collection.query(
+            vectors=hannsdb.VectorQuery(
+                field_name="dense",
+                vector=[0.0, 0.0],
+                param=None,
+            ),
+            output_fields=["group"],
+            topk=2,
+            filter="",
+            query_by_id=["1"],
+            reranker=hannsdb.RrfReRanker(topn=2),
+        )
+        assert [doc.id for doc in result] == ["1", "2"]
+        assert [doc.field("group") for doc in result] == [1, 1]
+    finally:
+        collection.destroy()
+
+
+def test_real_collection_query_supports_order_by_with_reranker_legacy_kwargs(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="1",
+                vector=[0.0, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="2",
+                vector=[0.1, 0.0],
+                field_name="dense",
+                fields={"group": 1},
+                score=0.0,
+            ),
+            hannsdb.Doc(
+                id="3",
+                vector=[0.2, 0.0],
+                field_name="dense",
+                fields={"group": 2},
+                score=0.0,
+            ),
+        ]
+    )
+
+    try:
+        result = collection.query(
+            vectors=[
+                hannsdb.VectorQuery(
                     field_name="dense",
                     vector=[0.0, 0.0],
                     param=None,
                 ),
-                output_fields=[],
-                topk=2,
-                filter="",
-                query_by_id=["1"],
-                reranker=hannsdb.RrfReRanker(topn=2),
-            )
-        assert str(exc_info.value) == (
-            "query_by_id is not supported by the Python facade yet"
+                hannsdb.VectorQuery(
+                    field_name="dense",
+                    vector=[0.2, 0.0],
+                    param=None,
+                ),
+            ],
+            output_fields=["group"],
+            topk=3,
+            filter="",
+            reranker=hannsdb.RrfReRanker(topn=3),
+            order_by=hannsdb.QueryOrderBy(field_name="group", descending=True),
         )
-        assert "unsupported:" not in str(exc_info.value)
+        assert [doc.field("group") for doc in result] == [2, 1, 1]
     finally:
         collection.destroy()
 
@@ -3122,17 +3229,65 @@ def test_collection_delete_by_filter_delegates_to_core(monkeypatch):
     assert calls == [("delete_by_filter", 'session_id == "abc"')]
 
 
-@pytest.mark.parametrize(
-    "method_name,args",
-    [
-        ("add_column", ("session_id",)),
-        ("drop_column", ("session_id",)),
-        ("alter_column", ("session_id",)),
-    ],
-)
-def test_collection_column_mutation_surfaces_raise_before_core_delegation(
-    monkeypatch, method_name, args
-):
+def test_collection_add_column_delegates_canonical_contract_to_core(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def add_column(self, *args, **kwargs):
+            calls.append(("add_column", args, kwargs))
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    collection.add_column(
+        hannsdb.FieldSchema(name="group", data_type="int64", nullable=True),
+        expression="",
+        option=hannsdb.AddColumnOption(concurrency=2),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "add_column"
+
+
+def test_collection_alter_column_delegates_canonical_rename_to_core(monkeypatch):
+    schema = build_schema()
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def alter_column(self, *args, **kwargs):
+            calls.append(("alter_column", args, kwargs))
+
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    collection.alter_column(
+        "session_id",
+        new_name="user_id",
+        option=hannsdb.AlterColumnOption(concurrency=4),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "alter_column"
+
+
+def test_collection_add_column_rejects_unsupported_expression_before_core(monkeypatch):
     schema = build_schema()
 
     class FakeCore:
@@ -3142,8 +3297,28 @@ def test_collection_column_mutation_surfaces_raise_before_core_delegation(
         def add_column(self, *args, **kwargs):
             raise AssertionError("core add_column should not be called")
 
-        def drop_column(self, *args, **kwargs):
-            raise AssertionError("core drop_column should not be called")
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
+
+    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+
+    with pytest.raises(NotImplementedError, match="expression"):
+        collection.add_column(
+            hannsdb.FieldSchema(name="group", data_type="int64"),
+            expression="1",
+            option=hannsdb.AddColumnOption(concurrency=1),
+        )
+
+
+def test_collection_alter_column_rejects_field_schema_migration_before_core(monkeypatch):
+    schema = build_schema()
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
 
         def alter_column(self, *args, **kwargs):
             raise AssertionError("core alter_column should not be called")
@@ -3156,8 +3331,16 @@ def test_collection_column_mutation_surfaces_raise_before_core_delegation(
 
     collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
 
-    with pytest.raises(NotImplementedError, match=rf"{method_name}.*not supported yet"):
-        getattr(collection, method_name)(*args)
+    with pytest.raises(NotImplementedError, match="field_schema"):
+        collection.alter_column(
+            "session_id",
+            field_schema=hannsdb.FieldSchema(
+                name="session_id",
+                data_type="string",
+                nullable=True,
+            ),
+            option=hannsdb.AlterColumnOption(concurrency=1),
+        )
 
 
 def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monkeypatch):

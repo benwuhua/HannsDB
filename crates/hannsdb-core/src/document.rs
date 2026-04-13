@@ -101,10 +101,28 @@ pub enum VectorIndexSchema {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quantize_type: Option<String>,
     },
+    HnswHvq {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<String>,
+        m: usize,
+        m_max0: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        nbits: usize,
+    },
     Ivf {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metric: Option<String>,
         nlist: usize,
+    },
+    IvfUsq {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<String>,
+        nlist: usize,
+        bits_per_dim: usize,
+        rotation_seed: usize,
+        rerank_k: usize,
+        use_high_accuracy_scan: bool,
     },
 }
 
@@ -115,6 +133,24 @@ impl VectorIndexSchema {
             m,
             ef_construction,
             quantize_type: None,
+        }
+    }
+
+    pub fn hnsw_hvq(
+        metric: Option<&str>,
+        m: usize,
+        m_max0: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        nbits: usize,
+    ) -> Self {
+        Self::HnswHvq {
+            metric: metric.map(str::to_string),
+            m,
+            m_max0,
+            ef_construction,
+            ef_search,
+            nbits,
         }
     }
 
@@ -142,16 +178,37 @@ impl VectorIndexSchema {
         }
     }
 
+    pub fn ivf_usq(
+        metric: Option<&str>,
+        nlist: usize,
+        bits_per_dim: usize,
+        rotation_seed: usize,
+        rerank_k: usize,
+        use_high_accuracy_scan: bool,
+    ) -> Self {
+        Self::IvfUsq {
+            metric: metric.map(str::to_string),
+            nlist,
+            bits_per_dim,
+            rotation_seed,
+            rerank_k,
+            use_high_accuracy_scan,
+        }
+    }
+
     pub fn metric(&self) -> Option<&str> {
         match self {
-            Self::Hnsw { metric, .. } | Self::Ivf { metric, .. } => metric.as_deref(),
+            Self::Hnsw { metric, .. }
+            | Self::HnswHvq { metric, .. }
+            | Self::Ivf { metric, .. }
+            | Self::IvfUsq { metric, .. } => metric.as_deref(),
         }
     }
 
     pub fn quantize_type(&self) -> Option<&str> {
         match self {
             Self::Hnsw { quantize_type, .. } => quantize_type.as_deref(),
-            Self::Ivf { .. } => None,
+            Self::HnswHvq { .. } | Self::Ivf { .. } | Self::IvfUsq { .. } => None,
         }
     }
 
@@ -160,7 +217,10 @@ impl VectorIndexSchema {
             Self::Hnsw {
                 m, ef_construction, ..
             } => Some((*m, *ef_construction)),
-            Self::Ivf { .. } => None,
+            Self::HnswHvq {
+                m, ef_construction, ..
+            } => Some((*m, *ef_construction)),
+            Self::Ivf { .. } | Self::IvfUsq { .. } => None,
         }
     }
 }

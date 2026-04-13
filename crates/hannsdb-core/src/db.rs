@@ -5,7 +5,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use hannsdb_index::adapter::VectorIndexBackend;
 use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind};
 use hannsdb_index::factory::DefaultIndexFactory;
 use hannsdb_index::scalar::{InvertedScalarIndex, RangeOp, ScalarValue};
@@ -16,18 +15,21 @@ use crate::document::{
     CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
     VectorFieldSchema, VectorIndexSchema,
 };
+use crate::pk::{PrimaryKeyMode, PrimaryKeyRegistry};
 use crate::query::{
     distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
-    search_sparse_bruteforce, ComparisonOp, FilterExpr, OrderBy, QueryContext, QueryExecutor,
-    QueryPlan, QueryPlanner, SearchHit,
+    search_sparse_bruteforce, ComparisonOp, FilterExpr, QueryContext, QueryExecutor, QueryPlan,
+    QueryPlanner, SearchHit,
 };
 #[cfg(feature = "hanns-backend")]
 use crate::segment::index_runtime::ann_search_with_bitset;
 #[cfg(feature = "hanns-backend")]
+use crate::segment::index_runtime::OptimizedAnnState;
+#[cfg(feature = "hanns-backend")]
 use crate::segment::index_runtime::HNSW_INDEX_FILE;
 use crate::segment::index_runtime::{
     ann_blob_path, ann_ids_path, ann_search, build_optimized_ann_state, invalidate_ann_blobs,
-    persist_ann_blob, CachedSearchState, OptimizedAnnState,
+    CachedSearchState,
 };
 use crate::segment::{
     append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
@@ -84,8 +86,6 @@ pub struct DocumentHit {
 #[derive(Clone)]
 struct CachedDocumentState {
     documents: Arc<HashMap<i64, Document>>,
-    collection_meta: Arc<CollectionMetadata>,
-    index_catalog: Arc<IndexCatalog>,
 }
 
 #[derive(Debug, Default)]
@@ -244,6 +244,7 @@ impl HannsDb {
 
         let collection = CollectionMetadata::new_with_schema(name, schema.clone());
         collection.save_to_path(&paths.collection_meta)?;
+        PrimaryKeyRegistry::new(PrimaryKeyMode::Numeric, 1).save_to_path(&paths.primary_keys)?;
 
         let segment = SegmentMetadata::new("seg-0001", dimension, 0, 0);
         segment.save_to_path(&paths.segment_meta)?;
@@ -910,6 +911,41 @@ impl HannsDb {
         self.insert_documents_internal(collection, documents, true)
     }
 
+    pub fn insert_documents_with_primary_keys(
+        &mut self,
+        collection: &str,
+        keyed_documents: &[(String, Document)],
+    ) -> io::Result<usize> {
+        self.require_write()?;
+        if keyed_documents.is_empty() {
+            return Ok(0);
+        }
+
+        let paths = self.collection_paths(collection);
+        let mut collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let public_keys = keyed_documents
+            .iter()
+            .map(|(public_key, _)| public_key.clone())
+            .collect::<Vec<_>>();
+        let internal_ids = keyed_documents
+            .iter()
+            .map(|(_, document)| document.id)
+            .collect::<Vec<_>>();
+
+        register_public_keys_with_internal_ids(
+            &paths,
+            &mut collection_meta,
+            &public_keys,
+            &internal_ids,
+        )?;
+
+        let documents = keyed_documents
+            .iter()
+            .map(|(_, document)| document.clone())
+            .collect::<Vec<_>>();
+        self.insert_documents_internal(collection, &documents, true)
+    }
+
     fn insert_documents_internal(
         &mut self,
         collection: &str,
@@ -1146,9 +1182,63 @@ impl HannsDb {
             .fetch_documents(external_ids)
     }
 
+    pub fn fetch_documents_by_primary_keys(
+        &self,
+        collection: &str,
+        public_keys: &[String],
+    ) -> io::Result<Vec<Document>> {
+        let ids = self.resolve_query_ids_by_primary_keys(collection, public_keys)?;
+        self.fetch_documents(collection, &ids)
+    }
+
     pub fn delete(&mut self, collection: &str, external_ids: &[i64]) -> io::Result<usize> {
         self.require_write()?;
         self.delete_internal(collection, external_ids, true)
+    }
+
+    pub fn delete_by_primary_keys(
+        &mut self,
+        collection: &str,
+        public_keys: &[String],
+    ) -> io::Result<usize> {
+        self.require_write()?;
+        let ids = self.resolve_query_ids_by_primary_keys(collection, public_keys)?;
+        self.delete_internal(collection, &ids, true)
+    }
+
+    pub fn assign_internal_ids_for_primary_keys(
+        &mut self,
+        collection: &str,
+        public_keys: &[String],
+    ) -> io::Result<Vec<i64>> {
+        self.require_write()?;
+        let paths = self.collection_paths(collection);
+        let mut collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        assign_internal_ids_for_public_keys(&paths, &mut collection_meta, public_keys)
+    }
+
+    pub fn resolve_query_ids_by_primary_keys(
+        &self,
+        collection: &str,
+        public_keys: &[String],
+    ) -> io::Result<Vec<i64>> {
+        let paths = self.collection_paths(collection);
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        resolve_public_keys_to_internal_ids(&paths, &collection_meta, public_keys)
+    }
+
+    pub fn display_primary_keys_for_document_ids(
+        &self,
+        collection: &str,
+        internal_ids: &[i64],
+    ) -> io::Result<Vec<String>> {
+        let paths = self.collection_paths(collection);
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let registry = load_primary_key_registry(&paths, &collection_meta)?;
+        Ok(internal_ids
+            .iter()
+            .map(|internal_id| display_key_for_internal_id(&registry, *internal_id))
+            .collect())
     }
 
     pub fn delete_by_filter(&mut self, collection: &str, filter: &str) -> io::Result<usize> {
@@ -1717,8 +1807,11 @@ impl CollectionHandle {
                 // provided, it overrides ef_search for IVF indexes (the IVF backend
                 // maps the ef_search argument to nprobe internally).
                 let state = self.cached_search_state_for_field(&plan.field_name)?;
-                let is_ivf =
-                    state.descriptor.kind == hannsdb_index::descriptor::VectorIndexKind::Ivf;
+                let is_ivf = matches!(
+                    state.descriptor.kind,
+                    hannsdb_index::descriptor::VectorIndexKind::Ivf
+                        | hannsdb_index::descriptor::VectorIndexKind::IvfUsq
+                );
                 let effective_search_param = if is_ivf && plan.nprobe.is_some() {
                     nprobe
                 } else {
@@ -2116,10 +2209,11 @@ impl CollectionHandle {
 
     fn flush(&self) -> io::Result<()> {
         let paths = self.collection_paths();
-        let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
         let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
         let _ = load_wal_records(&wal_path(&self.root))?;
+        materialize_active_segment_arrow_snapshots(&paths, &collection_meta)?;
         Ok(())
     }
 
@@ -2634,7 +2728,6 @@ impl CollectionHandle {
     fn build_document_cache(&self) -> io::Result<CachedDocumentState> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
         let segment_paths = self.segment_manager.segment_paths()?;
 
         let mut documents: HashMap<i64, Document> = HashMap::new();
@@ -2688,8 +2781,6 @@ impl CollectionHandle {
 
         Ok(CachedDocumentState {
             documents: Arc::new(documents),
-            collection_meta: Arc::new(collection_meta),
-            index_catalog: Arc::new(index_catalog),
         })
     }
 
@@ -2865,7 +2956,6 @@ fn sort_document_hits_by_field(hits: &mut [DocumentHit], field_name: &str, desce
 }
 
 fn compare_field_values_for_sort(a: &FieldValue, b: &FieldValue) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
     match (a, b) {
         (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
         (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
@@ -2981,6 +3071,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
     CollectionPaths {
         dir: dir.clone(),
         collection_meta: dir.join("collection.json"),
+        primary_keys: dir.join("primary_keys.json"),
         index_catalog: dir.join(INDEX_CATALOG_FILE),
         segment_set: dir.join("segment_set.json"),
         segments_dir: dir.join("segments"),
@@ -2997,6 +3088,7 @@ fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
 struct CollectionPaths {
     dir: PathBuf,
     collection_meta: PathBuf,
+    primary_keys: PathBuf,
     index_catalog: PathBuf,
     segment_set: PathBuf,
     segments_dir: PathBuf,
@@ -3257,6 +3349,238 @@ fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
     }
 }
 
+fn load_primary_key_registry(
+    paths: &CollectionPaths,
+    collection_meta: &CollectionMetadata,
+) -> io::Result<PrimaryKeyRegistry> {
+    if paths.primary_keys.exists() {
+        let registry = PrimaryKeyRegistry::load_from_path(&paths.primary_keys)?;
+        if registry.mode != collection_meta.primary_key_mode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "primary key registry mode does not match collection metadata",
+            ));
+        }
+        return Ok(registry);
+    }
+
+    let next_internal_id = collection_max_internal_id(paths)?.saturating_add(1).max(1);
+    let mut registry =
+        PrimaryKeyRegistry::new(collection_meta.primary_key_mode.clone(), next_internal_id);
+    if registry.mode == PrimaryKeyMode::String {
+        populate_numeric_keys_into_registry(paths, &mut registry)?;
+    }
+    Ok(registry)
+}
+
+fn save_primary_key_registry(
+    paths: &CollectionPaths,
+    collection_meta: &CollectionMetadata,
+    registry: &PrimaryKeyRegistry,
+) -> io::Result<()> {
+    if registry.mode != collection_meta.primary_key_mode {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "primary key registry mode does not match collection metadata",
+        ));
+    }
+    registry.save_to_path(&paths.primary_keys)
+}
+
+fn assign_internal_ids_for_public_keys(
+    paths: &CollectionPaths,
+    collection_meta: &mut CollectionMetadata,
+    public_keys: &[String],
+) -> io::Result<Vec<i64>> {
+    if public_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if collection_meta.primary_key_mode == PrimaryKeyMode::Numeric
+        && public_keys.iter().all(|key| key.parse::<i64>().is_ok())
+    {
+        return public_keys
+            .iter()
+            .map(|key| parse_numeric_public_key(key))
+            .collect();
+    }
+
+    let mut registry = ensure_string_primary_key_mode(paths, collection_meta)?;
+    let mut ids = Vec::with_capacity(public_keys.len());
+    for public_key in public_keys {
+        if let Some(existing) = registry.key_to_id.get(public_key).copied() {
+            ids.push(existing);
+            continue;
+        }
+
+        let internal_id = registry.next_internal_id;
+        registry.next_internal_id = registry.next_internal_id.saturating_add(1).max(1);
+        registry.key_to_id.insert(public_key.clone(), internal_id);
+        registry.id_to_key.insert(internal_id, public_key.clone());
+        ids.push(internal_id);
+    }
+
+    save_primary_key_registry(paths, collection_meta, &registry)?;
+    Ok(ids)
+}
+
+fn resolve_public_keys_to_internal_ids(
+    paths: &CollectionPaths,
+    collection_meta: &CollectionMetadata,
+    public_keys: &[String],
+) -> io::Result<Vec<i64>> {
+    match collection_meta.primary_key_mode {
+        PrimaryKeyMode::Numeric => public_keys
+            .iter()
+            .map(|key| parse_numeric_public_key(key))
+            .collect(),
+        PrimaryKeyMode::String => {
+            let registry = load_primary_key_registry(paths, collection_meta)?;
+            Ok(public_keys
+                .iter()
+                .filter_map(|public_key| registry.key_to_id.get(public_key).copied())
+                .collect())
+        }
+    }
+}
+
+fn register_public_keys_with_internal_ids(
+    paths: &CollectionPaths,
+    collection_meta: &mut CollectionMetadata,
+    public_keys: &[String],
+    internal_ids: &[i64],
+) -> io::Result<()> {
+    if public_keys.len() != internal_ids.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "public key count must match internal id count",
+        ));
+    }
+
+    let mut batch_keys = HashSet::with_capacity(public_keys.len());
+    let mut batch_ids = HashSet::with_capacity(internal_ids.len());
+    for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
+        if !batch_keys.insert(public_key.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate public key in batch: {public_key}"),
+            ));
+        }
+        if !batch_ids.insert(*internal_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate internal id in batch: {internal_id}"),
+            ));
+        }
+    }
+
+    if collection_meta.primary_key_mode == PrimaryKeyMode::Numeric
+        && public_keys.iter().all(|key| key.parse::<i64>().is_ok())
+    {
+        for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
+            let parsed = parse_numeric_public_key(public_key)?;
+            if parsed != *internal_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "numeric public key '{public_key}' must match document id {internal_id}"
+                    ),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut registry = ensure_string_primary_key_mode(paths, collection_meta)?;
+    for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
+        if let Some(existing_id) = registry.key_to_id.get(public_key).copied() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("public key already exists: {public_key} -> {existing_id}"),
+            ));
+        }
+        if let Some(existing_key) = registry.id_to_key.get(internal_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("internal id already registered: {internal_id} -> {existing_key}"),
+            ));
+        }
+        registry.key_to_id.insert(public_key.clone(), *internal_id);
+        registry.id_to_key.insert(*internal_id, public_key.clone());
+        registry.next_internal_id = registry.next_internal_id.max(internal_id.saturating_add(1));
+    }
+
+    save_primary_key_registry(paths, collection_meta, &registry)
+}
+
+fn ensure_string_primary_key_mode(
+    paths: &CollectionPaths,
+    collection_meta: &mut CollectionMetadata,
+) -> io::Result<PrimaryKeyRegistry> {
+    let mut registry = load_primary_key_registry(paths, collection_meta)?;
+    if collection_meta.primary_key_mode == PrimaryKeyMode::String {
+        return Ok(registry);
+    }
+
+    collection_meta.primary_key_mode = PrimaryKeyMode::String;
+    collection_meta.save_to_path(&paths.collection_meta)?;
+
+    registry.mode = PrimaryKeyMode::String;
+    populate_numeric_keys_into_registry(paths, &mut registry)?;
+    save_primary_key_registry(paths, collection_meta, &registry)?;
+    Ok(registry)
+}
+
+fn populate_numeric_keys_into_registry(
+    paths: &CollectionPaths,
+    registry: &mut PrimaryKeyRegistry,
+) -> io::Result<()> {
+    for internal_id in load_all_collection_ids(paths)? {
+        let public_key = internal_id.to_string();
+        registry.key_to_id.insert(public_key.clone(), internal_id);
+        registry.id_to_key.insert(internal_id, public_key);
+        registry.next_internal_id = registry.next_internal_id.max(internal_id.saturating_add(1));
+    }
+    Ok(())
+}
+
+fn display_key_for_internal_id(registry: &PrimaryKeyRegistry, internal_id: i64) -> String {
+    match registry.mode {
+        PrimaryKeyMode::Numeric => internal_id.to_string(),
+        PrimaryKeyMode::String => registry
+            .id_to_key
+            .get(&internal_id)
+            .cloned()
+            .unwrap_or_else(|| internal_id.to_string()),
+    }
+}
+
+fn parse_numeric_public_key(key: &str) -> io::Result<i64> {
+    key.parse::<i64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("public key must parse to i64 in numeric mode: {key}"),
+        )
+    })
+}
+
+fn collection_max_internal_id(paths: &CollectionPaths) -> io::Result<i64> {
+    let mut max_internal_id = 0i64;
+    for internal_id in load_all_collection_ids(paths)? {
+        max_internal_id = max_internal_id.max(internal_id);
+    }
+    Ok(max_internal_id)
+}
+
+fn load_all_collection_ids(paths: &CollectionPaths) -> io::Result<Vec<i64>> {
+    let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
+    let mut all_ids = Vec::new();
+    for segment in segment_paths {
+        all_ids.extend(load_record_ids_or_empty(&segment.external_ids)?);
+    }
+    Ok(all_ids)
+}
+
 fn load_payloads_or_empty(
     path: &Path,
     expected_rows: usize,
@@ -3279,6 +3603,32 @@ fn load_payloads_or_empty(
         }
         Err(err) => Err(err),
     }
+}
+
+fn materialize_active_segment_arrow_snapshots(
+    paths: &CollectionPaths,
+    collection_meta: &CollectionMetadata,
+) -> io::Result<()> {
+    if paths.payloads.exists() {
+        let payloads = load_payloads_jsonl(&paths.payloads)?;
+        write_payloads_arrow(
+            &paths.payloads.with_extension("arrow"),
+            &payloads,
+            &collection_meta.fields,
+        )?;
+    }
+
+    if paths.vectors.exists() {
+        let vectors = load_vectors_jsonl(&paths.vectors)?;
+        write_vectors_arrow(
+            &paths.vectors.with_extension("arrow"),
+            &vectors,
+            &collection_meta.vectors,
+            &collection_meta.primary_vector,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn load_vectors_or_empty(
@@ -3563,6 +3913,82 @@ fn validate_vector_index_descriptor(
                 }
             }
         }
+        VectorIndexKind::IvfUsq => {
+            for key in params.keys() {
+                if key != "nlist"
+                    && key != "bits_per_dim"
+                    && key != "rotation_seed"
+                    && key != "rerank_k"
+                    && key != "use_high_accuracy_scan"
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported ivf_usq param: {key}"),
+                    ));
+                }
+            }
+            for key in ["nlist", "bits_per_dim", "rotation_seed", "rerank_k"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("ivf_usq {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("ivf_usq {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+            if let Some(value) = params.get("use_high_accuracy_scan") {
+                value.as_bool().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf_usq use_high_accuracy_scan must be a boolean",
+                    )
+                })?;
+            }
+        }
+        VectorIndexKind::HnswHvq => {
+            for key in params.keys() {
+                if key != "m"
+                    && key != "m_max0"
+                    && key != "ef_construction"
+                    && key != "ef_search"
+                    && key != "nbits"
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported hnsw_hvq param: {key}"),
+                    ));
+                }
+            }
+            for key in ["m", "m_max0", "ef_construction", "ef_search", "nbits"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_hvq {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_hvq {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+            if descriptor.metric.as_deref() != Some("ip") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hnsw_hvq currently supports only ip in HannsDB",
+                ));
+            }
+        }
         VectorIndexKind::Hnsw => {
             for key in params.keys() {
                 if key != "m" && key != "ef_construction" {
@@ -3614,6 +4040,44 @@ fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::R
             metric: metric.clone(),
             params: serde_json::json!({ "nlist": nlist }),
         },
+        Some(VectorIndexSchema::IvfUsq {
+            metric,
+            nlist,
+            bits_per_dim,
+            rotation_seed,
+            rerank_k,
+            use_high_accuracy_scan,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::IvfUsq,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "nlist": nlist,
+                "bits_per_dim": bits_per_dim,
+                "rotation_seed": rotation_seed,
+                "rerank_k": rerank_k,
+                "use_high_accuracy_scan": use_high_accuracy_scan
+            }),
+        },
+        Some(VectorIndexSchema::HnswHvq {
+            metric,
+            m,
+            m_max0,
+            ef_construction,
+            ef_search,
+            nbits,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::HnswHvq,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "m": m,
+                "m_max0": m_max0,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
+                "nbits": nbits
+            }),
+        },
         Some(VectorIndexSchema::Hnsw {
             metric,
             m,
@@ -3658,6 +4122,44 @@ fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io
                 metric: metric.clone(),
                 params: serde_json::json!({ "nlist": nlist }),
             },
+            VectorIndexSchema::IvfUsq {
+                metric,
+                nlist,
+                bits_per_dim,
+                rotation_seed,
+                rerank_k,
+                use_high_accuracy_scan,
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::IvfUsq,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "nlist": nlist,
+                    "bits_per_dim": bits_per_dim,
+                    "rotation_seed": rotation_seed,
+                    "rerank_k": rerank_k,
+                    "use_high_accuracy_scan": use_high_accuracy_scan
+                }),
+            },
+            VectorIndexSchema::HnswHvq {
+                metric,
+                m,
+                m_max0,
+                ef_construction,
+                ef_search,
+                nbits,
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::HnswHvq,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "m": m,
+                    "m_max0": m_max0,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search,
+                    "nbits": nbits
+                }),
+            },
             VectorIndexSchema::Hnsw {
                 metric,
                 m,
@@ -3679,69 +4181,6 @@ fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io
 }
 
 #[cfg(feature = "hanns-backend")]
-fn resolve_primary_vector_descriptor(
-    collection_meta: &CollectionMetadata,
-    index_catalog: &IndexCatalog,
-) -> io::Result<VectorIndexDescriptor> {
-    if let Some(descriptor) = index_catalog
-        .vector_indexes
-        .iter()
-        .find(|descriptor| descriptor.field_name == collection_meta.primary_vector)
-    {
-        return Ok(descriptor.clone());
-    }
-
-    let primary_vector = collection_meta
-        .vectors
-        .iter()
-        .find(|vector| vector.name == collection_meta.primary_vector)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "primary vector '{}' is not defined in collection metadata",
-                    collection_meta.primary_vector
-                ),
-            )
-        })?;
-
-    let (kind, metric, params) = match primary_vector.index_param.as_ref() {
-        Some(VectorIndexSchema::Ivf { metric, nlist }) => (
-            VectorIndexKind::Ivf,
-            metric.clone(),
-            serde_json::json!({ "nlist": nlist }),
-        ),
-        Some(VectorIndexSchema::Hnsw {
-            metric,
-            m,
-            ef_construction,
-            ..
-        }) => (
-            VectorIndexKind::Hnsw,
-            metric.clone(),
-            serde_json::json!({
-                "m": m,
-                "ef_construction": ef_construction
-            }),
-        ),
-        None => (
-            VectorIndexKind::Hnsw,
-            Some(collection_meta.metric.clone()),
-            serde_json::json!({
-                "m": collection_meta.hnsw_m,
-                "ef_construction": collection_meta.hnsw_ef_construction
-            }),
-        ),
-    };
-
-    Ok(VectorIndexDescriptor {
-        field_name: collection_meta.primary_vector.clone(),
-        kind,
-        metric,
-        params,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

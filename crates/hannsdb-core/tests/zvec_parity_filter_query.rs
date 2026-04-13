@@ -6,7 +6,6 @@
 ///
 /// Adapted to HannsDB's Rust API: `query_with_context` with `QueryContext`, and
 /// `query_documents` for filter-only queries.
-
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
@@ -154,8 +153,7 @@ fn zvec_parity_filter_or_two_conditions() {
 
     // age < 22 means i < 2 => i=0,1. age > 33 means i > 13 => i=14.
     assert_eq!(hits.len(), 3);
-    let hit_ids: std::collections::HashSet<i64> =
-        hits.iter().map(|h| h.id).collect();
+    let hit_ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
     assert!(hit_ids.contains(&0));
     assert!(hit_ids.contains(&1));
     assert!(hit_ids.contains(&14));
@@ -186,9 +184,7 @@ fn zvec_parity_filter_parentheses_and_or_combined() {
                 }],
                 query_by_id: None,
                 query_by_id_field_name: None,
-                filter: Some(
-                    "(age < 22 or age > 33) and active == false".to_string(),
-                ),
+                filter: Some("(age < 22 or age > 33) and active == false".to_string()),
                 output_fields: None,
                 include_vector: false,
                 group_by: None,
@@ -225,8 +221,7 @@ fn zvec_parity_filter_parentheses_or_and_combined() {
                 query_by_id: None,
                 query_by_id_field_name: None,
                 filter: Some(
-                    "(age > 22 and age < 26) or (age > 32 and active == true)"
-                        .to_string(),
+                    "(age > 22 and age < 26) or (age > 32 and active == true)".to_string(),
                 ),
                 output_fields: None,
                 include_vector: false,
@@ -279,8 +274,7 @@ fn zvec_parity_filter_in_list_integers() {
         .expect("filter IN query");
 
     assert_eq!(hits.len(), 3);
-    let hit_ids: std::collections::HashSet<i64> =
-        hits.iter().map(|h| h.id).collect();
+    let hit_ids: std::collections::HashSet<i64> = hits.iter().map(|h| h.id).collect();
     assert!(hit_ids.contains(&1));
     assert!(hit_ids.contains(&2));
     assert!(hit_ids.contains(&3));
@@ -777,7 +771,10 @@ fn zvec_parity_query_empty_result_impossible_and() {
         )
         .expect("empty result query");
 
-    assert!(hits.is_empty(), "should return no results for impossible filter");
+    assert!(
+        hits.is_empty(),
+        "should return no results for impossible filter"
+    );
 }
 
 #[test]
@@ -865,8 +862,7 @@ fn zvec_parity_query_consistency_repeated_identical_queries() {
     let expected_ids: std::collections::HashSet<i64> =
         all_results[0].iter().map(|h| h.id).collect();
     for (i, result) in all_results.iter().enumerate() {
-        let ids: std::collections::HashSet<i64> =
-            result.iter().map(|h| h.id).collect();
+        let ids: std::collections::HashSet<i64> = result.iter().map(|h| h.id).collect();
         assert_eq!(ids, expected_ids, "id set mismatch at iteration {}", i);
     }
 }

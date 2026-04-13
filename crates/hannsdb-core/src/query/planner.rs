@@ -317,7 +317,7 @@ fn validate_vector_query(
 
     let field_data_type = vector_schema.data_type.clone();
     match (&query.vector, field_data_type) {
-        (QueryVector::Dense(vec), FieldType::VectorSparse) => {
+        (QueryVector::Dense(_vec), FieldType::VectorSparse) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -390,6 +390,8 @@ pub(crate) fn resolve_vector_descriptor_for_field(
             field_name: vector_schema.name.clone(),
             kind: match index_param {
                 crate::document::VectorIndexSchema::Ivf { .. } => VectorIndexKind::Ivf,
+                crate::document::VectorIndexSchema::IvfUsq { .. } => VectorIndexKind::IvfUsq,
+                crate::document::VectorIndexSchema::HnswHvq { .. } => VectorIndexKind::HnswHvq,
                 crate::document::VectorIndexSchema::Hnsw { .. } => VectorIndexKind::Hnsw,
             },
             metric: index_param.metric().map(str::to_string),
@@ -397,6 +399,34 @@ pub(crate) fn resolve_vector_descriptor_for_field(
                 crate::document::VectorIndexSchema::Ivf { nlist, .. } => {
                     serde_json::json!({ "nlist": nlist })
                 }
+                crate::document::VectorIndexSchema::IvfUsq {
+                    nlist,
+                    bits_per_dim,
+                    rotation_seed,
+                    rerank_k,
+                    use_high_accuracy_scan,
+                    ..
+                } => serde_json::json!({
+                    "nlist": nlist,
+                    "bits_per_dim": bits_per_dim,
+                    "rotation_seed": rotation_seed,
+                    "rerank_k": rerank_k,
+                    "use_high_accuracy_scan": use_high_accuracy_scan,
+                }),
+                crate::document::VectorIndexSchema::HnswHvq {
+                    m,
+                    m_max0,
+                    ef_construction,
+                    ef_search,
+                    nbits,
+                    ..
+                } => serde_json::json!({
+                    "m": m,
+                    "m_max0": m_max0,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search,
+                    "nbits": nbits,
+                }),
                 crate::document::VectorIndexSchema::Hnsw {
                     m, ef_construction, ..
                 } => serde_json::json!({
@@ -438,6 +468,42 @@ fn resolve_primary_vector_descriptor_for_planner(
             VectorIndexKind::Ivf,
             metric.clone(),
             serde_json::json!({ "nlist": nlist }),
+        ),
+        Some(crate::document::VectorIndexSchema::IvfUsq {
+            metric,
+            nlist,
+            bits_per_dim,
+            rotation_seed,
+            rerank_k,
+            use_high_accuracy_scan,
+        }) => (
+            VectorIndexKind::IvfUsq,
+            metric.clone(),
+            serde_json::json!({
+                "nlist": nlist,
+                "bits_per_dim": bits_per_dim,
+                "rotation_seed": rotation_seed,
+                "rerank_k": rerank_k,
+                "use_high_accuracy_scan": use_high_accuracy_scan,
+            }),
+        ),
+        Some(crate::document::VectorIndexSchema::HnswHvq {
+            metric,
+            m,
+            m_max0,
+            ef_construction,
+            ef_search,
+            nbits,
+        }) => (
+            VectorIndexKind::HnswHvq,
+            metric.clone(),
+            serde_json::json!({
+                "m": m,
+                "m_max0": m_max0,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
+                "nbits": nbits,
+            }),
         ),
         Some(crate::document::VectorIndexSchema::Hnsw {
             metric,

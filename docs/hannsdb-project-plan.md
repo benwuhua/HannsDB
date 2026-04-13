@@ -47,10 +47,13 @@
 - [x] Execute Track A from `docs/superpowers/plans/2026-03-20-architecture-analysis-alignment-v1.md`:
   normalize `docs/architecture-analysis.md`, land minimal `WAL + replay` in `hannsdb-core`, then finish the remaining crash-style recovery coverage and final closeout
   - 2026-03-21: all verification gates pass (clippy clean, workspace tests clean, VectorDBBench unit tests pass, optimize bench stable); external warnings (Python 3.14 ctypes, knowhere-rs unused_mut) are upstream — HannsDB itself is clean
-- [ ] Stabilize and measure `knowhere-rs` HNSW build behavior at target-scale cosine workloads
+- [x] Stabilize and measure `knowhere-rs` HNSW build behavior at target-scale cosine workloads
+  - 2026-04-13: fresh local full `Performance1536D50K` rerun completed with `insert=14.6432s`, `optimize=114.001s`, `load=128.6442s`, `p99=0.0003s`, `recall=0.9441`
+  - 2026-04-13: fresh remote x86 optimize proxy at `50K / 1536 / cosine` completed with `create=0ms`, `insert=3327ms`, `optimize=18606ms`, `total=21934ms`
 - [x] Close the standard `Performance1536D50K` benchmark path
   - 2026-03-21 root cause of slow search identified: Python binding was installed without `knowhere-backend`, so `optimize_collection` fell back to brute-force; script patched to force maturin rebuild with correct features before each run
   - 2026-03-21 first clean end-to-end run with knowhere HNSW: `insert=121s optimize=81s serial_latency_p99=111ms recall=1.0`; result: `result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
+  - 2026-04-13 fresh clean rerun: `result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
 - [ ] Convert current prototype durability into a real storage story
 
 ### Not started
@@ -71,7 +74,6 @@
 
 - [x] Write a top-level design document that reflects the real current architecture.
 - [x] Write a top-level plan document that marks completed work separately from upcoming work.
-- [ ] Keep benchmark notes as the detailed evidence log, not the only place where current status exists.
 - [x] Keep benchmark notes as the detailed evidence log, not the only place where current status exists.
 
 **Exit criteria:**
@@ -132,12 +134,13 @@
 
 - [x] Wire HannsDB into `VectorDBBench` with a local-path embedded client.
 - [x] Pass tiny smoke and custom dataset flows.
-- [ ] Finish `Performance1536D50K` with current code and record a complete result.
+- [x] Finish `Performance1536D50K` with current code and record a complete result.
+  - 2026-04-13 current result: `vectordb_bench/results/HannsDB/result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
 - [x] Decide whether v1 benchmark success requires only “run completes” or also a minimum latency/throughput target.
   - v1 success = run completes with HNSW active (optimize >30s); latency/QPS improvement is future work
 - [x] Keep a reproducible command and result artifact path for the latest standard-case run.
-  - command: `DB_LABEL=hannsdb-1536d50k-knowhere TASK_LABEL=hannsdb-1536d50k-knowhere DB_PATH=/tmp/hannsdb-vdbb-1536d50k-knowhere-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh`
-  - result: `vectordb_bench/results/HannsDB/result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
+  - command: `DB_LABEL=hannsdb-p0-rerun-20260413 TASK_LABEL=hannsdb-p0-rerun-20260413 DB_PATH=/tmp/hannsdb-p0-rerun-20260413-db bash scripts/run_vdbb_hannsdb_perf1536d50k.sh`
+  - result: `vectordb_bench/results/HannsDB/result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
 
 **Exit criteria:**
 - A full standard-case run completes end-to-end.
@@ -173,10 +176,10 @@
 - Modify: `crates/hannsdb-daemon/src/routes.rs`
 - Add tests under `crates/hannsdb-core/tests/`
 
-- [ ] Introduce explicit segment rollover rules.
-- [ ] Add compaction/rebuild plan for tombstoned data.
+- [x] Introduce explicit segment rollover rules.
+- [x] Add compaction/rebuild plan for tombstoned data.
 - [ ] Clarify when ANN state is rebuilt versus incrementally updated.
-- [ ] Expose minimal admin controls through the daemon if needed.
+- [x] Expose minimal admin controls through the daemon if needed.
 
 **Exit criteria:**
 - The code no longer assumes “one collection, one forever-growing segment” as the only lifecycle model.
@@ -219,17 +222,18 @@
 
 ## Recommended near-term execution order
 
-1. Measure and record the latest `knowhere-rs` target-scale build behavior.
-2. Use the recorded HannsDB release proxy baseline and latest `knowhere-rs` evidence to decide whether the next cut belongs in `knowhere-rs` or HannsDB glue.
-3. Re-run the full `Performance1536D50K` path once the optimize path is materially better understood.
-4. Only after benchmark closure, resume WAL/recovery and segment lifecycle work.
+1. Convert the current durability/runtime prototype into a cleaner long-term storage story.
+2. Clarify ANN rebuild vs incremental-update rules under the now multi-segment lifecycle.
+3. Continue expanding public/product surface to match the already-landed engine/runtime capability.
+4. Use the fresh full benchmark + remote x86 proxy checkpoints as the new baseline for the next performance cut.
 
 ## What this project is doing right now
 
 If you only want the short answer:
 
 - HannsDB already has a working local core, Python binding, daemon, and benchmark smoke path.
-- The current main blocker is not “can it run at all”; it is “can the ANN optimize/build path finish fast enough at the standard `50K / 1536 / cosine` workload”.
+- The current main blocker is no longer “can the standard benchmark run at all”; the benchmark path is now executable again.
+- The main remaining gap is turning the current durability/runtime prototype into a cleaner long-term storage story, while continuing to close product-surface and performance gaps against zvec.
 - The controller now uses the standalone release optimize benchmark as the default check before escalating to full `VectorDBBench`.
 - In parallel, the project is validating and improving `knowhere-rs` as a long-term ANN foundation for this workload.
 

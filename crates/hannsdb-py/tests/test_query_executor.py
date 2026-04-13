@@ -47,6 +47,47 @@ def build_collection(tmp_path):
     return collection, schema
 
 
+def build_alphanumeric_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(
+                name="group",
+                data_type="int64",
+            )
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(
+                id="user-a",
+                vector=[0.0, 0.0],
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="user-b",
+                vector=[0.1, 0.0],
+                fields={"group": 1},
+            ),
+            hannsdb.Doc(
+                id="user-c",
+                vector=[0.2, 0.0],
+                fields={"group": 2},
+            ),
+        ]
+    )
+    return collection, schema
+
+
 def build_secondary_vector_collection(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -236,6 +277,17 @@ def test_query_context_accepts_query_by_id_field_name():
     assert context.query_by_id_field_name == "title"
 
 
+def test_query_context_accepts_order_by_object():
+    context = hannsdb.QueryContext(
+        query_by_id=["user-b"],
+        order_by=hannsdb.QueryOrderBy(field_name="group", descending=True),
+    )
+
+    assert context.query_by_id == ["user-b"]
+    assert context.order_by.field_name == "group"
+    assert context.order_by.descending is True
+
+
 def test_reranker_constructors_validate_arguments():
     with pytest.raises(ValueError, match="topn"):
         hannsdb.RrfReRanker(topn=-1)
@@ -395,6 +447,25 @@ def test_query_executor_supports_multi_query_and_query_by_id(tmp_path):
     hits = executor.execute(collection, context)
 
     assert {hit.id for hit in hits} == {"1", "2", "3"}
+    assert hits[0].id == "2"
+    assert hits[0].fields["group"] == 1
+    assert sorted(hit.fields["group"] for hit in hits) == [1, 1, 2]
+    assert [hit.score for hit in hits] == sorted(hit.score for hit in hits)
+
+
+def test_query_executor_supports_alphanumeric_query_by_id(tmp_path):
+    collection, schema = build_alphanumeric_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        query_by_id=["user-b"],
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["user-b", "user-a", "user-c"]
     assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
 
 
@@ -481,10 +552,10 @@ def test_query_executor_supports_builtin_rrf_reranker(tmp_path, monkeypatch):
 
     hits = executor.execute(proxy, context)
 
-    # `top_k` is the per-query fan-out depth on the reranker path; `topn`
-    # controls the final fused result size.
-    assert [hit.id for hit in hits] == ["2", "1", "3"]
-    assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
+    # Built-in rerankers now use core-native query execution, so `top_k`
+    # is applied as the final result cap rather than as Python-side fan-out.
+    assert [hit.id for hit in hits] == ["3", "2"]
+    assert [hit.fields["group"] for hit in hits] == [2, 1]
     assert proxy.max_active == 1
 
 
@@ -508,36 +579,32 @@ def test_query_executor_supports_weighted_reranker(tmp_path):
 
     hits = executor.execute(collection, context)
 
-    assert [hit.id for hit in hits] == ["2", "3", "1"]
-    assert [hit.fields["group"] for hit in hits] == [1, 2, 1]
+    assert [hit.id for hit in hits] == ["1", "2", "3"]
+    assert [hit.fields["group"] for hit in hits] == [1, 1, 2]
 
 
-def test_query_executor_supports_weighted_reranker_with_duplicate_field_keys(
-    tmp_path,
-):
-    _, schema = build_collection(tmp_path)
+def test_query_executor_supports_weighted_reranker_with_query_by_id(tmp_path):
+    collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
-    class StubCollection:
-        def query_context(self, context):
-            key = tuple(context.queries[0].vector)
-            if key in {(0.0, 0.0), (0.2, 0.0)}:
-                return [hannsdb.Doc(id="a", score=0.0)]
-            raise AssertionError(f"unexpected query vector: {key!r}")
-
     context = hannsdb.QueryContext(
-        top_k=1,
+        top_k=2,
         queries=[
             hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
-            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
         ],
-        reranker=hannsdb.WeightedReRanker(weights={"dense": 10.0}),
+        query_by_id=["1"],
+        reranker=hannsdb.WeightedReRanker(
+            topn=2,
+            metric=hannsdb.MetricType.L2,
+            weights={"dense": 2.0},
+        ),
+        output_fields=["group"],
     )
 
-    hits = executor.execute(StubCollection(), context)
+    hits = executor.execute(collection, context)
 
-    assert [hit.id for hit in hits] == ["a"]
-    assert hits[0].score == pytest.approx(20.0)
+    assert [hit.id for hit in hits] == ["1", "2"]
+    assert [hit.fields["group"] for hit in hits] == [1, 1]
 
 
 def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
@@ -687,7 +754,7 @@ def test_query_executor_supports_include_vector(tmp_path):
     assert hits[0].vectors["dense"] == [0.0, 0.0]
 
 
-def test_query_executor_rejects_query_by_id_with_reranker_as_not_implemented(tmp_path):
+def test_query_executor_supports_query_by_id_with_builtin_reranker(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
@@ -698,7 +765,49 @@ def test_query_executor_rejects_query_by_id_with_reranker_as_not_implemented(tmp
         ],
         query_by_id=[1],
         reranker=hannsdb.RrfReRanker(topn=2),
+        output_fields=["group"],
     )
 
-    with pytest.raises(NotImplementedError, match="query_by_id"):
-        executor.execute(collection, context)
+    hits = executor.execute(collection, context)
+
+    assert [hit.id for hit in hits] == ["1", "2"]
+    assert [hit.fields["group"] for hit in hits] == [1, 1]
+
+
+def test_query_executor_supports_group_by_with_builtin_reranker(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        ],
+        group_by=hannsdb.QueryGroupBy(field_name="group"),
+        reranker=hannsdb.RrfReRanker(topn=2),
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.fields["group"] for hit in hits] == [1, 2]
+
+
+def test_query_executor_supports_order_by_with_builtin_reranker(tmp_path):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+            hannsdb.VectorQuery(field_name="dense", vector=[0.2, 0.0], param=None),
+        ],
+        reranker=hannsdb.RrfReRanker(topn=3),
+        order_by=hannsdb.QueryOrderBy(field_name="group", descending=True),
+        output_fields=["group"],
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert [hit.fields["group"] for hit in hits] == [2, 1, 1]

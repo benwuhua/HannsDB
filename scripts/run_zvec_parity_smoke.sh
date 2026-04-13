@@ -50,6 +50,11 @@ python -m pip install -q "$MATURIN_SPEC" "$PYTEST_SPEC"
 cd "$ROOT_DIR"
 cargo test -p hannsdb-core --test zvec_parity_schema -- --nocapture
 cargo test -p hannsdb-core --test zvec_parity_query -- --nocapture
+cargo test -p hannsdb-core --test lifecycle -- --nocapture
+cargo test -p hannsdb-core --test compaction -- --nocapture
+cargo test -p hannsdb-core --test collection_api -- --nocapture
+cargo test -p hannsdb-core --test wal_recovery -- --nocapture
+cargo test -p hannsdb-core --test segment_storage -- --nocapture
 cargo test -p hannsdb-daemon --test http_smoke -- --nocapture
 
 cd "$ROOT_DIR/crates/hannsdb-py"
@@ -59,6 +64,8 @@ python -m pytest \
   tests/test_schema_surface.py \
   tests/test_collection_parity.py \
   tests/test_collection_facade.py \
+  tests/test_ivf_usq_surface.py \
+  tests/test_hnsw_hvq_surface.py \
   tests/test_query_executor.py \
   tests/test_collection_concurrency.py \
   -q

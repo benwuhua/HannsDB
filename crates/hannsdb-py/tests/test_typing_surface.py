@@ -14,6 +14,10 @@ def test_typing_surface_is_available_from_package_and_top_level():
 
     assert str(hannsdb.MetricType.L2) == "l2"
     assert str(hannsdb.QuantizeType.Fp16) == "fp16"
+    assert str(hannsdb.DataType.Int32) == "int32"
+    assert str(hannsdb.DataType.UInt32) == "uint32"
+    assert str(hannsdb.DataType.UInt64) == "uint64"
+    assert str(hannsdb.DataType.Float) == "float"
     assert str(hannsdb.DataType.VectorFp32) == "vector_fp32"
     assert str(hannsdb.LogLevel.Warn) == "warn"
 
@@ -23,6 +27,9 @@ def test_typing_enums_are_accepted_by_schema_and_index_param_wrappers():
         name="docs",
         fields=[
             hannsdb.FieldSchema(name="session_id", data_type=hannsdb.DataType.String),
+            hannsdb.FieldSchema(name="rank", data_type=hannsdb.DataType.Int32),
+            hannsdb.FieldSchema(name="bucket", data_type=hannsdb.DataType.UInt32),
+            hannsdb.FieldSchema(name="weight", data_type=hannsdb.DataType.Float),
         ],
         vectors=[
             hannsdb.VectorSchema(
@@ -43,6 +50,9 @@ def test_typing_enums_are_accepted_by_schema_and_index_param_wrappers():
     )
 
     assert schema.field("session_id").data_type == "string"
+    assert schema.field("rank").data_type == "int32"
+    assert schema.field("bucket").data_type == "uint32"
+    assert schema.field("weight").data_type == "float"
     assert schema.vector("dense").data_type == "vector_fp32"
     assert schema.vector("dense").index_param.metric_type == "l2"
     assert hnsw.metric_type == "cosine"

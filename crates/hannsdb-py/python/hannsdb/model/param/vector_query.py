@@ -31,6 +31,16 @@ def _normalize_vector(vector: Any) -> list[float]:
     raise TypeError("vector must be a list, tuple, or numpy.ndarray of numbers")
 
 
+def _normalize_query_param(param: Any):
+    if param is None:
+        return None
+    from .index_params import HnswQueryParam, IvfUsqQueryParam, IVFQueryParam
+
+    if isinstance(param, (HnswQueryParam, IVFQueryParam, IvfUsqQueryParam)):
+        return param
+    raise TypeError("param must be HnswQueryParam, IVFQueryParam, or IvfUsqQueryParam")
+
+
 class SparseVector:
     """Sparse vector with separate indices and values arrays."""
 
@@ -69,11 +79,18 @@ class VectorQuery:
         # Only normalize if it's a dense vector (not SparseVector)
         if not isinstance(self.vector, SparseVector):
             self.vector = _normalize_vector(self.vector)
+        self.param = _normalize_query_param(self.param)
 
 
 @dataclass
 class QueryGroupBy:
     field_name: str
+
+
+@dataclass
+class QueryOrderBy:
+    field_name: str
+    descending: bool = False
 
 
 @dataclass
@@ -87,6 +104,7 @@ class QueryContext:
     query_by_id_field_name: Optional[str] = None
     group_by: Optional[QueryGroupBy] = None
     reranker: Optional[ReRanker] = None
+    order_by: Optional[QueryOrderBy] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.queries, list):
@@ -105,4 +123,10 @@ class QueryContext:
             self.output_fields = list(self.output_fields)
 
 
-__all__ = ["QueryContext", "QueryGroupBy", "SparseVector", "VectorQuery"]
+__all__ = [
+    "QueryContext",
+    "QueryGroupBy",
+    "QueryOrderBy",
+    "SparseVector",
+    "VectorQuery",
+]

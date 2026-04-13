@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+from ..extension.multi_vector_reranker import RrfReRanker, WeightedReRanker
 from ..extension.rerank_function import ReRanker
 from ..model.param.vector_query import QueryContext
 from ..model.schema.collection_schema import CollectionSchema
@@ -13,6 +14,10 @@ from ..model.schema.collection_schema import CollectionSchema
 @dataclass
 class QueryExecutor:
     schema: CollectionSchema
+
+    @staticmethod
+    def _is_builtin_reranker(reranker: Any) -> bool:
+        return isinstance(reranker, (RrfReRanker, WeightedReRanker))
 
     @staticmethod
     def _query_concurrency() -> int:
@@ -32,6 +37,8 @@ class QueryExecutor:
             return collection.query_context(context)
         if not isinstance(context.reranker, ReRanker):
             raise NotImplementedError("reranker is not supported by the Python facade yet")
+        if self._is_builtin_reranker(context.reranker):
+            return collection.query_context(context)
         if len(context.queries) == 0:
             raise ValueError("reranker requires at least one vector query")
         if context.query_by_id is not None:

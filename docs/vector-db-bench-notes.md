@@ -24,6 +24,15 @@ Source: [`result_20260319_hannsdb-smoke_hannsdb.json`](/Users/ryan/Code/VectorDB
 
 ## 3) Standard benchmark command (Performance1536D50K)
 
+Current local path note:
+- benchmark helper scripts now auto-detect the VectorDBBench repo from:
+  - `/Users/ryan/Code/vectorDB/VectorDBBench`
+  - fallback `/Users/ryan/Code/VectorDBBench`
+- benchmark helper scripts now auto-detect the HannsDB benchmark venv from:
+  - repo-local `.venv-hannsdb`
+  - `/Users/ryan/Code/vectorDB/HannsDB/.venv-hannsdb`
+  - fallback `/Users/ryan/Code/HannsDB/.venv-hannsdb`
+
 Command consistent with the logged TaskConfig (`db_label=hannsdb-1536d50k`, `path=/tmp/hannsdb-vdbb-1536d50k-db`, `M=16`, `ef_construction=64`, `ef_search=32`, `k=10`, `stages=drop_old/load/search_serial`):
 
 ```bash
@@ -148,6 +157,16 @@ Configurable parameters (env):
 - `DIM` (default `256`)
 - `METRIC` (`l2|cosine|ip`, default `cosine`)
 - `TOPK` (default `10`)
+- `INDEX_KIND` (`hnsw|ivf|ivf_usq|hnsw_hvq`, default `hnsw`)
+- `NLIST` (default `64`) for `ivf` / `ivf_usq`
+- `BITS_PER_DIM` (default `4`) for `ivf_usq`
+- `ROTATION_SEED` (default `42`) for `ivf_usq`
+- `RERANK_K` (default `64`) for `ivf_usq`
+- `HIGH_ACCURACY_SCAN` (default `false`) for `ivf_usq`
+- `HNSW_HVQ_M` / `HNSW_HVQ_M_MAX0` / `HNSW_HVQ_EF_CONSTRUCTION` / `HNSW_HVQ_EF_SEARCH` / `HNSW_HVQ_NBITS`
+  for `hnsw_hvq`
+- `QUERY_EF_SEARCH` optional typed-query recall param
+- `QUERY_NPROBE` optional typed-query recall param for IVF-family search
 - `REPEATS` (default `3`, script prints each run and medians)
 - `FEATURES` (default `knowhere-backend`)
 - `PROFILE` (`debug|release`, default `debug`)
@@ -161,7 +180,7 @@ N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=5 FEATURES=knowhere-backend ./scr
 Recommended stable A/B command (same params, different code revision):
 
 ```bash
-N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
+N=2000 DIM=256 METRIC=cosine TOPK=10 INDEX_KIND=hnsw REPEATS=3 FEATURES=knowhere-backend ./scripts/run_hannsdb_optimize_bench.sh
 ```
 
 Recommended large-scale proxy command:
@@ -169,6 +188,26 @@ Recommended large-scale proxy command:
 ```bash
 N=50000 DIM=1536 METRIC=cosine TOPK=10 REPEATS=1 FEATURES=knowhere-backend PROFILE=release ./scripts/run_hannsdb_optimize_bench.sh
 ```
+
+Current honest index-kind constraint:
+- `INDEX_KIND=hnsw_hvq` currently requires `METRIC=ip`
+- `QUERY_NPROBE` is only meaningful for `INDEX_KIND=ivf` or `INDEX_KIND=ivf_usq`
+
+Fresh local validation after adding `INDEX_KIND` support:
+- invalid kind is rejected at script level
+- `INDEX_KIND=hnsw_hvq` + non-`ip` metric is rejected at script level
+- `QUERY_NPROBE` on non-IVF index kinds is rejected at script level
+- small release proxy runs now work for:
+  - `INDEX_KIND=ivf_usq` with `METRIC=l2`
+  - `INDEX_KIND=hnsw_hvq` with `METRIC=ip`
+- script now also transparently forwards quantized/index-family tuning params into the Rust benchmark entry
+- script now also forwards optional typed-query recall params (`QUERY_EF_SEARCH`, `QUERY_NPROBE`)
+
+Fresh local validation after adding query-param forwarding:
+- `QUERY_NPROBE` is printed by the script and reflected by the Rust benchmark entry as
+  `OPT_BENCH_QUERY_PARAMS ... nprobe=<value>`
+- `QUERY_EF_SEARCH` is printed by the script and reflected by the Rust benchmark entry as
+  `OPT_BENCH_QUERY_PARAMS ef_search=<value> ...`
 
 Stable output fields:
 - `OPT_BENCH_CONFIG n=<...> dim=<...> metric=<...> top_k=<...>`
@@ -237,6 +276,94 @@ Profile used:
 
 Scale used:
 - `n=50000`, `dim=1536`, `metric=cosine`, `top_k=10`, `repeats=1`
+
+## 14) Current repo-local release proxy checkpoint (2026-04-13)
+
+Command:
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Per-run raw timing:
+- Run 1: `OPT_BENCH_TIMING_MS create=1 insert=35 optimize=117 search=0 total=155`
+- Run 2: `OPT_BENCH_TIMING_MS create=0 insert=14 optimize=106 search=0 total=122`
+- Run 3: `OPT_BENCH_TIMING_MS create=0 insert=14 optimize=107 search=0 total=122`
+
+Median summary:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=14 optimize=107 search=0 total=122`
+
+Interpretation:
+- This remains a **repo-local proxy**, not a replacement for the full `1536D50K` apples-to-apples benchmark lane.
+- It is still useful as a fast regression gate for recent runtime/productization work (`IvfUsq`, `HnswHvq`, Arrow snapshot/reopen, rollover/compaction hardening).
+
+## 15) Quantized index benchmark-entry validation (2026-04-13)
+
+After extending `collection_api_optimize_benchmark_entry` and `scripts/run_hannsdb_optimize_bench.sh` with `INDEX_KIND`, the repo-local proxy now also supports quantized-runtime benchmarking on honest combinations.
+
+Validated commands:
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=200 DIM=64 METRIC=l2 TOPK=10 INDEX_KIND=ivf_usq REPEATS=1 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Result:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=0 optimize=3 search=0 total=5`
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=200 DIM=64 METRIC=ip TOPK=10 INDEX_KIND=hnsw_hvq REPEATS=1 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Result:
+- `BENCH_SUMMARY_MEDIAN_MS create=0 insert=1 optimize=16 search=0 total=18`
+
+Constraint checks:
+- `INDEX_KIND=bogus` → script exits with code `2`
+- `INDEX_KIND=hnsw_hvq METRIC=cosine` → script exits with code `2`
+
+Interpretation:
+- the proxy can now exercise HannsDB’s quantized runtime lanes directly instead of only the default index path
+- these tiny release runs are still **regression probes**, not substitutes for the full standard-case apples-to-apples benchmark lane
+
+## 16) Query-param benchmark-entry validation (2026-04-13)
+
+The repo-local optimize proxy now also forwards typed-query recall params into the Rust benchmark entry.
+
+Validated commands:
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=200 DIM=64 METRIC=l2 TOPK=10 INDEX_KIND=ivf_usq QUERY_NPROBE=5 REPEATS=1 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed benchmark entry output includes:
+- `OPT_BENCH_QUERY_PARAMS ef_search=none nprobe=5`
+
+Result summary:
+- `BENCH_SUMMARY_MEDIAN_MS create=2 insert=2 optimize=3 search=0 total=11`
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=200 DIM=64 METRIC=cosine TOPK=10 INDEX_KIND=hnsw QUERY_EF_SEARCH=48 REPEATS=1 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed benchmark entry output includes:
+- `OPT_BENCH_QUERY_PARAMS ef_search=48 nprobe=none`
+
+Result summary:
+- `BENCH_SUMMARY_MEDIAN_MS create=2 insert=3 optimize=7 search=0 total=15`
+
+Interpretation:
+- the repo-local proxy can now probe not only index-family choice but also query-time recall knobs on the typed single-vector fast path
+- this is still a regression/profiling aid, not a substitute for the full apples-to-apples benchmark lane
 
 Raw output summary:
 - `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10`
@@ -1432,3 +1559,83 @@ HannsDB mean latency ≈ 0.65ms，zvec mean ≈ 0.36ms。尽管 HannsDB p99 更�
 1. INT8/FP16 量化（knowhere-rs SQ8）：降低 HNSW search 时间，可能提升 QPS
 2. 批量搜索：减少 Python-Rust FFI per-call 开销
 3. profile 确认 mean latency 分布（0.65ms 具体花在哪里）
+
+## 47) 2026-04-12 post-P0 optimize proxy rerun
+
+Context:
+- after landing the recent product/runtime slices in HannsDB:
+  - `IvfUsq` real runtime/productization
+  - `HnswHvq` honest public/runtime slice
+  - active-segment `flush -> Arrow snapshot` materialization with stale-snapshot invalidation
+- the external `VectorDBBench` repo path was not available in the current environment, so this checkpoint used the repo-local optimize proxy instead of the full standard-case harness
+
+Command:
+
+```bash
+cd /Users/ryan/Code/vectorDB/HannsDB
+N=2000 DIM=256 METRIC=cosine TOPK=10 REPEATS=3 FEATURES=hanns-backend PROFILE=release \
+  bash scripts/run_hannsdb_optimize_bench.sh
+```
+
+Observed per-run timings:
+- Run 1: `create=0 insert=15 optimize=110 search=0 total=127`
+- Run 2: `create=0 insert=19 optimize=111 search=0 total=131`
+- Run 3: `create=0 insert=16 optimize=111 search=0 total=128`
+
+Median summary:
+- `create=0`
+- `insert=16`
+- `optimize=111`
+- `search=0`
+- `total=128`
+
+Interpretation:
+- the current small-case release optimize proxy remains very fast and stable after the latest quantized-runtime/storage slices
+- this does **not** replace the full `Performance1536D50K` apples-to-apples recheck
+- but it does establish that the recent product/runtime work did not introduce an obvious small-case optimize regression in the repo-local benchmark proxy
+
+## 48) Fresh full `Performance1536D50K` rerun (2026-04-13)
+
+After fixing local benchmark helper path defaults and clearing an ENOSPC condition caused by stale `/tmp` benchmark DBs, HannsDB completed a fresh full `Performance1536D50K` run.
+
+Run label:
+- `hannsdb-p0-rerun-20260413`
+
+Result file:
+- `/Users/ryan/Code/vectorDB/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
+
+Observed metrics:
+- `insert_duration=14.6432`
+- `optimize_duration=114.001`
+- `load_duration=128.6442`
+- `serial_latency_p99=0.0003`
+- `serial_latency_p95=0.0003`
+- `recall=0.9441`
+- `ndcg=0.9506`
+
+Interpretation:
+- this is a fresh end-to-end benchmark result, not just a repo-local proxy
+- the current standard benchmark lane is executable again in the present environment
+- the failed same-day attempt with label `hannsdb-p0-20260413` was caused by `/tmp` ENOSPC during insert; after cleaning stale temp DBs, the rerun completed successfully
+
+## 49) Remote x86 release optimize proxy (2026-04-13)
+
+After syncing both `HannsDB` and the sibling `Hanns` repo to the remote x86 host, the remote release optimize proxy succeeded on the larger `50K / 1536 / cosine` shape.
+
+Host:
+- remote x86 machine (`root@189.1.218.159`)
+
+Command shape:
+
+```bash
+N=50000 DIM=1536 METRIC=cosine bash scripts/sync-remote.sh knowhere-bench
+```
+
+Observed output:
+- `OPT_BENCH_CONFIG n=50000 dim=1536 metric=cosine top_k=10 index_kind=hnsw`
+- `OPT_BENCH_TIMING_MS create=0 insert=3327 optimize=18606 search=0 total=21934`
+
+Interpretation:
+- this is not a full VectorDBBench run; it is the remote x86 optimize proxy
+- it confirms the current larger-shape optimize/search path is executable on x86 with the latest synced code and sibling dependency layout
+- it also establishes a fresh x86-side proxy checkpoint to compare against the successful full `Performance1536D50K` local rerun

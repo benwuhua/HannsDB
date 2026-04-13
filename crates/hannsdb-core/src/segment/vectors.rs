@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 pub fn append_vectors(path: &Path, vectors: &[BTreeMap<String, Vec<f32>>]) -> io::Result<usize> {
+    invalidate_arrow_snapshot(path.with_extension("arrow"))?;
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let mut writer = BufWriter::new(file);
     for vector_map in vectors {
@@ -43,6 +44,14 @@ pub fn load_vectors_jsonl(path: &Path) -> io::Result<Vec<BTreeMap<String, Vec<f3
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+fn invalidate_arrow_snapshot(path: std::path::PathBuf) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Ensure the vectors JSONL file has exactly `existing_rows` rows by padding

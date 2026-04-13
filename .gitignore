@@ -11,3 +11,4 @@
 .coord/watch/
 .coord/workers/
 /.worktrees/
+.omx/

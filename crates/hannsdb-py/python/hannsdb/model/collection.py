@@ -7,9 +7,20 @@ from typing import Any
 
 from .. import _native as _native_module
 from ..model.doc import Doc
-from ..model.param import CollectionOption, HnswIndexParam, IVFIndexParam
+from ..model.param import (
+    CollectionOption,
+    HnswHvqIndexParam,
+    HnswIndexParam,
+    IvfUsqIndexParam,
+    IVFIndexParam,
+)
 from ..model.schema.collection_schema import CollectionSchema, _coerce_collection_schema
-from ..model.schema.field_schema import FieldSchema, VectorSchema
+from ..model.schema.field_schema import (
+    FieldSchema,
+    VectorSchema,
+    _coerce_field_schema,
+    _coerce_vector_schema,
+)
 
 __all__ = ["Collection", "create_and_open", "open"]
 
@@ -63,6 +74,63 @@ def _wrap_collection_option(option):
     if isinstance(option, CollectionOption):
         return option
     return CollectionOption(read_only=option.read_only, enable_mmap=option.enable_mmap)
+
+
+def _replace_collection_schema(
+    schema: CollectionSchema,
+    *,
+    fields=None,
+    vectors=None,
+) -> CollectionSchema:
+    return CollectionSchema(
+        name=schema.name,
+        fields=schema.fields if fields is None else fields,
+        vectors=schema.vectors if vectors is None else vectors,
+        primary_vector=schema.primary_vector,
+    )
+
+
+def _normalize_add_column_input(
+    field_or_name,
+    data_type="string",
+    nullable=False,
+    array=False,
+    expression="",
+    option=None,
+) -> tuple[FieldSchema, str, Any]:
+    if isinstance(field_or_name, VectorSchema):
+        raise NotImplementedError("vector add_column is not supported yet")
+    if hasattr(field_or_name, "dimension") and hasattr(field_or_name, "index_param"):
+        _coerce_vector_schema(field_or_name)
+        raise NotImplementedError("vector add_column is not supported yet")
+
+    if isinstance(field_or_name, FieldSchema) or hasattr(field_or_name, "data_type"):
+        field_schema = _coerce_field_schema(field_or_name)
+    else:
+        field_schema = FieldSchema(
+            name=field_or_name,
+            data_type=data_type,
+            nullable=nullable,
+            array=array,
+        )
+
+    if expression != "":
+        raise NotImplementedError("add_column expression is not supported yet")
+
+    return field_schema, expression, option
+
+
+def _normalize_alter_column_input(
+    field_name,
+    new_name=None,
+    field_schema=None,
+    option=None,
+) -> tuple[str, str | None, Any]:
+    if field_schema is not None:
+        raise NotImplementedError("alter_column field_schema migration is not supported yet")
+    if new_name in (None, ""):
+        raise ValueError("alter_column rename requires new_name")
+    return str(field_name), str(new_name), option
 
 
 def _coerce_doc_to_native(doc):
@@ -162,6 +230,7 @@ def _build_query_context(
     query_by_id=None,
     query_by_id_field_name=None,
     group_by=None,
+    order_by=None,
 ):
     from ..model.param.vector_query import QueryContext
 
@@ -182,6 +251,7 @@ def _build_query_context(
         query_by_id_field_name=query_by_id_field_name,
         group_by=group_by,
         reranker=reranker,
+        order_by=order_by,
     )
 
 
@@ -206,10 +276,28 @@ def _index_param_from_metadata(metadata: dict[str, Any]):
             ef_construction=int(metadata.get("ef_construction", 128)),
             quantize_type=metadata.get("quantize_type", "undefined"),
         )
+    if kind == "hnsw_hvq":
+        return HnswHvqIndexParam(
+            metric_type=metric,
+            m=int(metadata.get("m", 16)),
+            m_max0=int(metadata.get("m_max0", 32)),
+            ef_construction=int(metadata.get("ef_construction", 100)),
+            ef_search=int(metadata.get("ef_search", 64)),
+            nbits=int(metadata.get("nbits", 4)),
+        )
     if kind == "ivf":
         return IVFIndexParam(
             metric_type=metric,
             nlist=int(metadata.get("nlist", 1024)),
+        )
+    if kind == "ivf_usq":
+        return IvfUsqIndexParam(
+            metric_type=metric,
+            nlist=int(metadata.get("nlist", 1024)),
+            bits_per_dim=int(metadata.get("bits_per_dim", 4)),
+            rotation_seed=int(metadata.get("rotation_seed", 42)),
+            rerank_k=int(metadata.get("rerank_k", 64)),
+            use_high_accuracy_scan=bool(metadata.get("use_high_accuracy_scan", False)),
         )
     return None
 
@@ -357,6 +445,7 @@ class Collection:
         query_by_id=None,
         query_by_id_field_name=None,
         group_by=None,
+        order_by=None,
         query_context=None,
         context=None,
     ):
@@ -379,6 +468,7 @@ class Collection:
                 query_by_id=query_by_id,
                 query_by_id_field_name=query_by_id_field_name,
                 group_by=group_by,
+                order_by=order_by,
             )
         return _wrap_doc_result(self._querier.execute(self, query_context))
 
@@ -433,14 +523,68 @@ class Collection:
     def delete_by_filter(self, filter: str):
         return self._core.delete_by_filter(filter)
 
-    def add_column(self, field_name, data_type="string", nullable=False, array=False):
-        return self._core.add_column(field_name, data_type, nullable, array)
+    def _set_schema(self, schema: CollectionSchema | None):
+        self._schema = _coerce_collection_schema(schema) if schema is not None else None
+        self._querier = _build_query_executor(self._schema) if self._schema is not None else None
+
+    def add_column(
+        self,
+        field_name,
+        data_type="string",
+        nullable=False,
+        array=False,
+        *,
+        expression="",
+        option=None,
+    ):
+        field_schema, expression, option = _normalize_add_column_input(
+            field_name,
+            data_type=data_type,
+            nullable=nullable,
+            array=array,
+            expression=expression,
+            option=option,
+        )
+        result = self._core.add_column(
+            field_schema.name,
+            field_schema.data_type,
+            field_schema.nullable,
+            field_schema.array,
+        )
+        if self._schema is not None:
+            fields = [*self._schema.fields, field_schema]
+            self._set_schema(_replace_collection_schema(self._schema, fields=fields))
+        return result
 
     def drop_column(self, field_name):
-        return self._core.drop_column(field_name)
+        result = self._core.drop_column(field_name)
+        if self._schema is not None:
+            fields = [field for field in self._schema.fields if field.name != field_name]
+            self._set_schema(_replace_collection_schema(self._schema, fields=fields))
+        return result
 
-    def alter_column(self, field_name, new_name):
-        return self._core.alter_column(field_name, new_name)
+    def alter_column(self, field_name, new_name=None, *, field_schema=None, option=None):
+        old_name, normalized_new_name, option = _normalize_alter_column_input(
+            field_name,
+            new_name=new_name,
+            field_schema=field_schema,
+            option=option,
+        )
+        result = self._core.alter_column(old_name, normalized_new_name)
+        if self._schema is not None:
+            fields = [
+                FieldSchema(
+                    name=normalized_new_name,
+                    data_type=field.data_type,
+                    nullable=field.nullable,
+                    array=field.array,
+                )
+                if field.name == old_name
+                else field
+                for field in self._schema.fields
+            ]
+            self._set_schema(_replace_collection_schema(self._schema, fields=fields))
+        return result
 
     def optimize(self, option=None):
         if option is None:
@@ -460,7 +604,7 @@ class Collection:
         if kind == "vector":
             return self.create_vector_index(field_name, index_param)
         if index_param is not None:
-            return self.create_scalar_index(field_name)
+            raise NotImplementedError("scalar index params are not supported")
         return self.create_scalar_index(field_name)
 
     def drop_index(self, field_name):

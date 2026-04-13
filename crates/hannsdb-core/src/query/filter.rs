@@ -701,7 +701,6 @@ fn parse_op(input: &str) -> io::Result<(ComparisonOp, usize)> {
         (">=", ComparisonOp::Gte),
         ("<=", ComparisonOp::Lte),
         ("==", ComparisonOp::Eq),
-        ("=", ComparisonOp::Eq),
         ("!=", ComparisonOp::Ne),
         (">", ComparisonOp::Gt),
         ("<", ComparisonOp::Lt),

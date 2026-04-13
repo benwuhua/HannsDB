@@ -490,7 +490,11 @@ fn zvec_parity_dense_sparse_hybrid_rrf() {
         )
         .expect("dense + sparse hybrid RRF query");
 
-    assert_eq!(hits.len(), 3, "all documents should be returned by hybrid query");
+    assert_eq!(
+        hits.len(),
+        3,
+        "all documents should be returned by hybrid query"
+    );
 
     // id=1 ranks #1 in dense (closest) and has strong sparse match => should be top
     assert_eq!(hits[0].id, 1, "id=1 should rank first in hybrid RRF");
@@ -670,7 +674,10 @@ fn zvec_parity_weighted_unequal_weights() {
 
     assert_eq!(hits.len(), 3);
     // id=1 is closest in dense (0.1), dense has weight 0.7 => should rank first
-    assert_eq!(hits[0].id, 1, "id=1 should rank first with 0.7 dense weight");
+    assert_eq!(
+        hits[0].id, 1,
+        "id=1 should rank first with 0.7 dense weight"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -743,10 +750,7 @@ fn zvec_parity_single_vector_no_reranker_unchanged() {
         .expect("single vector no reranker");
 
     // Should match plain brute-force L2 ordering: id=1 (0.0), id=3 (0.1), id=2 (0.2)
-    assert_eq!(
-        hits.iter().map(|h| h.id).collect::<Vec<_>>(),
-        vec![1, 3, 2]
-    );
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3, 2]);
     assert!((hits[0].distance - 0.0).abs() < 1e-6);
     assert!((hits[1].distance - 0.1).abs() < 1e-6);
     assert!((hits[2].distance - 0.2).abs() < 1e-6);

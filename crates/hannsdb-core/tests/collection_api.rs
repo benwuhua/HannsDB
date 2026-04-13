@@ -11,6 +11,7 @@ use hannsdb_core::document::{
     CollectionSchema, Document, DocumentUpdate, FieldType, FieldValue, ScalarFieldSchema,
     VectorFieldSchema, VectorIndexSchema,
 };
+use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery, VectorQueryParam};
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
@@ -427,6 +428,22 @@ fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layou
         .expect("search after rollover-eligible sequence");
     let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     assert_eq!(hit_ids, vec![200, 21, 22]);
+
+    let reopened = HannsDb::open(&root).expect("reopen db after rollover");
+    let reopened_hits = reopened
+        .search("docs", &[0.0_f32, 0.0], 3)
+        .expect("search after rollover reopen");
+    let reopened_hit_ids = reopened_hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(reopened_hit_ids, vec![200, 21, 22]);
+
+    let fetched = reopened
+        .fetch_documents("docs", &[21, 22, 200])
+        .expect("fetch after rollover reopen");
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![21, 22, 200]);
 }
 
 #[test]
@@ -1038,6 +1055,160 @@ fn collection_api_flush_collection_succeeds_after_create_and_insert() {
 }
 
 #[test]
+fn collection_api_flush_collection_materializes_active_segment_arrow_snapshots() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_arrow_snapshots");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10, 20], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+
+    db.flush_collection("docs")
+        .expect("flush should succeed after create+insert");
+
+    let collection_dir = root.join("collections").join("docs");
+    assert!(
+        collection_dir.join("payloads.arrow").exists(),
+        "flush should materialize payloads.arrow for the active segment"
+    );
+    assert!(
+        collection_dir.join("vectors.arrow").exists(),
+        "flush should materialize vectors.arrow for the active segment"
+    );
+}
+
+#[test]
+fn collection_api_flush_collection_refreshes_arrow_snapshots_after_subsequent_writes() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_arrow_refresh");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10], &[0.0_f32, 0.0])
+        .expect("insert first vector");
+    db.flush_collection("docs").expect("flush first state");
+
+    let collection_dir = root.join("collections").join("docs");
+    let payloads_arrow = collection_dir.join("payloads.arrow");
+    let vectors_arrow = collection_dir.join("vectors.arrow");
+    let payloads_mtime_before = fs::metadata(&payloads_arrow)
+        .expect("payloads.arrow metadata before second flush")
+        .modified()
+        .expect("payloads.arrow modified before second flush");
+    let vectors_mtime_before = fs::metadata(&vectors_arrow)
+        .expect("vectors.arrow metadata before second flush")
+        .modified()
+        .expect("vectors.arrow modified before second flush");
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.insert("docs", &[20], &[1.0_f32, 1.0])
+        .expect("insert second vector");
+    db.flush_collection("docs").expect("flush second state");
+
+    let payloads_mtime_after = fs::metadata(&payloads_arrow)
+        .expect("payloads.arrow metadata after second flush")
+        .modified()
+        .expect("payloads.arrow modified after second flush");
+    let vectors_mtime_after = fs::metadata(&vectors_arrow)
+        .expect("vectors.arrow metadata after second flush")
+        .modified()
+        .expect("vectors.arrow modified after second flush");
+
+    assert!(
+        payloads_mtime_after >= payloads_mtime_before,
+        "payloads.arrow should be refreshed after later flush"
+    );
+    assert!(
+        vectors_mtime_after >= vectors_mtime_before,
+        "vectors.arrow should be refreshed after later flush"
+    );
+}
+
+#[test]
+fn collection_api_insert_after_flush_invalidates_active_arrow_snapshots_until_next_flush() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_arrow_invalidation");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10], &[0.0_f32, 0.0])
+        .expect("insert first vector");
+    db.flush_collection("docs").expect("flush first state");
+
+    let collection_dir = root.join("collections").join("docs");
+    let payloads_arrow = collection_dir.join("payloads.arrow");
+    let vectors_arrow = collection_dir.join("vectors.arrow");
+    assert!(
+        payloads_arrow.exists(),
+        "payloads.arrow should exist after flush"
+    );
+    assert!(
+        vectors_arrow.exists(),
+        "vectors.arrow should exist after flush"
+    );
+
+    db.insert("docs", &[20], &[1.0_f32, 1.0])
+        .expect("insert second vector");
+
+    assert!(
+        !payloads_arrow.exists(),
+        "payloads.arrow should be invalidated after later active-segment write"
+    );
+    assert!(
+        !vectors_arrow.exists(),
+        "vectors.arrow should be invalidated after later active-segment write"
+    );
+}
+
+#[test]
+fn collection_api_reopen_fetch_documents_uses_active_arrow_snapshots_when_jsonl_sidecars_are_missing(
+) {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_fetch_arrow_only");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10, 20], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.flush_collection("docs")
+        .expect("flush should materialize active-segment arrows");
+
+    let collection_dir = root.join("collections").join("docs");
+    let payloads_jsonl = collection_dir.join("payloads.jsonl");
+    let vectors_jsonl = collection_dir.join("vectors.jsonl");
+    assert!(
+        collection_dir.join("payloads.arrow").exists(),
+        "payloads.arrow should exist before removing jsonl sidecars"
+    );
+    assert!(
+        collection_dir.join("vectors.arrow").exists(),
+        "vectors.arrow should exist before removing jsonl sidecars"
+    );
+    fs::remove_file(&payloads_jsonl).expect("remove payloads.jsonl");
+    fs::remove_file(&vectors_jsonl).expect("remove vectors.jsonl");
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let docs = reopened
+        .fetch_documents("docs", &[10, 20])
+        .expect("fetch should fall back to active-segment arrow snapshots");
+
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].id, 10);
+    assert_eq!(docs[1].id, 20);
+    assert_eq!(
+        docs[0]
+            .vectors
+            .get("vector")
+            .expect("doc 10 primary vector from vectors.arrow"),
+        &vec![0.0_f32, 0.0]
+    );
+    assert_eq!(
+        docs[1]
+            .vectors
+            .get("vector")
+            .expect("doc 20 primary vector from vectors.arrow"),
+        &vec![1.0_f32, 1.0]
+    );
+}
+
+#[test]
 fn collection_api_flush_collection_succeeds_after_create_insert_and_delete() {
     let root = unique_temp_dir("hannsdb_collection_api_flush_after_delete");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1237,6 +1408,10 @@ fn collection_api_reopen_loads_persisted_hnsw_index() {
 
 #[test]
 fn collection_api_optimize_benchmark_entry() {
+    fn read_env_string(name: &str, default: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| default.to_string())
+    }
+
     fn read_env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
@@ -1285,9 +1460,37 @@ fn collection_api_optimize_benchmark_entry() {
     let dim = read_env_usize("HANNSSDB_OPT_BENCH_DIM", 256);
     let top_k = read_env_usize("HANNSSDB_OPT_BENCH_TOPK", 10);
     let metric = read_env_metric("HANNSSDB_OPT_BENCH_METRIC", "cosine");
+    let index_kind = read_env_string("HANNSSDB_OPT_BENCH_INDEX_KIND", "hnsw").to_ascii_lowercase();
+    let query_ef_search = std::env::var("HANNSSDB_OPT_BENCH_QUERY_EF_SEARCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let query_nprobe = std::env::var("HANNSSDB_OPT_BENCH_QUERY_NPROBE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let nlist = read_env_usize("HANNSSDB_OPT_BENCH_NLIST", 64);
+    let bits_per_dim = read_env_usize("HANNSSDB_OPT_BENCH_BITS_PER_DIM", 4);
+    let rotation_seed = read_env_usize("HANNSSDB_OPT_BENCH_ROTATION_SEED", 42);
+    let rerank_k = read_env_usize("HANNSSDB_OPT_BENCH_RERANK_K", 64);
+    let use_high_accuracy_scan = std::env::var("HANNSSDB_OPT_BENCH_HIGH_ACCURACY_SCAN")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let hnsw_hvq_m = read_env_usize("HANNSSDB_OPT_BENCH_HNSW_HVQ_M", 8);
+    let hnsw_hvq_m_max0 = read_env_usize("HANNSSDB_OPT_BENCH_HNSW_HVQ_M_MAX0", 16);
+    let hnsw_hvq_ef_construction =
+        read_env_usize("HANNSSDB_OPT_BENCH_HNSW_HVQ_EF_CONSTRUCTION", 32);
+    let hnsw_hvq_ef_search = read_env_usize("HANNSSDB_OPT_BENCH_HNSW_HVQ_EF_SEARCH", 32);
+    let hnsw_hvq_nbits = read_env_usize("HANNSSDB_OPT_BENCH_HNSW_HVQ_NBITS", 4);
     assert!(
         matches!(metric.as_str(), "l2" | "cosine" | "ip"),
         "unsupported metric, expected one of l2/cosine/ip, got: {metric}"
+    );
+    assert!(
+        matches!(index_kind.as_str(), "hnsw" | "ivf" | "ivf_usq" | "hnsw_hvq"),
+        "unsupported index kind, expected one of hnsw/ivf/ivf_usq/hnsw_hvq, got: {index_kind}"
+    );
+    assert!(
+        index_kind != "hnsw_hvq" || metric == "ip",
+        "hnsw_hvq benchmark currently supports only ip metric in HannsDB, got: {metric}"
     );
 
     let root = unique_temp_dir("hannsdb_collection_api_optimize_bench");
@@ -1300,7 +1503,38 @@ fn collection_api_optimize_benchmark_entry() {
     let mut db = HannsDb::open(&root).expect("open db");
 
     let create_start = Instant::now();
-    db.create_collection(collection, dim, &metric)
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![match index_kind.as_str() {
+            "hnsw" => VectorFieldSchema::new("vector", dim)
+                .with_index_param(VectorIndexSchema::hnsw(Some(&metric), 16, 128)),
+            "ivf" => VectorFieldSchema::new("vector", dim)
+                .with_index_param(VectorIndexSchema::ivf(Some(&metric), nlist.max(1))),
+            "ivf_usq" => {
+                VectorFieldSchema::new("vector", dim).with_index_param(VectorIndexSchema::ivf_usq(
+                    Some(&metric),
+                    nlist.max(1),
+                    bits_per_dim,
+                    rotation_seed,
+                    rerank_k,
+                    use_high_accuracy_scan,
+                ))
+            }
+            "hnsw_hvq" => {
+                VectorFieldSchema::new("vector", dim).with_index_param(VectorIndexSchema::hnsw_hvq(
+                    Some("ip"),
+                    hnsw_hvq_m,
+                    hnsw_hvq_m_max0,
+                    hnsw_hvq_ef_construction,
+                    hnsw_hvq_ef_search,
+                    hnsw_hvq_nbits,
+                ))
+            }
+            _ => unreachable!("index_kind prevalidated"),
+        }],
+    };
+    db.create_collection_with_schema(collection, &schema)
         .expect("create collection");
     let create_ms = create_start.elapsed().as_millis();
 
@@ -1317,9 +1551,40 @@ fn collection_api_optimize_benchmark_entry() {
     let optimize_ms = optimize_start.elapsed().as_millis();
 
     let search_start = Instant::now();
-    let hits = db
-        .search(collection, &query, top_k)
-        .expect("search optimized collection");
+    let hits = if query_ef_search.is_some() || query_nprobe.is_some() {
+        db.query_with_context(
+            collection,
+            &QueryContext {
+                top_k,
+                queries: vec![VectorQuery {
+                    field_name: "vector".to_string(),
+                    vector: QueryVector::Dense(query.clone()),
+                    param: Some(VectorQueryParam {
+                        ef_search: query_ef_search,
+                        nprobe: query_nprobe,
+                    }),
+                }],
+                query_by_id: None,
+                query_by_id_field_name: None,
+                filter: None,
+                output_fields: None,
+                include_vector: false,
+                group_by: None,
+                reranker: None,
+                order_by: None,
+            },
+        )
+        .expect("search optimized collection with query params")
+        .into_iter()
+        .map(|hit| hannsdb_core::query::SearchHit {
+            id: hit.id,
+            distance: hit.distance,
+        })
+        .collect::<Vec<_>>()
+    } else {
+        db.search(collection, &query, top_k)
+            .expect("search optimized collection")
+    };
     let search_ms = search_start.elapsed().as_millis();
     let total_ms = bench_start.elapsed().as_millis();
 
@@ -1329,9 +1594,40 @@ fn collection_api_optimize_benchmark_entry() {
     );
 
     println!(
-        "OPT_BENCH_CONFIG n={} dim={} metric={} top_k={}",
-        n, dim, metric, top_k
+        "OPT_BENCH_CONFIG n={} dim={} metric={} top_k={} index_kind={}",
+        n, dim, metric, top_k, index_kind
     );
+    match index_kind.as_str() {
+        "ivf" => println!("OPT_BENCH_INDEX_PARAMS nlist={}", nlist.max(1)),
+        "ivf_usq" => println!(
+            "OPT_BENCH_INDEX_PARAMS nlist={} bits_per_dim={} rotation_seed={} rerank_k={} high_accuracy_scan={}",
+            nlist.max(1),
+            bits_per_dim,
+            rotation_seed,
+            rerank_k,
+            use_high_accuracy_scan
+        ),
+        "hnsw_hvq" => println!(
+            "OPT_BENCH_INDEX_PARAMS m={} m_max0={} ef_construction={} ef_search={} nbits={}",
+            hnsw_hvq_m,
+            hnsw_hvq_m_max0,
+            hnsw_hvq_ef_construction,
+            hnsw_hvq_ef_search,
+            hnsw_hvq_nbits
+        ),
+        _ => {}
+    }
+    if query_ef_search.is_some() || query_nprobe.is_some() {
+        println!(
+            "OPT_BENCH_QUERY_PARAMS ef_search={} nprobe={}",
+            query_ef_search
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            query_nprobe
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+    }
     println!(
         "OPT_BENCH_TIMING_MS create={} insert={} optimize={} search={} total={}",
         create_ms, insert_ms, optimize_ms, search_ms, total_ms

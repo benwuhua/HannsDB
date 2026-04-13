@@ -39,6 +39,29 @@ def _coerce_vector_schema(value) -> "VectorSchema":
     )
 
 
+def _normalize_index_param(index_param):
+    if index_param is None:
+        return None
+    from ..param import (
+        FlatIndexParam,
+        HnswHvqIndexParam,
+        HnswIndexParam,
+        IvfUsqIndexParam,
+        IVFIndexParam,
+    )
+
+    if isinstance(
+        index_param,
+        (FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, IvfUsqIndexParam),
+    ):
+        return index_param
+    if type(index_param) is not object:
+        return index_param
+    raise TypeError(
+        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, or IvfUsqIndexParam"
+    )
+
+
 class FieldSchema:
     __slots__ = ("_name", "_data_type", "_nullable", "_array")
 
@@ -96,7 +119,7 @@ class VectorSchema:
         self._name = str(name)
         self._data_type = _normalize_data_type(data_type)
         self._dimension = int(dimension)
-        self._index_param = index_param
+        self._index_param = _normalize_index_param(index_param)
 
     @property
     def name(self) -> str:

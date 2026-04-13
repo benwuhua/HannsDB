@@ -8,6 +8,7 @@ use crate::document::{
     default_hnsw_ef_construction, default_hnsw_m, default_primary_vector_name, CollectionSchema,
     FieldType, ScalarFieldSchema, VectorFieldSchema, VectorIndexSchema,
 };
+use crate::pk::{default_primary_key_mode, PrimaryKeyMode};
 use crate::segment::atomic_write;
 
 use super::CATALOG_FORMAT_VERSION;
@@ -16,6 +17,7 @@ use super::CATALOG_FORMAT_VERSION;
 pub struct CollectionMetadata {
     pub format_version: u32,
     pub name: String,
+    pub primary_key_mode: PrimaryKeyMode,
     pub dimension: usize,
     pub metric: String,
     pub primary_vector: String,
@@ -37,6 +39,7 @@ impl CollectionMetadata {
         Self::from_schema_parts(
             CATALOG_FORMAT_VERSION,
             name.into(),
+            default_primary_key_mode(),
             schema.primary_vector,
             schema.fields,
             schema.vectors,
@@ -63,6 +66,7 @@ impl CollectionMetadata {
         let persisted = PersistedCollectionMetadata {
             format_version: self.format_version,
             name: self.name.clone(),
+            primary_key_mode: self.primary_key_mode.clone(),
             primary_vector: Some(self.primary_vector.clone()),
             fields: self.fields.clone(),
             vectors: self.vectors.clone(),
@@ -79,6 +83,7 @@ impl CollectionMetadata {
             PersistedCollectionMetadataCompat::Current(current) => Self::from_schema_parts(
                 current.format_version,
                 current.name,
+                current.primary_key_mode,
                 current.primary_vector.unwrap_or_else(|| {
                     current
                         .vectors
@@ -104,6 +109,7 @@ impl CollectionMetadata {
                 Self::from_schema_parts(
                     legacy.format_version,
                     legacy.name,
+                    default_primary_key_mode(),
                     legacy.primary_vector,
                     legacy.fields,
                     vectors,
@@ -125,6 +131,7 @@ impl CollectionMetadata {
     fn from_schema_parts(
         format_version: u32,
         name: String,
+        primary_key_mode: PrimaryKeyMode,
         primary_vector: String,
         fields: Vec<ScalarFieldSchema>,
         vectors: Vec<VectorFieldSchema>,
@@ -141,6 +148,7 @@ impl CollectionMetadata {
         Self {
             format_version,
             name,
+            primary_key_mode,
             dimension,
             metric,
             primary_vector,
@@ -156,6 +164,8 @@ impl CollectionMetadata {
 struct PersistedCollectionMetadata {
     pub format_version: u32,
     pub name: String,
+    #[serde(default = "default_primary_key_mode")]
+    pub primary_key_mode: PrimaryKeyMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_vector: Option<String>,
     #[serde(default)]

@@ -10,6 +10,7 @@ pub fn append_payloads(
     path: &Path,
     payloads: &[BTreeMap<String, FieldValue>],
 ) -> io::Result<usize> {
+    invalidate_arrow_snapshot(path.with_extension("arrow"))?;
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let mut writer = BufWriter::new(file);
     for payload in payloads {
@@ -71,6 +72,14 @@ pub fn load_payloads_jsonl(path: &Path) -> io::Result<Vec<BTreeMap<String, Field
 
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+fn invalidate_arrow_snapshot(path: std::path::PathBuf) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Ensure the payloads JSONL file has exactly `expected_rows` rows by padding

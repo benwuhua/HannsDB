@@ -2,8 +2,55 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VDBB_REPO="${VDBB_REPO:-/Users/ryan/Code/VectorDBBench}"
-VENV_PATH="${VENV_PATH:-$ROOT_DIR/.venv-hannsdb}"
+
+resolve_vdbb_repo() {
+  if [[ -n "${VDBB_REPO:-}" ]]; then
+    printf '%s\n' "$VDBB_REPO"
+    return 0
+  fi
+
+  local candidates=(
+    "/data/work/VectorDBBench"
+    "/Users/ryan/Code/vectorDB/VectorDBBench"
+    "/Users/ryan/Code/VectorDBBench"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "/data/work/VectorDBBench"
+}
+
+resolve_venv_path() {
+  if [[ -n "${VENV_PATH:-}" ]]; then
+    printf '%s\n' "$VENV_PATH"
+    return 0
+  fi
+
+  local candidates=(
+    "/data/work/HannsDB/.venv-hannsdb-remote"
+    "/data/work/HannsDB/.venv-hannsdb"
+    "$ROOT_DIR/.venv-hannsdb"
+    "/Users/ryan/Code/vectorDB/HannsDB/.venv-hannsdb"
+    "/Users/ryan/Code/HannsDB/.venv-hannsdb"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate/bin/activate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "/data/work/HannsDB/.venv-hannsdb-remote"
+}
+
+VDBB_REPO="$(resolve_vdbb_repo)"
+VENV_PATH="$(resolve_venv_path)"
 
 DATASET_DIR="${DATASET_DIR:-/tmp/hannsdb-custom-ds-review}"
 DB_PATH="${DB_PATH:-/tmp/hannsdb-vdbb-smoke-db}"
