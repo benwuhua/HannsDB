@@ -41,6 +41,8 @@ pub struct ForwardStoreDescriptor {
 
 impl ForwardStoreDescriptor {
     pub fn artifact(&self, format: ForwardFileFormat) -> Option<&ForwardStoreArtifact> {
-        self.artifacts.iter().find(|artifact| artifact.format == format)
+        self.artifacts
+            .iter()
+            .find(|artifact| artifact.format == format)
     }
 }

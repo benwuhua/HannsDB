@@ -124,15 +124,35 @@ fn forward_store_roundtrips_arrow_and_parquet_equivalently() {
         "arrow reopen should preserve every logical row",
     );
     assert_eq!(
-        parquet_reader.scan_columns(None).expect("scan parquet rows"),
+        parquet_reader
+            .scan_columns(None)
+            .expect("scan parquet rows"),
         rows,
         "parquet reopen should preserve every logical row",
     );
 
     let projection = ["internal_id", "is_deleted", "title", "aux"];
     let expected_projection = vec![
-        row(30, 0, false, Some("gamma"), None, None, None, Some(vec![0.3, 0.4])),
-        row(10, 0, false, Some("alpha"), None, None, None, Some(vec![0.1, 0.2])),
+        row(
+            30,
+            0,
+            false,
+            Some("gamma"),
+            None,
+            None,
+            None,
+            Some(vec![0.3, 0.4]),
+        ),
+        row(
+            10,
+            0,
+            false,
+            Some("alpha"),
+            None,
+            None,
+            None,
+            Some(vec![0.1, 0.2]),
+        ),
     ];
     assert_eq!(
         arrow_reader

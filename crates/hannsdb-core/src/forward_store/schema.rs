@@ -56,8 +56,11 @@ impl ForwardSchema {
     }
 
     pub fn validate_row(&self, row: &ForwardRow) -> io::Result<()> {
-        let declared_fields: HashSet<&str> =
-            self.scalar_fields().iter().map(|field| field.name.as_str()).collect();
+        let declared_fields: HashSet<&str> = self
+            .scalar_fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
         let declared_vectors: BTreeMap<&str, &VectorFieldSchema> = self
             .vector_fields()
             .iter()
@@ -146,11 +149,7 @@ impl ForwardSchema {
             if !includes(&selected, scalar.name.as_str()) {
                 continue;
             }
-            fields.push(Field::new(
-                &scalar.name,
-                scalar_arrow_type(scalar),
-                true,
-            ));
+            fields.push(Field::new(&scalar.name, scalar_arrow_type(scalar), true));
             arrays.push(build_scalar_array(rows, scalar)?);
         }
 
@@ -158,11 +157,7 @@ impl ForwardSchema {
             if !includes(&selected, vector.name.as_str()) {
                 continue;
             }
-            fields.push(Field::new(
-                &vector.name,
-                vector_arrow_type(vector),
-                true,
-            ));
+            fields.push(Field::new(&vector.name, vector_arrow_type(vector), true));
             arrays.push(build_vector_array(rows, vector)?);
         }
 
@@ -206,7 +201,9 @@ impl ForwardSchema {
                         row.is_deleted = values.value(row_index);
                     }
                     name => {
-                        if let Some(value) = arrow_value_to_field_value(column, row_index, field.data_type()) {
+                        if let Some(value) =
+                            arrow_value_to_field_value(column, row_index, field.data_type())
+                        {
                             row.fields.insert(name.to_string(), value);
                             continue;
                         }
@@ -240,7 +237,11 @@ pub fn project_row(row: &ForwardRow, columns: Option<&[&str]>) -> ForwardRow {
         } else {
             0
         },
-        op_seq: if include_system(OP_SEQ_COLUMN) { row.op_seq } else { 0 },
+        op_seq: if include_system(OP_SEQ_COLUMN) {
+            row.op_seq
+        } else {
+            0
+        },
         is_deleted: if include_system(IS_DELETED_COLUMN) {
             row.is_deleted
         } else {
@@ -336,7 +337,10 @@ fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Res
     if field.array {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!("array forward-store scalar fields not yet supported: {}", field.name),
+            format!(
+                "array forward-store scalar fields not yet supported: {}",
+                field.name
+            ),
         ));
     }
 
