@@ -661,8 +661,12 @@ impl HannsDb {
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
                 load_payloads_or_empty(&segment_paths, &segment_meta, segment_external_ids.len())?;
-            let segment_vectors =
-                load_vectors_or_empty(&segment_paths, &segment_meta, segment_external_ids.len())?;
+            let segment_vectors = load_vectors_or_empty(
+                &segment_paths,
+                &segment_meta,
+                &collection_meta.primary_vector,
+                segment_external_ids.len(),
+            )?;
             let segment_tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
 
             if segment_external_ids
@@ -729,7 +733,7 @@ impl HannsDb {
             compacted_ids.len(),
             0,
         );
-        compacted_meta.storage_format = "arrow".to_string();
+        compacted_meta.storage_format = "forward_store".to_string();
         compacted_meta.save_to_path(&compacted_dir.join("segment.json"))?;
 
         version_set = VersionSet::new(
@@ -2553,6 +2557,7 @@ impl CollectionHandle {
                 &self.segment_manager,
                 vector_schema.dimension,
                 field_name,
+                &collection_meta.primary_vector,
             )?
         };
 
@@ -2639,7 +2644,12 @@ impl CollectionHandle {
                 collection_meta.primary_is_fp16(),
             )?;
             let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
-            let vectors = load_vectors_or_empty(&segment, &segment_meta, stored_ids.len())?;
+            let vectors = load_vectors_or_empty(
+                &segment,
+                &segment_meta,
+                &collection_meta.primary_vector,
+                stored_ids.len(),
+            )?;
             let sparse = load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 

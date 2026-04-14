@@ -79,6 +79,7 @@ impl QueryExecutor {
                 Some(load_segment_vectors_or_empty(
                     &segment,
                     &segment_meta,
+                    &collection.primary_vector,
                     external_ids.len(),
                 )?)
             } else {

@@ -451,8 +451,8 @@ fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layou
     )
     .expect("load sealed seg-000001 metadata");
     assert_eq!(
-        sealed_meta.storage_format, "arrow",
-        "first rollover should mark the previous active segment as arrow-backed"
+        sealed_meta.storage_format, "forward_store",
+        "first rollover should mark the previous active segment as forward_store-backed"
     );
     assert!(
         !collection_dir.join("payloads.jsonl").exists(),
@@ -1736,6 +1736,45 @@ fn collection_api_reopen_fetch_documents_uses_active_arrow_snapshots_when_jsonl_
             .get("vector")
             .expect("doc 20 primary vector from vectors.arrow"),
         &vec![1.0_f32, 1.0]
+    );
+}
+
+#[test]
+fn collection_api_reopen_uses_immutable_forward_store_when_arrow_sidecars_are_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_immutable_forward_store");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let sealed_segment_dir = collection_dir
+        .join("segments")
+        .join(&version_set.immutable_segment_ids[0]);
+    let _ = fs::remove_file(sealed_segment_dir.join("payloads.arrow"));
+    let _ = fs::remove_file(sealed_segment_dir.join("vectors.arrow"));
+    let _ = fs::remove_file(sealed_segment_dir.join("payloads.jsonl"));
+    let _ = fs::remove_file(sealed_segment_dir.join("vectors.jsonl"));
+
+    let reopened = HannsDb::open(&root).expect("reopen after removing immutable arrow sidecars");
+    let fetched = reopened
+        .fetch_documents("docs", &[21, 22, 200])
+        .expect("fetch docs after immutable forward_store reopen");
+    let fetched_ids = fetched.iter().map(|doc| doc.id).collect::<Vec<_>>();
+    assert_eq!(
+        fetched_ids,
+        vec![21, 22, 200],
+        "reopen should use immutable forward_store artifacts when compat sidecars are absent"
     );
 }
 

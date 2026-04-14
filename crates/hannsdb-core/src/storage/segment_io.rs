@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryFrom;
+use std::fs;
 use std::io;
 use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
 use crate::document::{FieldValue, SparseVector};
-use crate::forward_store::{ChunkedFileWriter, ForwardFileFormat, ForwardRow, MemForwardStore};
+use crate::forward_store::{
+    ChunkedFileWriter, ForwardFileFormat, ForwardRow, ForwardStoreDescriptor, ForwardStoreReader,
+    MemForwardStore,
+};
 use crate::segment::index_runtime::{ann_blob_path, HNSW_INDEX_FILE};
 use crate::segment::{
     load_payloads_jsonl, load_payloads_with_fields, load_record_ids, load_records,
@@ -20,7 +24,24 @@ fn load_payloads_for_segment(
     segment_meta: &SegmentMetadata,
     fields: Option<&[String]>,
 ) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    if prefers_forward_store_authority(segment, segment_meta) {
+        if let Ok(payloads) = load_payloads_from_forward_store(segment, fields) {
+            return Ok(payloads);
+        }
+    }
     match segment_meta.normalized_storage_format() {
+        NormalizedStorageFormat::ForwardStore => {
+            if segment.payloads_arrow.exists() {
+                match load_payloads_with_fields(&segment.payloads, fields) {
+                    Ok(payloads) => return Ok(payloads),
+                    Err(err) if segment.payloads.exists() => {
+                        let _ = err;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            load_payload_rows_jsonl(&segment.payloads, fields)
+        }
         NormalizedStorageFormat::Arrow => {
             if segment.payloads_arrow.exists() {
                 match load_payloads_with_fields(&segment.payloads, fields) {
@@ -162,7 +183,12 @@ pub(crate) fn materialize_forward_store_snapshot(
     }
 
     let payloads = load_payloads_or_empty(segment_paths, &segment_meta, row_limit)?;
-    let vectors = load_vectors_or_empty(segment_paths, &segment_meta, row_limit)?;
+    let vectors = load_vectors_or_empty(
+        segment_paths,
+        &segment_meta,
+        &collection_meta.primary_vector,
+        row_limit,
+    )?;
     let tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
     let mut store = MemForwardStore::new(collection_meta.schema());
     let declared_fields = collection_meta
@@ -232,7 +258,12 @@ pub(crate) fn materialize_latest_live_forward_store_snapshot(
         )?;
         let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
         let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
-        let vectors = load_vectors_or_empty(&segment, &segment_meta, stored_ids.len())?;
+        let vectors = load_vectors_or_empty(
+            &segment,
+            &segment_meta,
+            &collection_meta.primary_vector,
+            stored_ids.len(),
+        )?;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
         let row_limit = segment_meta
@@ -304,9 +335,10 @@ pub(crate) fn invalidate_forward_store_snapshot(segment_paths: &SegmentPaths) ->
 pub(crate) fn load_vectors_or_empty(
     segment: &SegmentPaths,
     segment_meta: &SegmentMetadata,
+    primary_vector_name: &str,
     expected_rows: usize,
 ) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    match load_vectors_for_segment(segment, segment_meta) {
+    match load_vectors_for_segment(segment, segment_meta, primary_vector_name) {
         Ok(vectors) => {
             if vectors.len() > expected_rows {
                 return Err(io::Error::new(
@@ -332,8 +364,26 @@ pub(crate) fn load_vectors_or_empty(
 fn load_vectors_for_segment(
     segment: &SegmentPaths,
     segment_meta: &SegmentMetadata,
+    primary_vector_name: &str,
 ) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    if prefers_forward_store_authority(segment, segment_meta) {
+        if let Ok(vectors) = load_vectors_from_forward_store(segment, primary_vector_name) {
+            return Ok(vectors);
+        }
+    }
     match segment_meta.normalized_storage_format() {
+        NormalizedStorageFormat::ForwardStore => {
+            if segment.vectors_arrow.exists() {
+                match load_vectors(&segment.vectors) {
+                    Ok(vectors) => return Ok(vectors),
+                    Err(err) if segment.vectors.exists() => {
+                        let _ = err;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            load_vectors_jsonl(&segment.vectors)
+        }
         NormalizedStorageFormat::Arrow => {
             if segment.vectors_arrow.exists() {
                 match load_vectors(&segment.vectors) {
@@ -353,6 +403,82 @@ fn load_vectors_for_segment(
             load_vectors(&segment.vectors)
         }
     }
+}
+
+fn prefers_forward_store_authority(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> bool {
+    if !matches!(
+        segment_meta.normalized_storage_format(),
+        NormalizedStorageFormat::ForwardStore | NormalizedStorageFormat::Arrow
+    ) {
+        return false;
+    }
+
+    let Ok(descriptor) = load_forward_store_descriptor(segment) else {
+        return false;
+    };
+    descriptor.row_count == segment_meta.record_count
+}
+
+fn load_forward_store_descriptor(segment: &SegmentPaths) -> io::Result<ForwardStoreDescriptor> {
+    let bytes = fs::read(segment.forward_store_descriptor())?;
+    serde_json::from_slice(&bytes).map_err(json_to_io_error)
+}
+
+fn preferred_forward_store_format(descriptor: &ForwardStoreDescriptor) -> io::Result<ForwardFileFormat> {
+    descriptor
+        .artifact(ForwardFileFormat::ArrowIpc)
+        .map(|_| ForwardFileFormat::ArrowIpc)
+        .or_else(|| {
+            descriptor
+                .artifact(ForwardFileFormat::Parquet)
+                .map(|_| ForwardFileFormat::Parquet)
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "forward_store descriptor has no readable artifacts",
+            )
+        })
+}
+
+fn load_forward_store_rows(segment: &SegmentPaths) -> io::Result<Vec<ForwardRow>> {
+    let descriptor = load_forward_store_descriptor(segment)?;
+    let format = preferred_forward_store_format(&descriptor)?;
+    let reader = ForwardStoreReader::open(&descriptor, format)?;
+    reader.scan_columns(None)
+}
+
+fn load_payloads_from_forward_store(
+    segment: &SegmentPaths,
+    fields: Option<&[String]>,
+) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    let rows = load_forward_store_rows(segment)?;
+    let keep = fields.map(|names| names.iter().cloned().collect::<BTreeSet<_>>());
+    Ok(rows
+        .into_iter()
+        .map(|mut row| {
+            if let Some(ref keep) = keep {
+                row.fields.retain(|name, _| keep.contains(name));
+            }
+            row.fields
+        })
+        .collect())
+}
+
+fn load_vectors_from_forward_store(
+    segment: &SegmentPaths,
+    primary_vector_name: &str,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    Ok(load_forward_store_rows(segment)?
+        .into_iter()
+        .map(|mut row| {
+            row.vectors.remove(primary_vector_name);
+            row.vectors
+        })
+        .collect())
 }
 
 pub(crate) fn load_payloads_with_fields_or_empty(
@@ -451,6 +577,7 @@ pub(crate) fn load_shadowed_live_vector_records(
     segment_manager: &SegmentManager,
     dimension: usize,
     field_name: &str,
+    primary_vector_name: &str,
 ) -> io::Result<(Vec<f32>, Vec<i64>)> {
     let mut records = Vec::new();
     let mut external_ids = Vec::new();
@@ -459,8 +586,12 @@ pub(crate) fn load_shadowed_live_vector_records(
     for segment in segment_manager.segment_paths()? {
         let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
         let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let segment_vectors =
-            load_vectors_or_empty(&segment, &segment_meta, segment_external_ids.len())?;
+        let segment_vectors = load_vectors_or_empty(
+            &segment,
+            &segment_meta,
+            primary_vector_name,
+            segment_external_ids.len(),
+        )?;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
         if segment_vectors.len() != segment_external_ids.len() {
             return Err(io::Error::new(

@@ -120,7 +120,7 @@ impl SegmentWriter {
 
         active.meta.record_count += inserted;
         active.meta.deleted_count = tombstone.deleted_count();
-        active.meta.storage_format = "arrow".to_string();
+        active.meta.storage_format = "forward_store".to_string();
 
         let needed = active.meta.record_count.saturating_sub(tombstone.len());
         if needed > 0 {
@@ -352,7 +352,7 @@ impl SegmentWriter {
         let meta_path = seg_dir.join("segment.json");
         if meta_path.exists() {
             let mut meta = SegmentMetadata::load_from_path(&meta_path)?;
-            meta.storage_format = "arrow".to_string();
+            meta.storage_format = "forward_store".to_string();
             meta.save_to_path(&meta_path)?;
         }
 

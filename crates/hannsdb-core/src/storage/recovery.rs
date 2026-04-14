@@ -4,6 +4,7 @@ use std::path::Path;
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::ManifestMetadata;
+use crate::forward_store::{ForwardFileFormat, ForwardStoreDescriptor, ForwardStoreReader};
 use crate::segment::{load_vectors, SegmentManager, SegmentMetadata};
 use crate::storage::paths::CollectionPaths;
 use crate::storage::wal::WalRecord;
@@ -187,6 +188,15 @@ fn segment_is_authoritative(
         return Ok(false);
     }
 
+    if segment.forward_store_descriptor().exists() {
+        let descriptor = load_forward_store_descriptor(&segment.forward_store_descriptor())?;
+        let format = preferred_forward_store_format(&descriptor)?;
+        let reader = ForwardStoreReader::open(&descriptor, format)?;
+        if reader.row_count() == segment_meta.record_count {
+            return Ok(true);
+        }
+    }
+
     if plan.requires_data_files && !segment.payloads.exists() && !segment.payloads_arrow.exists() {
         return Ok(false);
     }
@@ -204,6 +214,31 @@ fn segment_is_authoritative(
     }
 
     Ok(true)
+}
+
+fn load_forward_store_descriptor(path: &Path) -> io::Result<ForwardStoreDescriptor> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn preferred_forward_store_format(
+    descriptor: &ForwardStoreDescriptor,
+) -> io::Result<ForwardFileFormat> {
+    descriptor
+        .artifact(ForwardFileFormat::ArrowIpc)
+        .map(|_| ForwardFileFormat::ArrowIpc)
+        .or_else(|| {
+            descriptor
+                .artifact(ForwardFileFormat::Parquet)
+                .map(|_| ForwardFileFormat::Parquet)
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "forward_store descriptor has no readable artifacts",
+            )
+        })
 }
 
 pub(crate) fn collection_name_for_wal_record(record: &WalRecord) -> &str {

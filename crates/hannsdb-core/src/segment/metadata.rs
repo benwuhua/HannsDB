@@ -22,6 +22,7 @@ pub struct SegmentMetadata {
 pub enum NormalizedStorageFormat {
     Jsonl,
     Arrow,
+    ForwardStore,
 }
 
 fn default_storage_format() -> String {
@@ -67,6 +68,7 @@ impl SegmentMetadata {
 
     pub fn normalized_storage_format(&self) -> NormalizedStorageFormat {
         match self.storage_format.as_str() {
+            "forward_store" => NormalizedStorageFormat::ForwardStore,
             "arrow" => NormalizedStorageFormat::Arrow,
             _ => NormalizedStorageFormat::Jsonl,
         }
