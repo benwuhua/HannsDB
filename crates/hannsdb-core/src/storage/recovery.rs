@@ -5,13 +5,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CollectionMetadata, ManifestMetadata};
 use crate::document::Document;
-use crate::forward_store::{ForwardFileFormat, ForwardStoreDescriptor, ForwardStoreReader};
 use crate::segment::TombstoneMask;
-use crate::segment::{load_vectors, NormalizedStorageFormat, SegmentManager, SegmentMetadata};
+use crate::segment::{SegmentManager, SegmentMetadata};
+use crate::storage::paths::CollectionPaths;
 use crate::storage::segment_io::{
     load_payloads_or_empty, load_primary_dense_rows_for_segment_or_empty, load_vectors_or_empty,
+    segment_has_authoritative_persisted_image,
 };
-use crate::storage::paths::CollectionPaths;
 use crate::storage::wal::WalRecord;
 
 #[derive(Debug, Default)]
@@ -57,7 +57,9 @@ impl WalReplayPlan {
                     dropped_collections.insert(collection.clone());
                 }
                 WalRecord::Insert {
-                    collection, ids, vectors
+                    collection,
+                    ids,
+                    vectors,
                 } if !ids.is_empty() => {
                     let plan = ensure_collection_plan(&mut collections, collection);
                     plan.requires_data_files = true;
@@ -65,7 +67,9 @@ impl WalReplayPlan {
                     if !plan.created_in_wal {
                         if let Some(dim) = vectors.len().checked_div(ids.len()) {
                             if dim.saturating_mul(ids.len()) == vectors.len() {
-                                for (id, vector) in ids.iter().copied().zip(vectors.chunks_exact(dim)) {
+                                for (id, vector) in
+                                    ids.iter().copied().zip(vectors.chunks_exact(dim))
+                                {
                                     plan.delta_expectations.insert(
                                         id,
                                         ReplayExpectedRow::PresentPrimaryVector(vector.to_vec()),
@@ -284,7 +288,9 @@ fn persisted_collection_matches_delta(
 
         for row_idx in (0..stored_ids.len()).rev() {
             let external_id = stored_ids[row_idx];
-            if !plan.delta_expectations.contains_key(&external_id) || !shadowed_ids.insert(external_id) {
+            if !plan.delta_expectations.contains_key(&external_id)
+                || !shadowed_ids.insert(external_id)
+            {
                 continue;
             }
             if tombstone.is_deleted(row_idx) {
@@ -317,7 +323,8 @@ fn persisted_collection_matches_delta(
             (ReplayExpectedRow::Deleted, None | Some(None)) => true,
             (ReplayExpectedRow::PresentDocument(expected), Some(Some(actual))) => {
                 actual.fields == expected.fields
-                    && actual.vectors == *expected.vectors_with_primary(&collection_meta.primary_vector)
+                    && actual.vectors
+                        == *expected.vectors_with_primary(&collection_meta.primary_vector)
             }
             (ReplayExpectedRow::PresentPrimaryVector(expected), Some(Some(actual))) => actual
                 .primary_vector_for(&collection_meta.primary_vector)
@@ -360,76 +367,12 @@ fn segment_is_authoritative(
         return Ok(false);
     };
 
-    if !segment.tombstones.exists() {
-        return Ok(false);
-    }
-
-    if segment_uses_forward_store_authority(segment_meta)
-        && segment.forward_store_descriptor().exists()
-    {
-        let descriptor = load_forward_store_descriptor(&segment.forward_store_descriptor())?;
-        let format = preferred_forward_store_format(&descriptor)?;
-        let reader = ForwardStoreReader::open(&descriptor, format)?;
-        if reader.row_count() == segment_meta.record_count {
-            return Ok(true);
-        }
-    }
-
-    if segment_meta.record_count > 0
-        && (!segment.records.exists() || !segment.external_ids.exists())
-    {
-        return Ok(false);
-    }
-
-    if plan.requires_data_files && !segment.payloads.exists() && !segment.payloads_arrow.exists() {
-        return Ok(false);
-    }
-
-    if plan.requires_vector_sidecar {
-        match load_vectors(&segment.vectors) {
-            Ok(vectors) => {
-                if vectors.len() != segment_meta.record_count {
-                    return Ok(false);
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err),
-        }
-    }
-
-    Ok(true)
-}
-
-fn segment_uses_forward_store_authority(segment_meta: &SegmentMetadata) -> bool {
-    matches!(
-        segment_meta.normalized_storage_format(),
-        NormalizedStorageFormat::ForwardStore | NormalizedStorageFormat::Arrow
+    segment_has_authoritative_persisted_image(
+        segment,
+        segment_meta,
+        plan.requires_data_files,
+        plan.requires_vector_sidecar,
     )
-}
-
-fn load_forward_store_descriptor(path: &Path) -> io::Result<ForwardStoreDescriptor> {
-    let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
-}
-
-fn preferred_forward_store_format(
-    descriptor: &ForwardStoreDescriptor,
-) -> io::Result<ForwardFileFormat> {
-    descriptor
-        .artifact(ForwardFileFormat::ArrowIpc)
-        .map(|_| ForwardFileFormat::ArrowIpc)
-        .or_else(|| {
-            descriptor
-                .artifact(ForwardFileFormat::Parquet)
-                .map(|_| ForwardFileFormat::Parquet)
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "forward_store descriptor has no readable artifacts",
-            )
-        })
 }
 
 pub(crate) fn collection_name_for_wal_record(record: &WalRecord) -> &str {

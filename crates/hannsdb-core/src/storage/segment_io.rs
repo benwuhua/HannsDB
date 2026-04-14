@@ -327,83 +327,6 @@ pub(crate) fn materialize_forward_store_snapshot(
     Ok(())
 }
 
-pub(crate) fn materialize_latest_live_forward_store_snapshot(
-    segment_manager: &SegmentManager,
-    collection_meta: &CollectionMetadata,
-) -> io::Result<()> {
-    let active_segment = segment_manager.active_segment_path()?;
-    let mut store = MemForwardStore::new(collection_meta.schema());
-    let mut seen_ids = HashSet::new();
-    let mut op_seq = 1_u64;
-
-    for segment in segment_manager.segment_paths()? {
-        let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-        let records = load_records_or_empty(
-            &segment.records,
-            collection_meta.dimension,
-            collection_meta.primary_is_fp16(),
-        )?;
-        let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
-        let vectors = load_vectors_or_empty(
-            &segment,
-            &segment_meta,
-            &collection_meta.primary_vector,
-            stored_ids.len(),
-        )?;
-        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-        let row_limit = segment_meta
-            .record_count
-            .min(stored_ids.len())
-            .min(records.len() / collection_meta.dimension.max(1))
-            .min(payloads.len())
-            .min(vectors.len());
-
-        for row_idx in (0..row_limit).rev() {
-            let internal_id = stored_ids[row_idx];
-            if !seen_ids.insert(internal_id) || tombstone.is_deleted(row_idx) {
-                continue;
-            }
-            let internal_id = u64::try_from(internal_id).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "forward_store latest-live snapshot cannot encode negative internal id {}",
-                        stored_ids[row_idx]
-                    ),
-                )
-            })?;
-            let start = row_idx * collection_meta.dimension;
-            let end = start + collection_meta.dimension;
-            let mut row_vectors = vectors[row_idx].clone();
-            row_vectors.insert(
-                collection_meta.primary_vector.clone(),
-                records[start..end].to_vec(),
-            );
-            store.append(ForwardRow {
-                internal_id,
-                op_seq,
-                is_deleted: false,
-                fields: payloads[row_idx].clone(),
-                vectors: row_vectors,
-            })?;
-            op_seq += 1;
-        }
-    }
-
-    let descriptor = ChunkedFileWriter::new(&active_segment.dir).write(
-        "forward_store",
-        &store,
-        &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
-    )?;
-    crate::segment::atomic_write(
-        &active_segment.forward_store_descriptor(),
-        &serde_json::to_vec_pretty(&descriptor).map_err(json_to_io_error)?,
-    )?;
-    Ok(())
-}
-
 pub(crate) fn invalidate_forward_store_snapshot(segment_paths: &SegmentPaths) -> io::Result<()> {
     for path in [
         segment_paths.forward_store_descriptor(),
@@ -509,6 +432,45 @@ pub(crate) fn segment_prefers_forward_store_authority(
     descriptor.row_count == segment_meta.record_count
 }
 
+pub(crate) fn segment_has_authoritative_persisted_image(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+    requires_data_files: bool,
+    requires_vector_sidecar: bool,
+) -> io::Result<bool> {
+    if !segment.tombstones.exists() {
+        return Ok(false);
+    }
+
+    if forward_store_matches_segment_rows(segment, segment_meta)? {
+        return Ok(true);
+    }
+
+    if segment_meta.record_count > 0
+        && (!segment.records.exists() || !segment.external_ids.exists())
+    {
+        return Ok(false);
+    }
+
+    if requires_data_files && !segment_has_payload_image(segment) {
+        return Ok(false);
+    }
+
+    if requires_vector_sidecar {
+        match load_vectors(&segment.vectors) {
+            Ok(vectors) => {
+                if vectors.len() != segment_meta.record_count {
+                    return Ok(false);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(true)
+}
+
 pub(crate) fn load_authoritative_forward_store_rows(
     segment: &SegmentPaths,
     segment_meta: &SegmentMetadata,
@@ -566,9 +528,30 @@ fn any_paths_newer_than_forward_store(
 }
 
 fn newest_mtime(paths: &[std::path::PathBuf]) -> Option<std::time::SystemTime> {
-    paths.iter()
+    paths
+        .iter()
         .filter_map(|path| fs::metadata(path).ok()?.modified().ok())
         .max()
+}
+
+fn segment_has_payload_image(segment: &SegmentPaths) -> bool {
+    segment.payloads.exists() || segment.payloads_arrow.exists()
+}
+
+fn forward_store_matches_segment_rows(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<bool> {
+    if !segment_prefers_forward_store_authority(segment, segment_meta)
+        || !segment.forward_store_descriptor().exists()
+    {
+        return Ok(false);
+    }
+
+    let descriptor = load_forward_store_descriptor(segment)?;
+    let format = preferred_forward_store_format(&descriptor)?;
+    let reader = ForwardStoreReader::open(&descriptor, format)?;
+    Ok(reader.row_count() == segment_meta.record_count)
 }
 
 fn load_forward_store_descriptor(segment: &SegmentPaths) -> io::Result<ForwardStoreDescriptor> {
@@ -576,7 +559,9 @@ fn load_forward_store_descriptor(segment: &SegmentPaths) -> io::Result<ForwardSt
     serde_json::from_slice(&bytes).map_err(json_to_io_error)
 }
 
-fn preferred_forward_store_format(descriptor: &ForwardStoreDescriptor) -> io::Result<ForwardFileFormat> {
+fn preferred_forward_store_format(
+    descriptor: &ForwardStoreDescriptor,
+) -> io::Result<ForwardFileFormat> {
     descriptor
         .artifact(ForwardFileFormat::ArrowIpc)
         .map(|_| ForwardFileFormat::ArrowIpc)
@@ -605,8 +590,7 @@ fn project_forward_store_payloads(
     fields: Option<&[String]>,
 ) -> Vec<BTreeMap<String, FieldValue>> {
     let keep = fields.map(|names| names.iter().cloned().collect::<BTreeSet<_>>());
-    rows
-        .into_iter()
+    rows.into_iter()
         .map(|mut row| {
             if let Some(ref keep) = keep {
                 row.fields.retain(|name, _| keep.contains(name));
@@ -620,8 +604,7 @@ fn project_forward_store_vectors(
     rows: Vec<ForwardRow>,
     primary_vector_name: &str,
 ) -> Vec<BTreeMap<String, Vec<f32>>> {
-    rows
-        .into_iter()
+    rows.into_iter()
         .map(|mut row| {
             row.vectors.remove(primary_vector_name);
             row.vectors
@@ -801,7 +784,10 @@ pub(crate) fn load_all_collection_ids(paths: &CollectionPaths) -> io::Result<Vec
     let mut all_ids = Vec::new();
     for segment in segment_paths {
         let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-        all_ids.extend(load_external_ids_for_segment_or_empty(&segment, &segment_meta)?);
+        all_ids.extend(load_external_ids_for_segment_or_empty(
+            &segment,
+            &segment_meta,
+        )?);
     }
     Ok(all_ids)
 }

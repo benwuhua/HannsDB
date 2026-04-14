@@ -53,8 +53,7 @@ use crate::storage::segment_io::{
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
     load_vectors_or_empty,
     materialize_active_segment_arrow_snapshots, materialize_forward_store_snapshot,
-    materialize_latest_live_forward_store_snapshot, next_compacted_segment_id,
-    persisted_ann_exists,
+    next_compacted_segment_id, persisted_ann_exists,
 };
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
@@ -2092,7 +2091,7 @@ impl CollectionHandle {
             .unwrap_or_else(|| paths.dir.clone());
         let _ = load_wal_records(&wal_path(&root))?;
         materialize_active_segment_arrow_snapshots(&active_segment, &collection_meta)?;
-        materialize_latest_live_forward_store_snapshot(&self.segment_manager, &collection_meta)?;
+        materialize_forward_store_snapshot(&active_segment, &collection_meta)?;
         Ok(())
     }
 

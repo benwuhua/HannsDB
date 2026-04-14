@@ -1460,9 +1460,16 @@ fn collection_api_flush_collection_persists_forward_store_artifacts_with_latest_
         .join("segments")
         .join(&version_set.active_segment_id);
     let descriptor = load_forward_store_descriptor(&active_segment_dir.join("forward_store.json"));
+    let active_meta =
+        SegmentMetadata::load_from_path(&active_segment_dir.join("segment.json")).expect("meta");
     assert!(
         descriptor.row_count >= 1,
         "flush should persist at least the active forward_store rows"
+    );
+    assert_eq!(
+        descriptor.row_count,
+        active_meta.record_count,
+        "flush should persist a row-aligned active forward_store snapshot"
     );
     assert!(
         descriptor.artifact(ForwardFileFormat::ArrowIpc).is_some(),
@@ -1822,6 +1829,69 @@ fn collection_api_query_documents_uses_forward_store_when_dense_sidecars_are_mis
 }
 
 #[test]
+fn collection_api_reopen_keeps_filtered_query_surface_on_refreshed_active_forward_store() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_query_refreshed_forward_store");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                10,
+                vec![("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                20,
+                vec![("group".to_string(), FieldValue::Int64(2))],
+                vec![2.0_f32, 2.0],
+            ),
+        ],
+    )
+    .expect("insert initial documents");
+    db.flush_collection("docs")
+        .expect("flush initial active forward_store");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            30,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.1_f32, 0.0],
+        )],
+    )
+    .expect("insert later document");
+    db.flush_collection("docs")
+        .expect("refresh active forward_store after later write");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let hits = reopened
+        .query_documents("docs", &[0.0_f32, 0.0], 3, Some("group == 1"))
+        .expect("query should keep existing filtered surface on refreshed active forward_store");
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![10, 30]
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.fields.get("group").cloned())
+            .collect::<Vec<_>>(),
+        vec![Some(FieldValue::Int64(1)), Some(FieldValue::Int64(1)),]
+    );
+}
+
+#[test]
 fn collection_api_stale_forward_store_does_not_hide_newer_payloads_jsonl() {
     let root = unique_temp_dir("hannsdb_collection_api_stale_forward_store_payloads");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1850,7 +1920,10 @@ fn collection_api_stale_forward_store_does_not_hide_newer_payloads_jsonl() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     append_payloads(
         &collection_dir.join("payloads.jsonl"),
-        &[BTreeMap::from([("group".to_string(), FieldValue::Int64(9))])],
+        &[BTreeMap::from([(
+            "group".to_string(),
+            FieldValue::Int64(9),
+        )])],
     )
     .expect("rewrite fresher payloads jsonl");
 

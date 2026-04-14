@@ -607,11 +607,19 @@ fn wal_recovery_open_skips_replay_when_forward_store_descriptor_can_authoritativ
         .expect("create collection");
     db.insert_documents("docs", &[sample_document(11)])
         .expect("insert document");
+    db.upsert_documents(
+        "docs",
+        &[custom_document(11, "s-forward", 9, false, vec![0.9, 0.8])],
+    )
+    .expect("upsert document");
+    db.insert_documents("docs", &[sample_document(22)])
+        .expect("insert second document");
+    db.delete("docs", &[22]).expect("delete second document");
     db.flush_collection("docs")
         .expect("flush should materialize active forward_store");
     drop(db);
 
-    let collection_dir = collection_dir(temp.path(), "docs");
+    let collection_dir = storage_dir_with_file(temp.path(), "docs", "forward_store.json");
     let payloads_jsonl = collection_dir.join("payloads.jsonl");
     let vectors_jsonl = collection_dir.join("vectors.jsonl");
     let payloads_arrow = collection_dir.join("payloads.arrow");
@@ -640,13 +648,47 @@ fn wal_recovery_open_skips_replay_when_forward_store_descriptor_can_authoritativ
         },
     )
     .expect("append insert to mimic pre-truncation WAL");
+    append_wal_record(
+        &wal_path,
+        &WalRecord::UpsertDocuments {
+            collection: "docs".to_string(),
+            documents: vec![custom_document(11, "s-forward", 9, false, vec![0.9, 0.8])],
+        },
+    )
+    .expect("append upsert to mimic pre-truncation WAL");
+    append_wal_record(
+        &wal_path,
+        &WalRecord::InsertDocuments {
+            collection: "docs".to_string(),
+            documents: vec![sample_document(22)],
+        },
+    )
+    .expect("append second insert to mimic pre-truncation WAL");
+    append_wal_record(
+        &wal_path,
+        &WalRecord::Delete {
+            collection: "docs".to_string(),
+            ids: vec![22],
+        },
+    )
+    .expect("append delete to mimic pre-truncation WAL");
 
     let reopened = HannsDb::open(temp.path()).expect("reopen from authoritative forward_store");
     let fetched = reopened
-        .fetch_documents("docs", &[11])
+        .fetch_documents("docs", &[11, 22])
         .expect("fetch from forward_store-authoritative reopen");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].id, 11);
+    assert_eq!(
+        fetched[0].fields.get("session_id"),
+        Some(&FieldValue::String("s-forward".to_string()))
+    );
+    assert_eq!(fetched[0].fields.get("turn"), Some(&FieldValue::Int64(9)));
+    assert_eq!(fetched[0].fields.get("active"), Some(&FieldValue::Bool(false)));
+    assert_eq!(
+        fetched[0].primary_vector_for("dense").unwrap(),
+        &[0.9, 0.8]
+    );
     assert!(
         !payloads_jsonl.exists(),
         "reopen should not replay WAL and recreate payloads.jsonl when forward_store is authoritative"
@@ -678,7 +720,7 @@ fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compa
         .expect("flush should materialize active forward_store");
     drop(db);
 
-    let collection_dir = collection_dir(temp.path(), "docs");
+    let collection_dir = storage_dir_with_file(temp.path(), "docs", "forward_store.json");
     let payloads_jsonl = collection_dir.join("payloads.jsonl");
     let vectors_jsonl = collection_dir.join("vectors.jsonl");
     let payloads_arrow = collection_dir.join("payloads.arrow");
