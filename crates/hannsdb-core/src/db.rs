@@ -659,9 +659,9 @@ impl HannsDb {
             };
             let segment_external_ids = load_record_ids(&segment_paths.external_ids)?;
             let segment_payloads =
-                load_payloads_or_empty(&segment_paths.payloads, segment_external_ids.len())?;
+                load_payloads_or_empty(&segment_paths, &segment_meta, segment_external_ids.len())?;
             let segment_vectors =
-                load_vectors_or_empty(&segment_paths.vectors, segment_external_ids.len())?;
+                load_vectors_or_empty(&segment_paths, &segment_meta, segment_external_ids.len())?;
             let segment_tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
 
             if segment_external_ids
@@ -1261,7 +1261,7 @@ impl HannsDb {
                 collection_meta.primary_is_fp16(),
             )?;
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+            let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
             let row_limit = segment_meta
@@ -1839,7 +1839,8 @@ impl CollectionHandle {
             let mut all_ids: Vec<i64> = Vec::new();
             for segment in &segment_paths {
                 let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-                let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
+                let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+                let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
                 let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
                 for (row_idx, ext_id) in stored_ids.iter().enumerate() {
                     if tombstone.is_deleted(row_idx) {
@@ -2068,8 +2069,9 @@ impl CollectionHandle {
     fn flush(&self) -> io::Result<()> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
+        let active_segment = self.segment_manager.active_segment_path()?;
+        let _ = SegmentMetadata::load_from_path(&active_segment.metadata)?;
+        let _ = TombstoneMask::load_from_path(&active_segment.tombstones)?;
         let root = paths
             .dir
             .parent()
@@ -2077,7 +2079,7 @@ impl CollectionHandle {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| paths.dir.clone());
         let _ = load_wal_records(&wal_path(&root))?;
-        materialize_active_segment_arrow_snapshots(&paths, &collection_meta)?;
+        materialize_active_segment_arrow_snapshots(&active_segment, &collection_meta)?;
         Ok(())
     }
 
@@ -2355,6 +2357,7 @@ impl CollectionHandle {
 
         let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
         for segment in segment_paths {
+            let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let records = load_records_or_empty(
                 &segment.records,
                 collection_meta.dimension,
@@ -2362,9 +2365,14 @@ impl CollectionHandle {
             )?;
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
             let payloads = if projection.is_some() {
-                load_payloads_with_fields_or_empty(&segment.payloads, stored_ids.len(), projection)?
+                load_payloads_with_fields_or_empty(
+                    &segment,
+                    &segment_meta,
+                    stored_ids.len(),
+                    projection,
+                )?
             } else {
-                load_payloads_or_empty(&segment.payloads, stored_ids.len())?
+                load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?
             };
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
@@ -2620,14 +2628,15 @@ impl CollectionHandle {
         let mut shadowed_ids: HashSet<i64> = HashSet::new();
 
         for segment in &segment_paths {
+            let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
             let records = load_records_or_empty(
                 &segment.records,
                 collection_meta.dimension,
                 collection_meta.primary_is_fp16(),
             )?;
-            let payloads = load_payloads_or_empty(&segment.payloads, stored_ids.len())?;
-            let vectors = load_vectors_or_empty(&segment.vectors, stored_ids.len())?;
+            let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
+            let vectors = load_vectors_or_empty(&segment, &segment_meta, stored_ids.len())?;
             let sparse = load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 

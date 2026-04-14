@@ -6,17 +6,59 @@ use crate::catalog::CollectionMetadata;
 use crate::document::{FieldValue, SparseVector};
 use crate::segment::index_runtime::{ann_blob_path, HNSW_INDEX_FILE};
 use crate::segment::{
-    load_payloads, load_payloads_jsonl, load_payloads_with_fields, load_record_ids, load_records,
+    load_payloads_jsonl, load_payloads_with_fields, load_record_ids, load_records,
     load_records_f16, load_sparse_vectors, load_vectors, load_vectors_jsonl, write_payloads_arrow,
-    write_vectors_arrow, SegmentManager, TombstoneMask,
+    write_vectors_arrow, NormalizedStorageFormat, SegmentManager, SegmentMetadata, SegmentPaths,
+    TombstoneMask,
 };
 use crate::storage::paths::CollectionPaths;
 
-pub(crate) fn load_payloads_or_empty(
+fn load_payloads_for_segment(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+    fields: Option<&[String]>,
+) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    match segment_meta.normalized_storage_format() {
+        NormalizedStorageFormat::Arrow => {
+            if segment.payloads_arrow.exists() {
+                return load_payloads_with_fields(&segment.payloads, fields);
+            }
+            load_payload_rows_jsonl(&segment.payloads, fields)
+        }
+        NormalizedStorageFormat::Jsonl => {
+            if segment.payloads.exists() {
+                return load_payload_rows_jsonl(&segment.payloads, fields);
+            }
+            load_payloads_with_fields(&segment.payloads, fields)
+        }
+    }
+}
+
+fn load_payload_rows_jsonl(
     path: &Path,
+    fields: Option<&[String]>,
+) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
+    let payloads = load_payloads_jsonl(path)?;
+    if let Some(field_names) = fields {
+        let keep: std::collections::BTreeSet<&str> =
+            field_names.iter().map(String::as_str).collect();
+        return Ok(payloads
+            .into_iter()
+            .map(|mut map| {
+                map.retain(|k, _| keep.contains(k.as_str()));
+                map
+            })
+            .collect());
+    }
+    Ok(payloads)
+}
+
+pub(crate) fn load_payloads_or_empty(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
     expected_rows: usize,
 ) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    match load_payloads(path) {
+    match load_payloads_for_segment(segment, segment_meta, None) {
         Ok(mut payloads) => {
             if payloads.len() > expected_rows {
                 return Err(io::Error::new(
@@ -62,22 +104,22 @@ pub(crate) fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
 }
 
 pub(crate) fn materialize_active_segment_arrow_snapshots(
-    paths: &CollectionPaths,
+    segment_paths: &SegmentPaths,
     collection_meta: &CollectionMetadata,
 ) -> io::Result<()> {
-    if paths.payloads.exists() {
-        let payloads = load_payloads_jsonl(&paths.payloads)?;
+    if segment_paths.payloads.exists() {
+        let payloads = load_payloads_jsonl(&segment_paths.payloads)?;
         write_payloads_arrow(
-            &paths.payloads.with_extension("arrow"),
+            &segment_paths.payloads_arrow,
             &payloads,
             &collection_meta.fields,
         )?;
     }
 
-    if paths.vectors.exists() {
-        let vectors = load_vectors_jsonl(&paths.vectors)?;
+    if segment_paths.vectors.exists() {
+        let vectors = load_vectors_jsonl(&segment_paths.vectors)?;
         write_vectors_arrow(
-            &paths.vectors.with_extension("arrow"),
+            &segment_paths.vectors_arrow,
             &vectors,
             &collection_meta.vectors,
             &collection_meta.primary_vector,
@@ -88,10 +130,11 @@ pub(crate) fn materialize_active_segment_arrow_snapshots(
 }
 
 pub(crate) fn load_vectors_or_empty(
-    path: &Path,
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
     expected_rows: usize,
 ) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    match load_vectors(path) {
+    match load_vectors_for_segment(segment, segment_meta) {
         Ok(vectors) => {
             if vectors.len() > expected_rows {
                 return Err(io::Error::new(
@@ -114,12 +157,33 @@ pub(crate) fn load_vectors_or_empty(
     }
 }
 
+fn load_vectors_for_segment(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
+    match segment_meta.normalized_storage_format() {
+        NormalizedStorageFormat::Arrow => {
+            if segment.vectors_arrow.exists() {
+                return load_vectors(&segment.vectors);
+            }
+            load_vectors_jsonl(&segment.vectors)
+        }
+        NormalizedStorageFormat::Jsonl => {
+            if segment.vectors.exists() {
+                return load_vectors_jsonl(&segment.vectors);
+            }
+            load_vectors(&segment.vectors)
+        }
+    }
+}
+
 pub(crate) fn load_payloads_with_fields_or_empty(
-    path: &Path,
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
     expected_rows: usize,
     fields: Option<&[String]>,
 ) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    match load_payloads_with_fields(path, fields) {
+    match load_payloads_for_segment(segment, segment_meta, fields) {
         Ok(mut payloads) => {
             if payloads.len() > expected_rows {
                 return Err(io::Error::new(
@@ -215,8 +279,10 @@ pub(crate) fn load_shadowed_live_vector_records(
     let mut shadowed_ids = HashSet::new();
 
     for segment in segment_manager.segment_paths()? {
+        let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
         let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let segment_vectors = load_vectors_or_empty(&segment.vectors, segment_external_ids.len())?;
+        let segment_vectors =
+            load_vectors_or_empty(&segment, &segment_meta, segment_external_ids.len())?;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
         if segment_vectors.len() != segment_external_ids.len() {
             return Err(io::Error::new(

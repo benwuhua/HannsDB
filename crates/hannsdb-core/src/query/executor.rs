@@ -6,8 +6,12 @@ use std::path::Path;
 use crate::catalog::CollectionMetadata;
 use crate::document::{compare_field_value_for_sort, FieldValue};
 use crate::segment::{
-    load_payloads, load_record_ids, load_records, load_sparse_vectors, load_vectors,
-    SegmentManager, TombstoneMask,
+    load_record_ids, load_records, load_sparse_vectors, SegmentManager, SegmentMetadata,
+    TombstoneMask,
+};
+use crate::storage::segment_io::{
+    load_payloads_or_empty as load_segment_payloads_or_empty,
+    load_vectors_or_empty as load_segment_vectors_or_empty,
 };
 
 use super::hits::{compare_hits, DocumentHit};
@@ -66,11 +70,17 @@ impl QueryExecutor {
             .iter()
             .any(|source| matches!(&source.vector, QueryVector::Sparse(_)));
         for segment in segment_manager.segment_paths()? {
+            let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let records = load_records_or_empty(&segment.records, collection.dimension)?;
             let external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let payloads = load_payloads_or_empty(&segment.payloads, external_ids.len())?;
+            let payloads =
+                load_segment_payloads_or_empty(&segment, &segment_meta, external_ids.len())?;
             let vectors = if needs_secondary_vectors {
-                Some(load_vectors_or_empty(&segment.vectors, external_ids.len())?)
+                Some(load_segment_vectors_or_empty(
+                    &segment,
+                    &segment_meta,
+                    external_ids.len(),
+                )?)
             } else {
                 None
             };
@@ -411,57 +421,6 @@ fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
     match load_record_ids(path) {
         Ok(ids) => Ok(ids),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn load_payloads_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    match load_payloads(path) {
-        Ok(mut payloads) => {
-            if payloads.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload row count exceeds record row count",
-                ));
-            }
-            if payloads.len() < expected_rows {
-                payloads.resize_with(expected_rows, BTreeMap::new);
-            }
-            Ok(payloads)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn load_vectors_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    match load_vectors(path) {
-        Ok(vectors) => {
-            if vectors.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vector row count exceeds record row count",
-                ));
-            }
-            if vectors.len() < expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vector row count is shorter than record row count",
-                ));
-            }
-            Ok(vectors)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
         Err(err) => Err(err),
     }
 }

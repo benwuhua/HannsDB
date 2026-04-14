@@ -66,6 +66,8 @@
   - 2026-04-13: no longer truly "not started" — rollover rules, segment-set layout, multi-segment reads, and segment-aware reopen/search coverage are already green; remaining work is broader operational hardening and story completion
   - 2026-04-14: active write routing after rollover is now also segment-aware for `insert` / `insert_documents` / `upsert_documents`; the next remaining storage-story work is less about basic correctness and more about deeper forward-store / runtime orchestration maturity
   - 2026-04-14: active-segment mutation authority is now explicitly split: `SegmentWriter` owns append/rollover/sealing mechanics, `VersionSet` / `SegmentManager` own topology, and `db.rs` keeps WAL / mutation policy / ANN invalidation / compaction triggering
+  - 2026-04-14: `flush_collection()` is now segment-aware after rollover as well; active-segment Arrow snapshot materialization no longer mis-targets the root-level legacy path, and Arrow-only reopen works for the active segment after multi-segment flush
+  - 2026-04-14: persisted-read authority is now less implicit: segment loads start from `segment.json.storage_format`, so `jsonl` segments prefer JSONL but can fall back to Arrow snapshots when JSONL is absent, while `arrow` segments prefer Arrow. This closes a stale/corrupt-sidecar class of reopen bugs without widening into a full recovery rewrite
 - [ ] Compaction/rebuild workflow
   - 2026-04-13: no longer truly "not started" — compaction merge behavior, tombstone filtering, reopen coverage, and daemon/admin hooks exist; remaining work is turning the implemented path into a more complete production workflow story
 

@@ -2,9 +2,12 @@ use std::fs;
 use std::path::Path;
 
 use hannsdb_core::db::HannsDb;
-use hannsdb_core::document::{Document, FieldValue};
+use hannsdb_core::document::{
+    CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
+};
 use hannsdb_core::segment::{
-    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+    append_payloads, append_record_ids, append_records, write_payloads_arrow, SegmentMetadata,
+    SegmentSet, TombstoneMask,
 };
 use hannsdb_core::wal::truncate_wal;
 
@@ -208,4 +211,73 @@ fn compaction_filters_tombstoned_rows_from_merged_segment() {
         .expect("search after compact");
     let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     assert_eq!(hit_ids, vec![11, 22, 30]);
+}
+
+#[test]
+fn compaction_reopen_prefers_jsonl_when_storage_format_is_jsonl() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("tag", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+
+    let segments_dir = collection_segments_dir(root, "docs");
+    write_segment(
+        &segments_dir.join("seg-000001"),
+        "seg-000001",
+        2,
+        &[Document::new(
+            1,
+            vec![("tag".to_string(), FieldValue::String("jsonl".to_string()))],
+            vec![0.0, 0.0],
+        )],
+        &[],
+    );
+    write_segment(
+        &segments_dir.join("seg-000002"),
+        "seg-000002",
+        2,
+        &[doc(10, vec![10.0, 10.0])],
+        &[],
+    );
+
+    write_payloads_arrow(
+        &segments_dir.join("seg-000001").join("payloads.arrow"),
+        &[std::collections::BTreeMap::from([(
+            "tag".to_string(),
+            FieldValue::String("arrow".to_string()),
+        )])],
+        &[ScalarFieldSchema::new("tag", FieldType::String)],
+    )
+    .expect("write conflicting arrow payloads");
+
+    SegmentSet {
+        active_segment_id: "seg-000002".to_string(),
+        immutable_segment_ids: vec!["seg-000001".to_string()],
+    }
+    .save_to_path(
+        &root
+            .join("collections")
+            .join("docs")
+            .join("segment_set.json"),
+    )
+    .expect("write segment_set");
+
+    truncate_wal(&root.join("wal.jsonl")).expect("truncate wal before reopen");
+    let reopened = HannsDb::open(root).expect("reopen db");
+    let fetched = reopened
+        .fetch_documents("docs", &[1])
+        .expect("fetch immutable jsonl-authoritative doc");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(
+        fetched[0].fields.get("tag"),
+        Some(&FieldValue::String("jsonl".to_string())),
+        "storage_format=jsonl should prefer payloads.jsonl over conflicting payloads.arrow"
+    );
 }

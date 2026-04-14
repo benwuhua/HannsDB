@@ -556,6 +556,48 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
 }
 
 #[test]
+fn wal_recovery_open_skips_replay_when_arrow_snapshot_can_authoritatively_reopen_collection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut db = HannsDb::open(temp.path()).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert_documents("docs", &[sample_document(11)])
+        .expect("insert document");
+    db.flush_collection("docs")
+        .expect("flush should materialize active-segment arrows");
+    drop(db);
+
+    let collection_dir = collection_dir(temp.path(), "docs");
+    let payloads_jsonl = collection_dir.join("payloads.jsonl");
+    let vectors_jsonl = collection_dir.join("vectors.jsonl");
+    assert!(
+        collection_dir.join("payloads.arrow").exists(),
+        "flush should create payloads.arrow before removing jsonl sidecars"
+    );
+    assert!(
+        collection_dir.join("vectors.arrow").exists(),
+        "flush should create vectors.arrow before removing jsonl sidecars"
+    );
+    fs::remove_file(&payloads_jsonl).expect("remove payloads jsonl");
+    fs::remove_file(&vectors_jsonl).expect("remove vectors jsonl");
+
+    let reopened = HannsDb::open(temp.path()).expect("reopen from authoritative arrows");
+    let fetched = reopened
+        .fetch_documents("docs", &[11])
+        .expect("fetch from arrow-authoritative reopen");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].id, 11);
+    assert!(
+        !payloads_jsonl.exists(),
+        "reopen should not replay WAL and recreate payloads.jsonl when Arrow snapshots are authoritative"
+    );
+    assert!(
+        !vectors_jsonl.exists(),
+        "reopen should not replay WAL and recreate vectors.jsonl when Arrow snapshots are authoritative"
+    );
+}
+
+#[test]
 fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view() {
     let temp = tempfile::tempdir().expect("tempdir");
     let wal_path = temp.path().join("wal.jsonl");

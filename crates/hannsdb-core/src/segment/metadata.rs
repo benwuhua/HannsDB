@@ -18,6 +18,12 @@ pub struct SegmentMetadata {
     pub storage_format: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalizedStorageFormat {
+    Jsonl,
+    Arrow,
+}
+
 fn default_storage_format() -> String {
     "jsonl".to_string()
 }
@@ -57,6 +63,13 @@ impl SegmentMetadata {
             ));
         }
         Ok(metadata)
+    }
+
+    pub fn normalized_storage_format(&self) -> NormalizedStorageFormat {
+        match self.storage_format.as_str() {
+            "arrow" => NormalizedStorageFormat::Arrow,
+            _ => NormalizedStorageFormat::Jsonl,
+        }
     }
 }
 

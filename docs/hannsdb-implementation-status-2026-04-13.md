@@ -147,6 +147,17 @@
 - 同时补了两类额外回归：
   - post-rollover `update_documents` 仍会把最新 live row 追加到 active segment
   - post-rollover `delete` 仍保持 latest-live 语义，但没有把 delete 逻辑错误地收进 writer authority
+- `flush_collection()` 现在也会在 multi-segment 模式下对真正的 active segment 物化 Arrow snapshot，
+  不再错误地只盯着 collection 根目录的旧单段路径
+- 新增回归覆盖：
+  - rollover 之后 `flush_collection()` 会把 `payloads.arrow` / `vectors.arrow` 写到 active segment 目录
+  - 即使移除 active segment 的 JSONL sidecar，reopen 后仍能通过该 active-segment Arrow snapshot 读回数据
+- segment read path 现在也开始显式尊重 `segment.json.storage_format`：
+  - `storage_format=jsonl` 时优先读 JSONL，只有 JSONL 缺失时才回退到 Arrow snapshot
+  - `storage_format=arrow` 时优先读 Arrow
+- 新增回归覆盖：
+  - active segment 的 `payloads.arrow` 若损坏，但 `payloads.jsonl` 仍在，reopen 会回退到 JSONL
+  - immutable segment 若 metadata 仍声明 `jsonl`，即使旁边存在冲突的 `payloads.arrow`，reopen 仍以 JSONL 为准
 - 为避免 ad-hoc payload 在 sealed Arrow segment 中退化成 JSON 字符串，本轮也补了 Arrow payload ad-hoc field 的类型推断；常见 scalar/bool/array ad-hoc 字段在 rollover/reopen 后保持原始语义
 - 未被使用的 `CollectionHandle::name()` accessor 也已删掉，避免再保留无调用的薄包装 API
 - `FieldValue` 排序比较逻辑也已收拢到 `document.rs`，`query::executor` 不再内联维护那段 match 细节

@@ -15,7 +15,7 @@ pub use arrow_io::{
     load_payloads_arrow, load_vectors_arrow, write_payloads_arrow, write_vectors_arrow,
 };
 pub use manager::{SegmentManager, SegmentPaths};
-pub use metadata::SegmentMetadata;
+pub use metadata::{NormalizedStorageFormat, SegmentMetadata};
 pub use payloads::{
     append_payloads, ensure_payload_rows, load_payloads, load_payloads_jsonl,
     load_payloads_with_fields,

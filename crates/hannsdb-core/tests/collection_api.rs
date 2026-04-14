@@ -629,6 +629,68 @@ fn collection_api_post_rollover_delete_keeps_writer_boundary_and_latest_live_vie
 }
 
 #[test]
+fn collection_api_flush_after_rollover_materializes_active_segment_arrow_snapshots() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_after_rollover");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+    db.insert("docs", &[201], &[1.0_f32, 1.0])
+        .expect("insert after rollover");
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let active_segment_dir = collection_dir
+        .join("segments")
+        .join(&version_set.active_segment_id);
+    let active_payloads_arrow = active_segment_dir.join("payloads.arrow");
+    let active_vectors_arrow = active_segment_dir.join("vectors.arrow");
+
+    db.flush_collection("docs")
+        .expect("flush should target the active segment after rollover");
+
+    assert!(
+        active_payloads_arrow.exists(),
+        "flush should materialize payloads.arrow in the active segment directory"
+    );
+    assert!(
+        active_vectors_arrow.exists(),
+        "flush should materialize vectors.arrow in the active segment directory"
+    );
+    assert!(
+        !collection_dir.join("payloads.arrow").exists(),
+        "flush should not materialize a stale root-level payloads.arrow after rollover"
+    );
+    assert!(
+        !collection_dir.join("vectors.arrow").exists(),
+        "flush should not materialize a stale root-level vectors.arrow after rollover"
+    );
+
+    fs::remove_file(active_segment_dir.join("payloads.jsonl"))
+        .expect("remove active payloads jsonl after flush");
+    fs::remove_file(active_segment_dir.join("vectors.jsonl"))
+        .expect("remove active vectors jsonl after flush");
+
+    let reopened = HannsDb::open(&root).expect("reopen after active-segment flush");
+    let fetched = reopened
+        .fetch_documents("docs", &[200, 201])
+        .expect("fetch post-rollover docs from active-segment Arrow snapshots");
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![200, 201]);
+}
+
+#[test]
 fn collection_api_delete_masks_results() {
     let root = unique_temp_dir("hannsdb_collection_api_delete");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1471,6 +1533,45 @@ fn collection_api_reopen_fetch_documents_uses_active_arrow_snapshots_when_jsonl_
             .get("vector")
             .expect("doc 20 primary vector from vectors.arrow"),
         &vec![1.0_f32, 1.0]
+    );
+}
+
+#[test]
+fn collection_api_reopen_falls_back_to_jsonl_when_active_arrow_snapshot_is_unreadable() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_fallback_to_jsonl");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("tag", FieldType::String)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            10,
+            vec![("tag".to_string(), FieldValue::String("jsonl".to_string()))],
+            vec![0.0_f32, 0.0],
+        )],
+    )
+    .expect("insert document");
+    db.flush_collection("docs")
+        .expect("flush should materialize active-segment arrows");
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::write(collection_dir.join("payloads.arrow"), b"not arrow").expect("corrupt payloads.arrow");
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let docs = reopened
+        .fetch_documents("docs", &[10])
+        .expect("fetch should fall back to payloads.jsonl when active arrow is unreadable");
+
+    assert_eq!(docs.len(), 1);
+    assert_eq!(
+        docs[0].fields.get("tag"),
+        Some(&FieldValue::String("jsonl".to_string()))
     );
 }
 
