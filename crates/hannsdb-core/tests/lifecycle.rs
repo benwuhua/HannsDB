@@ -414,6 +414,23 @@ fn lifecycle_compact_reduces_immutable_count_to_one() {
         "compacted segment must contain 2 live rows from seg-1 + seg-2"
     );
     assert_eq!(immutable_segments[0].dead_count, 0);
+    let compacted_dir = segs.join(&immutable_segments[0].id);
+    let compacted_meta =
+        SegmentMetadata::load_from_path(&compacted_dir.join("segment.json")).expect("load meta");
+    assert_eq!(
+        compacted_meta.storage_format, "forward_store",
+        "compacted lifecycle segment should stay on the forward_store-backed storage path"
+    );
+    assert!(
+        compacted_dir.join("payloads.arrow").exists()
+            && compacted_dir.join("vectors.arrow").exists(),
+        "compacted lifecycle segment should keep Arrow compatibility artifacts"
+    );
+    assert!(
+        !compacted_dir.join("payloads.jsonl").exists()
+            && !compacted_dir.join("vectors.jsonl").exists(),
+        "compaction should not fall back to JSONL sidecars for the merged immutable segment"
+    );
     assert!(
         segments.iter().any(|s| s.id == "seg-000003"),
         "active segment must remain unchanged after compact"

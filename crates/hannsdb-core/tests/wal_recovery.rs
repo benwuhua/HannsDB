@@ -742,6 +742,84 @@ fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compa
 }
 
 #[test]
+fn wal_recovery_reopen_keeps_compacted_immutable_arrow_storage_without_recreating_jsonl_sidecars() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert 100 docs");
+    let to_delete: Vec<i64> = (0..21).collect();
+    db.delete("docs", &to_delete).expect("delete 21 docs");
+    db.insert("docs", &[200], &[99.0_f32, 99.0])
+        .expect("trigger rollover");
+    db.compact_collection("docs")
+        .expect("compact rolled-over immutable segment");
+
+    let collection_dir = collection_dir(root, "docs");
+    let segment_set_before =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("segment_set");
+    assert_eq!(
+        segment_set_before.immutable_segment_ids.len(),
+        1,
+        "compaction should leave exactly one immutable segment behind"
+    );
+
+    let compacted_segment_dir = collection_dir
+        .join("segments")
+        .join(&segment_set_before.immutable_segment_ids[0]);
+    let compacted_meta = SegmentMetadata::load_from_path(&compacted_segment_dir.join("segment.json"))
+        .expect("load compacted metadata");
+    assert_eq!(
+        compacted_meta.storage_format, "forward_store",
+        "compaction recovery fixture should advertise forward_store-backed immutable storage"
+    );
+    assert!(
+        compacted_segment_dir.join("payloads.arrow").exists()
+            && compacted_segment_dir.join("vectors.arrow").exists(),
+        "compaction should leave Arrow compatibility artifacts for reopen"
+    );
+    assert!(
+        !compacted_segment_dir.join("payloads.jsonl").exists(),
+        "compaction should not regenerate payloads.jsonl for the immutable segment"
+    );
+    assert!(
+        !compacted_segment_dir.join("vectors.jsonl").exists(),
+        "compaction should not regenerate vectors.jsonl for the immutable segment"
+    );
+
+    drop(db);
+    let reopened = HannsDb::open(root).expect("reopen after compaction");
+    let fetched = reopened
+        .fetch_documents("docs", &[21, 22, 200])
+        .expect("fetch after compaction reopen");
+    assert_eq!(
+        fetched.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        vec![21, 22, 200],
+        "reopen should preserve the live documents that span the compacted immutable segment and active segment"
+    );
+
+    let segment_set_after =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("segment_set");
+    assert_eq!(
+        segment_set_after.immutable_segment_ids,
+        segment_set_before.immutable_segment_ids,
+        "reopen should preserve the compacted immutable segment identity instead of replaying it into a different layout"
+    );
+    assert!(
+        !compacted_segment_dir.join("payloads.jsonl").exists(),
+        "reopen should not recreate payloads.jsonl for the compacted immutable segment"
+    );
+    assert!(
+        !compacted_segment_dir.join("vectors.jsonl").exists(),
+        "reopen should not recreate vectors.jsonl for the compacted immutable segment"
+    );
+}
+
+#[test]
 fn wal_recovery_open_skips_replay_when_refreshed_active_arrow_snapshots_cover_later_write() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

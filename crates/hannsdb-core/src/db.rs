@@ -52,8 +52,9 @@ use crate::storage::segment_io::{
     load_payloads_with_fields_or_empty, load_primary_dense_rows_for_segment_or_empty,
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
     load_vectors_or_empty,
-    materialize_active_segment_arrow_snapshots, materialize_latest_live_forward_store_snapshot,
-    next_compacted_segment_id, persisted_ann_exists,
+    materialize_active_segment_arrow_snapshots, materialize_forward_store_snapshot,
+    materialize_latest_live_forward_store_snapshot, next_compacted_segment_id,
+    persisted_ann_exists,
 };
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
@@ -736,6 +737,7 @@ impl HannsDb {
         );
         compacted_meta.storage_format = "forward_store".to_string();
         compacted_meta.save_to_path(&compacted_dir.join("segment.json"))?;
+        materialize_forward_store_snapshot(&compacted_paths, &collection_meta)?;
 
         version_set = VersionSet::new(
             version_set.active_segment_id().to_string(),
@@ -1235,9 +1237,7 @@ impl HannsDb {
                 segment_meta.deleted_count = tombstone.deleted_count();
                 segment_meta.save_to_path(&segment.metadata)?;
                 tombstone.save_to_path(&segment.tombstones)?;
-                if segment.records.exists() && segment.external_ids.exists() {
-                    invalidate_forward_store_snapshot(&segment)?;
-                }
+                invalidate_forward_store_snapshot(&segment)?;
             }
         }
 
@@ -3169,7 +3169,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_output_is_arrow_format() {
+    fn compact_output_materializes_forward_store_artifacts() {
         let tempdir = tempdir().expect("tempdir");
         let mut db = HannsDb::open(tempdir.path()).expect("open db");
         db.create_collection("docs", 2, "l2").expect("create");
@@ -3211,7 +3211,8 @@ mod tests {
 
         db.compact_collection("docs").expect("compact");
 
-        // Verify compacted segment has arrow files.
+        // Verify compacted segment keeps compatibility arrow files and writes
+        // authoritative forward_store artifacts.
         let version_set = VersionSet::load_from_path(&paths.segment_set).expect("vs");
         let immutables = version_set.immutable_segment_ids();
         assert_eq!(immutables.len(), 1, "should have 1 compacted segment");
@@ -3224,6 +3225,18 @@ mod tests {
         assert!(
             compacted_dir.join("vectors.arrow").exists(),
             "compacted segment should have vectors.arrow"
+        );
+        assert!(
+            compacted_dir.join("forward_store.json").exists(),
+            "compacted segment should persist forward_store descriptor"
+        );
+        assert!(
+            compacted_dir.join("forward_store.arrow").exists(),
+            "compacted segment should persist forward_store Arrow IPC artifact"
+        );
+        assert!(
+            compacted_dir.join("forward_store.parquet").exists(),
+            "compacted segment should persist forward_store Parquet artifact"
         );
     }
 

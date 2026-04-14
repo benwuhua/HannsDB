@@ -9,7 +9,7 @@ use crate::forward_store::{ForwardFileFormat, ForwardStoreDescriptor, ForwardSto
 use crate::segment::TombstoneMask;
 use crate::segment::{load_vectors, NormalizedStorageFormat, SegmentManager, SegmentMetadata};
 use crate::storage::segment_io::{
-    load_payloads_or_empty, load_records_or_empty, load_record_ids_or_empty, load_vectors_or_empty,
+    load_payloads_or_empty, load_primary_dense_rows_for_segment_or_empty, load_vectors_or_empty,
 };
 use crate::storage::paths::CollectionPaths;
 use crate::storage::wal::WalRecord;
@@ -260,12 +260,15 @@ fn persisted_collection_matches_delta(
 
     for segment in &segment_paths {
         let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-        let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let records = load_records_or_empty(
-            &segment.records,
+        let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+            segment,
+            &segment_meta,
+            &collection_meta.primary_vector,
             collection_meta.dimension,
             collection_meta.primary_is_fp16(),
         )?;
+        let stored_ids = dense_rows.external_ids;
+        let records = dense_rows.primary_vectors;
         let payloads = load_payloads_or_empty(segment, &segment_meta, stored_ids.len())?;
         let vectors = load_vectors_or_empty(
             segment,
@@ -361,12 +364,6 @@ fn segment_is_authoritative(
         return Ok(false);
     }
 
-    if segment_meta.record_count > 0
-        && (!segment.records.exists() || !segment.external_ids.exists())
-    {
-        return Ok(false);
-    }
-
     if segment_uses_forward_store_authority(segment_meta)
         && segment.forward_store_descriptor().exists()
     {
@@ -376,6 +373,12 @@ fn segment_is_authoritative(
         if reader.row_count() == segment_meta.record_count {
             return Ok(true);
         }
+    }
+
+    if segment_meta.record_count > 0
+        && (!segment.records.exists() || !segment.external_ids.exists())
+    {
+        return Ok(false);
     }
 
     if plan.requires_data_files && !segment.payloads.exists() && !segment.payloads_arrow.exists() {

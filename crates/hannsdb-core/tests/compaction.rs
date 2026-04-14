@@ -5,6 +5,7 @@ use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
 };
+use hannsdb_core::forward_store::{ForwardFileFormat, ForwardStoreDescriptor, ForwardStoreReader};
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, write_payloads_arrow, SegmentMetadata,
     SegmentSet, TombstoneMask,
@@ -68,6 +69,11 @@ fn write_segment(
 
 fn collection_segments_dir(root: &Path, collection: &str) -> std::path::PathBuf {
     root.join("collections").join(collection).join("segments")
+}
+
+fn load_forward_store_descriptor(path: &Path) -> ForwardStoreDescriptor {
+    serde_json::from_slice(&fs::read(path).expect("read persisted forward_store descriptor json"))
+        .expect("parse persisted forward_store descriptor")
 }
 
 #[test]
@@ -140,12 +146,42 @@ fn compaction_merges_multiple_immutable_segments_and_removes_old_dirs() {
             .expect("load compacted metadata");
     assert_eq!(compacted_meta.record_count, 4);
     assert_eq!(compacted_meta.deleted_count, 0);
+    assert_eq!(compacted_meta.storage_format, "forward_store");
+
+    let compacted_dir = segments_dir.join(compacted_id);
+    let descriptor = load_forward_store_descriptor(&compacted_dir.join("forward_store.json"));
+    assert_eq!(descriptor.row_count, 4);
+    assert!(
+        descriptor.artifact(ForwardFileFormat::ArrowIpc).is_some(),
+        "compacted segment should persist Arrow IPC forward_store artifact"
+    );
+    assert!(
+        descriptor.artifact(ForwardFileFormat::Parquet).is_some(),
+        "compacted segment should persist Parquet forward_store artifact"
+    );
+    let reader = ForwardStoreReader::open(&descriptor, ForwardFileFormat::Parquet)
+        .expect("open compacted forward_store parquet snapshot");
+    let latest_live_ids = reader
+        .latest_live_rows()
+        .into_iter()
+        .map(|row| row.internal_id as i64)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latest_live_ids,
+        vec![1, 2, 3, 4],
+        "compacted forward_store snapshot should preserve the immutable latest-live set"
+    );
 
     let hits = db
         .search("docs", &[0.0, 0.0], 10)
         .expect("search after compact");
     let hit_ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     assert_eq!(hit_ids, vec![1, 2, 3, 4, 10]);
+
+    let _ = fs::remove_file(compacted_dir.join("payloads.arrow"));
+    let _ = fs::remove_file(compacted_dir.join("vectors.arrow"));
+    let _ = fs::remove_file(compacted_dir.join("payloads.jsonl"));
+    let _ = fs::remove_file(compacted_dir.join("vectors.jsonl"));
 
     truncate_wal(&root.join("wal.jsonl")).expect("truncate wal before reopening manual fixture");
     let reopened = HannsDb::open(root).expect("reopen db after compact");
