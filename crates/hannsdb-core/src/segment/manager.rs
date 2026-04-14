@@ -120,6 +120,7 @@ impl SegmentManager {
         Ok(version_set
             .immutable_segment_ids()
             .iter()
+            .rev()
             .cloned()
             .map(|segment_id| {
                 SegmentPaths::from_segment_dir(self.segments_dir().join(&segment_id), segment_id)

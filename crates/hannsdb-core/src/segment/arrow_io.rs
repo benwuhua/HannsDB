@@ -49,8 +49,9 @@ pub fn write_payloads_arrow(
         return write_batch(path, &batch);
     }
 
-    let schema = build_payload_schema(field_schemas, &ad_hoc_names);
-    let batch = build_payload_batch(payloads, &schema, field_schemas, &ad_hoc_names)?;
+    let ad_hoc_specs = infer_ad_hoc_specs(payloads, &ad_hoc_names);
+    let schema = build_payload_schema(field_schemas, &ad_hoc_specs);
+    let batch = build_payload_batch(payloads, &schema, field_schemas, &ad_hoc_specs)?;
     write_batch(path, &batch)
 }
 
@@ -290,7 +291,90 @@ fn infer_segment_row_count_from_ids(arrow_path: &Path) -> io::Result<usize> {
     Ok(bytes.len() / 8)
 }
 
-fn build_payload_schema(field_schemas: &[ScalarFieldSchema], ad_hoc_names: &[String]) -> Schema {
+#[derive(Debug, Clone)]
+struct AdHocColumnSpec {
+    name: String,
+    data_type: Option<FieldType>,
+    array: bool,
+}
+
+fn infer_ad_hoc_specs(
+    payloads: &[BTreeMap<String, FieldValue>],
+    ad_hoc_names: &[String],
+) -> Vec<AdHocColumnSpec> {
+    ad_hoc_names
+        .iter()
+        .map(|name| {
+            let mut inferred: Option<(FieldType, bool)> = None;
+            let mut fallback_to_json = false;
+
+            for row in payloads {
+                let Some(value) = row.get(name) else {
+                    continue;
+                };
+                let Some(current) = infer_field_value_shape(value) else {
+                    fallback_to_json = true;
+                    break;
+                };
+                match &inferred {
+                    None => inferred = Some(current),
+                    Some(existing) if existing == &current => {}
+                    Some(_) => {
+                        fallback_to_json = true;
+                        break;
+                    }
+                }
+            }
+
+            let (data_type, array) = if fallback_to_json {
+                (None, false)
+            } else if let Some((data_type, array)) = inferred {
+                (Some(data_type), array)
+            } else {
+                (None, false)
+            };
+
+            AdHocColumnSpec {
+                name: name.clone(),
+                data_type,
+                array,
+            }
+        })
+        .collect()
+}
+
+fn infer_field_value_shape(value: &FieldValue) -> Option<(FieldType, bool)> {
+    match value {
+        FieldValue::String(_) => Some((FieldType::String, false)),
+        FieldValue::Int64(_) => Some((FieldType::Int64, false)),
+        FieldValue::Int32(_) => Some((FieldType::Int32, false)),
+        FieldValue::UInt32(_) => Some((FieldType::UInt32, false)),
+        FieldValue::UInt64(_) => Some((FieldType::UInt64, false)),
+        FieldValue::Float(_) => Some((FieldType::Float, false)),
+        FieldValue::Float64(_) => Some((FieldType::Float64, false)),
+        FieldValue::Bool(_) => Some((FieldType::Bool, false)),
+        FieldValue::Array(items) => {
+            let mut inferred: Option<FieldType> = None;
+            for item in items {
+                let (data_type, is_array) = infer_field_value_shape(item)?;
+                if is_array {
+                    return None;
+                }
+                match &inferred {
+                    None => inferred = Some(data_type),
+                    Some(existing) if existing == &data_type => {}
+                    Some(_) => return None,
+                }
+            }
+            inferred.map(|data_type| (data_type, true))
+        }
+    }
+}
+
+fn build_payload_schema(
+    field_schemas: &[ScalarFieldSchema],
+    ad_hoc_specs: &[AdHocColumnSpec],
+) -> Schema {
     let mut fields: Vec<Field> = field_schemas
         .iter()
         .map(|fs| {
@@ -301,8 +385,13 @@ fn build_payload_schema(field_schemas: &[ScalarFieldSchema], ad_hoc_names: &[Str
             }
         })
         .collect();
-    for name in ad_hoc_names {
-        fields.push(Field::new(name, DataType::Utf8, true));
+    for spec in ad_hoc_specs {
+        let data_type = match (&spec.data_type, spec.array) {
+            (Some(data_type), true) => field_type_to_arrow_list(data_type),
+            (Some(data_type), false) => field_type_to_arrow(data_type),
+            (None, _) => DataType::Utf8,
+        };
+        fields.push(Field::new(&spec.name, data_type, true));
     }
     Schema::new(fields)
 }
@@ -311,9 +400,9 @@ fn build_payload_batch(
     payloads: &[BTreeMap<String, FieldValue>],
     _schema: &Schema,
     field_schemas: &[ScalarFieldSchema],
-    ad_hoc_names: &[String],
+    ad_hoc_specs: &[AdHocColumnSpec],
 ) -> io::Result<RecordBatch> {
-    let schema = build_payload_schema(field_schemas, ad_hoc_names);
+    let schema = build_payload_schema(field_schemas, ad_hoc_specs);
     let num_rows = payloads.len();
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
@@ -325,15 +414,26 @@ fn build_payload_batch(
         };
         arrays.push(arr);
     }
-    for name in ad_hoc_names {
-        let mut builder = StringBuilder::new();
-        for row in payloads {
-            match row.get(name) {
-                Some(value) => builder.append_value(serde_json::to_string(value).unwrap()),
-                None => builder.append_null(),
+    for spec in ad_hoc_specs {
+        let array: ArrayRef = match (&spec.data_type, spec.array) {
+            (Some(data_type), true) => {
+                build_array_column(payloads, &spec.name, data_type, num_rows)
             }
-        }
-        arrays.push(Arc::new(builder.finish()));
+            (Some(data_type), false) => {
+                build_typed_column(payloads, &spec.name, data_type, num_rows)
+            }
+            (None, _) => {
+                let mut builder = StringBuilder::new();
+                for row in payloads {
+                    match row.get(&spec.name) {
+                        Some(value) => builder.append_value(serde_json::to_string(value).unwrap()),
+                        None => builder.append_null(),
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+        };
+        arrays.push(array);
     }
 
     RecordBatch::try_new(Arc::new(schema), arrays).map_err(arrow_to_io)

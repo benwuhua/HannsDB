@@ -118,6 +118,36 @@
 - filtered segment-aware query 路径里最后一处手写 `distance/id` 排序也已改为复用 `compare_hits`
 - 占位性质的 `IndexRegistry` 也已删除，`CollectionHandle` 不再额外挂一个未实际承载状态的 registry 壳
 - `CachedDocumentState` 这个单字段 wrapper 也已删除，document cache 现在直接缓存 `Arc<HashMap<i64, Document>>`
+
+### 12. rollover 之后的 active write 路径修复
+- 这一步继续补 storage/runtime maturity，而不是扩新的 public surface
+- 之前 multi-segment 读路径已经是 segment-aware，但部分写路径仍然会在 `segment_set.json` 存在后继续盯着 collection 根目录文件
+- 现在：
+  - `insert`
+  - `insert_documents`
+  - `upsert_documents`
+  都会在进入 multi-segment 模式后，改为通过 `SegmentManager::active_segment_path()` 追加到真正的 active segment
+- live-id / duplicate-id 检查也不再只看 root-level `ids.bin`，而是按 collection 的 live view 做跨 segment 判断
+- 新增回归测试覆盖：
+  - rollover 之后的新写入确实落在 active segment
+  - reopen 之后仍可读到 post-rollover 新写入
+  - rollover 之后对旧 live id 的重复插入会被拒绝
+
+### 13. active-segment mutation authority 收拢
+- 这一轮继续往 storage/runtime orchestration 靠拢，不再让 `db.rs` 自己重复实现 append/rollover/sealing mechanics
+- 当前 authority split 明确为：
+  - `SegmentWriter`：active segment append、首轮 rollover 迁移、旧 active sealing（`JSONL -> Arrow`）
+  - `VersionSet` / `SegmentManager`：segment topology 与 active/immutable path authority
+  - `db.rs`：WAL、duplicate/live-view policy、ANN invalidation、compaction policy
+- 这意味着：
+  - `insert`
+  - `insert_documents`
+  - `upsert_documents`
+  已改为通过统一的 writer-owned mutation path 落盘，而不是继续各自在 `db.rs` 里维护一份 append/rollover 细节
+- 同时补了两类额外回归：
+  - post-rollover `update_documents` 仍会把最新 live row 追加到 active segment
+  - post-rollover `delete` 仍保持 latest-live 语义，但没有把 delete 逻辑错误地收进 writer authority
+- 为避免 ad-hoc payload 在 sealed Arrow segment 中退化成 JSON 字符串，本轮也补了 Arrow payload ad-hoc field 的类型推断；常见 scalar/bool/array ad-hoc 字段在 rollover/reopen 后保持原始语义
 - 未被使用的 `CollectionHandle::name()` accessor 也已删掉，避免再保留无调用的薄包装 API
 - `FieldValue` 排序比较逻辑也已收拢到 `document.rs`，`query::executor` 不再内联维护那段 match 细节
 - `CollectionHandle` 不再单独保存 `root`; collection path / wal path 现在直接从 `segment_manager.collection_dir()` 推导，减少一份重复状态

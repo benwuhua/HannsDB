@@ -34,10 +34,9 @@ use crate::segment::index_runtime::{
     CachedSearchState,
 };
 use crate::segment::{
-    append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
-    append_vectors, ensure_payload_rows, ensure_vector_rows, load_payloads_jsonl, load_record_ids,
-    load_records, load_records_f16, load_vectors_jsonl, write_payloads_arrow, write_vectors_arrow,
-    SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask, VersionSet,
+    append_record_ids, append_records, append_records_f16, load_record_ids, load_records,
+    load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentManager, SegmentMetadata,
+    SegmentPaths, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
 };
 use crate::storage::paths::{
     collection_paths_for_dir, collection_paths_for_root, manifest_path, wal_path, CollectionPaths,
@@ -48,11 +47,11 @@ use crate::storage::primary_keys::{
 };
 use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
 use crate::storage::segment_io::{
-    append_documents, has_live_id, latest_row_index_for_id, load_payloads_or_empty,
+    latest_live_row_index, latest_row_index_for_id, load_payloads_or_empty,
     load_payloads_with_fields_or_empty, load_record_ids_or_empty, load_records_or_empty,
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
-    load_vectors_or_empty, mark_live_id_deleted, materialize_active_segment_arrow_snapshots,
-    next_compacted_segment_id, persisted_ann_exists,
+    load_vectors_or_empty, materialize_active_segment_arrow_snapshots, next_compacted_segment_id,
+    persisted_ann_exists,
 };
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
@@ -782,8 +781,6 @@ impl HannsDb {
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
 
         if collection_meta.dimension == 0 {
             return Err(io::Error::new(
@@ -816,15 +813,12 @@ impl HannsDb {
             }
         }
 
-        let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        let existing_set: HashSet<i64> = existing_ids.into_iter().collect();
-        for external_id in external_ids {
-            if existing_set.contains(external_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("external id already exists: {external_id}"),
-                ));
-            }
+        let existing_live = self.fetch_documents(collection, external_ids)?;
+        if let Some(existing) = existing_live.first() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("external id already exists: {}", existing.id),
+            ));
         }
 
         if log_wal {
@@ -838,33 +832,23 @@ impl HannsDb {
             )?;
         }
 
-        ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        ensure_vector_rows(&paths.vectors, segment_meta.record_count)?;
-        let fp16 = collection_meta.primary_is_fp16();
-        let inserted = if fp16 {
-            append_records_f16(&paths.records, collection_meta.dimension, vectors)?
-        } else {
-            append_records(&paths.records, collection_meta.dimension, vectors)?
-        };
-        let _ = append_record_ids(&paths.external_ids, external_ids)?;
-        let empty_payloads = vec![BTreeMap::new(); inserted];
-        let empty_vectors = vec![BTreeMap::new(); inserted];
-        let empty_sparse = vec![BTreeMap::new(); inserted];
-        let _ = append_payloads(&paths.payloads, &empty_payloads)?;
-        let _ = append_vectors(&paths.vectors, &empty_vectors)?;
-        let _ = append_sparse_vectors(&paths.sparse_vectors, &empty_sparse)?;
-        segment_meta.record_count += inserted;
-        segment_meta.deleted_count = tombstone.deleted_count();
-
-        let needed = segment_meta.record_count.saturating_sub(tombstone.len());
-        if needed > 0 {
-            tombstone.extend(needed);
-        }
-
-        segment_meta.save_to_path(&paths.segment_meta)?;
-        tombstone.save_to_path(&paths.tombstones)?;
+        let batch_len = external_ids.len();
+        let empty_payloads = vec![BTreeMap::new(); batch_len];
+        let empty_vectors = vec![BTreeMap::new(); batch_len];
+        let empty_sparse = vec![BTreeMap::new(); batch_len];
+        let writer = self.segment_writer(&paths);
+        let inserted = writer
+            .append_records(
+                collection_meta.dimension,
+                external_ids,
+                vectors,
+                &empty_payloads,
+                &empty_vectors,
+                &empty_sparse,
+                collection_meta.primary_is_fp16(),
+            )?
+            .inserted;
         invalidate_ann_blobs(&paths.dir)?;
-        self.maybe_trigger_segment_rollover(&paths, &segment_meta)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
         }
@@ -924,19 +908,19 @@ impl HannsDb {
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
 
         validate_documents(documents, &collection_meta)?;
 
-        let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
-        for document in documents {
-            if has_live_id(&existing_ids, &tombstone, document.id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("external id already exists: {}", document.id),
-                ));
-            }
+        let requested_ids = documents
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        let existing_live = self.fetch_documents(collection, &requested_ids)?;
+        if let Some(existing) = existing_live.first() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("external id already exists: {}", existing.id),
+            ));
         }
 
         if log_wal {
@@ -949,25 +933,10 @@ impl HannsDb {
             )?;
         }
 
-        ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted = append_documents(
-            &paths,
-            collection_meta.dimension,
-            segment_meta.record_count,
-            &collection_meta.primary_vector,
-            documents,
-            collection_meta.primary_is_fp16(),
-        )?;
-        segment_meta.record_count += inserted;
-        segment_meta.deleted_count = tombstone.deleted_count();
-
-        let needed = segment_meta.record_count.saturating_sub(tombstone.len());
-        if needed > 0 {
-            tombstone.extend(needed);
-        }
-
-        segment_meta.save_to_path(&paths.segment_meta)?;
-        tombstone.save_to_path(&paths.tombstones)?;
+        let writer = self.segment_writer(&paths);
+        let inserted = writer
+            .append_documents(&collection_meta, documents)?
+            .inserted;
         invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
@@ -993,9 +962,6 @@ impl HannsDb {
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
-        let mut segment_meta = SegmentMetadata::load_from_path(&paths.segment_meta)?;
-        let mut tombstone = TombstoneMask::load_from_path(&paths.tombstones)?;
-        let existing_ids = load_record_ids_or_empty(&paths.external_ids)?;
 
         validate_documents(documents, &collection_meta)?;
 
@@ -1009,34 +975,16 @@ impl HannsDb {
             )?;
         }
 
-        for document in documents {
-            mark_live_id_deleted(
-                &existing_ids,
-                &mut tombstone,
-                document.id,
-                segment_meta.record_count,
-            );
-        }
+        let document_ids = documents
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        self.mark_live_ids_deleted_across_segments(&paths, &document_ids)?;
 
-        ensure_payload_rows(&paths.payloads, segment_meta.record_count)?;
-        let inserted = append_documents(
-            &paths,
-            collection_meta.dimension,
-            segment_meta.record_count,
-            &collection_meta.primary_vector,
-            documents,
-            collection_meta.primary_is_fp16(),
-        )?;
-        segment_meta.record_count += inserted;
-        segment_meta.deleted_count = tombstone.deleted_count();
-
-        let needed = segment_meta.record_count.saturating_sub(tombstone.len());
-        if needed > 0 {
-            tombstone.extend(needed);
-        }
-
-        segment_meta.save_to_path(&paths.segment_meta)?;
-        tombstone.save_to_path(&paths.tombstones)?;
+        let writer = self.segment_writer(&paths);
+        let inserted = writer
+            .append_documents(&collection_meta, documents)?
+            .inserted;
         invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
@@ -1399,6 +1347,60 @@ impl HannsDb {
         collection_paths_for_root(&self.root, name)
     }
 
+    fn segment_writer(&self, paths: &CollectionPaths) -> SegmentWriter {
+        SegmentWriter::new(paths.dir.clone(), SegmentManager::new(paths.dir.clone()))
+    }
+
+    fn mark_live_ids_deleted_across_segments(
+        &self,
+        paths: &CollectionPaths,
+        external_ids: &[i64],
+    ) -> io::Result<()> {
+        if external_ids.is_empty() {
+            return Ok(());
+        }
+
+        let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
+        let mut remaining_ids = external_ids.iter().copied().collect::<HashSet<_>>();
+
+        for segment in segment_paths {
+            if remaining_ids.is_empty() {
+                break;
+            }
+
+            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            if stored_ids.is_empty() {
+                continue;
+            }
+
+            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+            let mut segment_changed = false;
+            let row_limit = segment_meta.record_count.min(stored_ids.len());
+            let stored_ids = &stored_ids[..row_limit];
+            let ids_to_check = remaining_ids.iter().copied().collect::<Vec<_>>();
+
+            for external_id in ids_to_check {
+                let Some(row_idx) = latest_live_row_index(stored_ids, &tombstone, external_id)
+                else {
+                    continue;
+                };
+                remaining_ids.remove(&external_id);
+                if tombstone.mark_deleted(row_idx) {
+                    segment_changed = true;
+                }
+            }
+
+            if segment_changed {
+                segment_meta.deleted_count = tombstone.deleted_count();
+                segment_meta.save_to_path(&segment.metadata)?;
+                tombstone.save_to_path(&segment.tombstones)?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn should_auto_compact(&self, collection: &str) -> io::Result<bool> {
         let paths = self.collection_paths(collection);
         if !paths.segment_set.exists() {
@@ -1422,119 +1424,6 @@ impl HannsDb {
             let _ = handle.refresh_version_set();
             handle.invalidate_search_cache();
         }
-    }
-
-    fn maybe_trigger_segment_rollover(
-        &self,
-        paths: &CollectionPaths,
-        segment_meta: &SegmentMetadata,
-    ) -> io::Result<()> {
-        if !SegmentSet::should_rollover(
-            segment_meta.record_count as u64,
-            segment_meta.deleted_count as u64,
-        ) {
-            return Ok(());
-        }
-
-        let mut version_set = if paths.segment_set.exists() {
-            VersionSet::load_from_path(&paths.segment_set)?
-        } else {
-            VersionSet::single(&segment_meta.segment_id)
-        };
-
-        let new_id = version_set.rollover();
-
-        // If no segment_set.json exists, migrate root-level files into segments/
-        let old_seg_dir = if !paths.segment_set.exists() {
-            let segments_dir = paths.segments_dir.clone();
-            let old_dir = segments_dir.join(&segment_meta.segment_id);
-            fs::create_dir_all(&segments_dir)?;
-            fs::create_dir_all(&old_dir)?;
-
-            let files_to_move = [
-                "segment.json",
-                "records.bin",
-                "ids.bin",
-                "payloads.jsonl",
-                "vectors.jsonl",
-                "tombstones.json",
-            ];
-            for file_name in &files_to_move {
-                let src = paths.dir.join(file_name);
-                if src.exists() {
-                    fs::rename(&src, old_dir.join(file_name))?;
-                }
-            }
-            old_dir
-        } else {
-            paths.segments_dir.join(&segment_meta.segment_id)
-        };
-
-        // Convert JSONL → Arrow IPC for the now-immutable segment.
-        if let Err(e) = Self::convert_segment_jsonl_to_arrow(&old_seg_dir, &paths.dir) {
-            log::warn!(
-                "JSONL→Arrow conversion failed for {}, keeping JSONL: {}",
-                segment_meta.segment_id,
-                e
-            );
-        }
-
-        // Create the new active segment directory
-        let seg_manager = SegmentManager::new(paths.dir.clone());
-        seg_manager.create_segment_dir(&new_id, segment_meta.dimension)?;
-
-        // Persist the updated version set
-        version_set.save_to_path(&paths.segment_set)?;
-
-        log::info!("Segment rollover: {} → {}", segment_meta.segment_id, new_id);
-
-        Ok(())
-    }
-
-    /// Convert JSONL files to Arrow IPC for an immutable segment directory.
-    fn convert_segment_jsonl_to_arrow(
-        seg_dir: &std::path::Path,
-        collection_dir: &std::path::Path,
-    ) -> io::Result<()> {
-        let collection_meta_path = collection_dir.join("collection.json");
-        if !collection_meta_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "collection.json not found",
-            ));
-        }
-        let collection_meta = CollectionMetadata::load_from_path(&collection_meta_path)?;
-
-        let jsonl_payloads = seg_dir.join("payloads.jsonl");
-        let jsonl_vectors = seg_dir.join("vectors.jsonl");
-        let arrow_payloads = seg_dir.join("payloads.arrow");
-        let arrow_vectors = seg_dir.join("vectors.arrow");
-
-        if jsonl_payloads.exists() {
-            let payloads = load_payloads_jsonl(&jsonl_payloads)?;
-            write_payloads_arrow(&arrow_payloads, &payloads, &collection_meta.fields)?;
-            let _ = fs::remove_file(&jsonl_payloads);
-        }
-
-        if jsonl_vectors.exists() {
-            let vectors = load_vectors_jsonl(&jsonl_vectors)?;
-            write_vectors_arrow(
-                &arrow_vectors,
-                &vectors,
-                &collection_meta.vectors,
-                &collection_meta.primary_vector,
-            )?;
-            let _ = fs::remove_file(&jsonl_vectors);
-        }
-
-        let meta_path = seg_dir.join("segment.json");
-        if meta_path.exists() {
-            let mut meta = SegmentMetadata::load_from_path(&meta_path)?;
-            meta.storage_format = "arrow".to_string();
-            meta.save_to_path(&meta_path)?;
-        }
-
-        Ok(())
     }
 
     fn replay_wal_if_needed(&mut self) -> io::Result<()> {

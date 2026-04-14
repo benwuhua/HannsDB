@@ -3,13 +3,11 @@ use std::io;
 use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
-use crate::document::{Document, FieldValue, SparseVector};
+use crate::document::{FieldValue, SparseVector};
 use crate::segment::index_runtime::{ann_blob_path, HNSW_INDEX_FILE};
 use crate::segment::{
-    append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
-    append_vectors, ensure_vector_rows, load_payloads, load_payloads_jsonl,
-    load_payloads_with_fields, load_record_ids, load_records, load_records_f16,
-    load_sparse_vectors, load_vectors, load_vectors_jsonl, write_payloads_arrow,
+    load_payloads, load_payloads_jsonl, load_payloads_with_fields, load_record_ids, load_records,
+    load_records_f16, load_sparse_vectors, load_vectors, load_vectors_jsonl, write_payloads_arrow,
     write_vectors_arrow, SegmentManager, TombstoneMask,
 };
 use crate::storage::paths::CollectionPaths;
@@ -168,51 +166,6 @@ pub(crate) fn load_sparse_vectors_or_empty(
     }
 }
 
-pub(crate) fn append_documents(
-    paths: &CollectionPaths,
-    dimension: usize,
-    existing_rows: usize,
-    primary_vector_name: &str,
-    documents: &[Document],
-    fp16: bool,
-) -> io::Result<usize> {
-    ensure_vector_rows(&paths.vectors, existing_rows)?;
-    let mut ids = Vec::with_capacity(documents.len());
-    let mut records = Vec::with_capacity(documents.len().saturating_mul(dimension));
-    let mut payloads = Vec::with_capacity(documents.len());
-    let mut vectors = Vec::with_capacity(documents.len());
-    let mut sparse_vecs = Vec::with_capacity(documents.len());
-    for document in documents {
-        ids.push(document.id);
-        let primary = document.vectors.get(primary_vector_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "document {} is missing primary vector '{}'",
-                    document.id, primary_vector_name
-                ),
-            )
-        })?;
-        records.extend_from_slice(primary);
-        payloads.push(document.fields.clone());
-        let mut secondary = document.vectors.clone();
-        secondary.remove(primary_vector_name);
-        vectors.push(secondary);
-        sparse_vecs.push(document.sparse_vectors.clone());
-    }
-
-    let inserted = if fp16 {
-        append_records_f16(&paths.records, dimension, &records)?
-    } else {
-        append_records(&paths.records, dimension, &records)?
-    };
-    let _ = append_record_ids(&paths.external_ids, &ids)?;
-    let _ = append_payloads(&paths.payloads, &payloads)?;
-    let _ = append_vectors(&paths.vectors, &vectors)?;
-    let _ = append_sparse_vectors(&paths.sparse_vectors, &sparse_vecs)?;
-    Ok(inserted)
-}
-
 pub(crate) fn load_shadowed_live_records(
     segment_manager: &SegmentManager,
     dimension: usize,
@@ -320,10 +273,6 @@ pub(crate) fn load_all_collection_ids(paths: &CollectionPaths) -> io::Result<Vec
     Ok(all_ids)
 }
 
-pub(crate) fn has_live_id(stored_ids: &[i64], tombstone: &TombstoneMask, external_id: i64) -> bool {
-    latest_live_row_index(stored_ids, tombstone, external_id).is_some()
-}
-
 pub(crate) fn latest_live_row_index(
     stored_ids: &[i64],
     tombstone: &TombstoneMask,
@@ -339,19 +288,6 @@ pub(crate) fn latest_row_index_for_id(stored_ids: &[i64], external_id: i64) -> O
         .enumerate()
         .rev()
         .find_map(|(row_idx, stored_id)| (*stored_id == external_id).then_some(row_idx))
-}
-
-pub(crate) fn mark_live_id_deleted(
-    stored_ids: &[i64],
-    tombstone: &mut TombstoneMask,
-    external_id: i64,
-    row_limit: usize,
-) {
-    for (row_idx, stored_id) in stored_ids.iter().enumerate().take(row_limit) {
-        if *stored_id == external_id {
-            let _ = tombstone.mark_deleted(row_idx);
-        }
-    }
 }
 
 pub(crate) fn next_compacted_segment_id<'a>(

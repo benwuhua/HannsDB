@@ -64,6 +64,8 @@
   - 2026-04-13: `CollectionHandle` shed duplicated derived state (`root`, `name`) and several placeholder/wrapper layers, so the remaining work is increasingly about durable semantics instead of code-organization debt
 - [ ] Multi-segment management
   - 2026-04-13: no longer truly "not started" — rollover rules, segment-set layout, multi-segment reads, and segment-aware reopen/search coverage are already green; remaining work is broader operational hardening and story completion
+  - 2026-04-14: active write routing after rollover is now also segment-aware for `insert` / `insert_documents` / `upsert_documents`; the next remaining storage-story work is less about basic correctness and more about deeper forward-store / runtime orchestration maturity
+  - 2026-04-14: active-segment mutation authority is now explicitly split: `SegmentWriter` owns append/rollover/sealing mechanics, `VersionSet` / `SegmentManager` own topology, and `db.rs` keeps WAL / mutation policy / ANN invalidation / compaction triggering
 - [ ] Compaction/rebuild workflow
   - 2026-04-13: no longer truly "not started" — compaction merge behavior, tombstone filtering, reopen coverage, and daemon/admin hooks exist; remaining work is turning the implemented path into a more complete production workflow story
 

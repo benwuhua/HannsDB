@@ -66,6 +66,45 @@ fn collection_dir(root: &Path, name: &str) -> std::path::PathBuf {
     root.join("collections").join(name)
 }
 
+fn storage_dir_with_file(root: &Path, name: &str, file_name: &str) -> std::path::PathBuf {
+    let collection_dir = collection_dir(root, name);
+    let root_candidate = collection_dir.join(file_name);
+    if root_candidate.exists() {
+        return collection_dir;
+    }
+
+    let segment_set_path = collection_dir.join("segment_set.json");
+    if segment_set_path.exists() {
+        let segment_set = SegmentSet::load_from_path(&segment_set_path)
+            .expect("load segment_set for file lookup");
+        let candidates = segment_set
+            .immutable_segment_ids
+            .iter()
+            .rev()
+            .cloned()
+            .chain(std::iter::once(segment_set.active_segment_id));
+        for segment_id in candidates {
+            let dir = collection_dir.join("segments").join(&segment_id);
+            if dir.join(file_name).exists() {
+                return dir;
+            }
+        }
+    }
+
+    collection_dir
+}
+
+fn storage_file_path(root: &Path, name: &str, file_names: &[&str]) -> std::path::PathBuf {
+    for file_name in file_names {
+        let dir = storage_dir_with_file(root, name, file_name);
+        let path = dir.join(file_name);
+        if path.exists() {
+            return path;
+        }
+    }
+    storage_dir_with_file(root, name, file_names[0]).join(file_names[0])
+}
+
 fn rewrite_collection_to_two_segment_layout(
     root: &Path,
     collection: &str,
@@ -480,8 +519,9 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
     assert_eq!(live[0].fields.get("active"), Some(&FieldValue::Bool(false)));
     drop(db);
 
-    let collection_dir = collection_dir(temp.path(), "docs");
-    fs::remove_file(collection_dir.join("payloads.jsonl")).expect("remove payloads");
+    let payload_path =
+        storage_file_path(temp.path(), "docs", &["payloads.jsonl", "payloads.arrow"]);
+    fs::remove_file(&payload_path).expect("remove payloads");
 
     let reopened = HannsDb::open(temp.path()).expect("reopen should replay wal");
     let info = reopened
@@ -510,8 +550,8 @@ fn wal_recovery_open_replays_wal_owned_collection_when_payloads_are_missing() {
         Some(&FieldValue::Bool(false))
     );
     assert!(
-        collection_dir.join("payloads.jsonl").exists(),
-        "payloads file should be recreated by replay"
+        storage_file_path(temp.path(), "docs", &["payloads.jsonl", "payloads.arrow"]).exists(),
+        "payload file should be recreated by replay"
     );
 }
 
@@ -554,10 +594,9 @@ fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view()
     );
     drop(db);
 
-    let collection_dir = collection_dir(temp.path(), "docs");
-    fs::remove_file(collection_dir.join("records.bin")).expect("remove records");
-    fs::write(collection_dir.join("stale.tmp"), b"stale partial storage")
-        .expect("write stale file");
+    let records_dir = storage_dir_with_file(temp.path(), "docs", "records.bin");
+    fs::remove_file(records_dir.join("records.bin")).expect("remove records");
+    fs::write(records_dir.join("stale.tmp"), b"stale partial storage").expect("write stale file");
 
     let reopened = HannsDb::open(temp.path()).expect("reopen should replay wal");
     let info = reopened
@@ -586,12 +625,67 @@ fn wal_recovery_open_replays_stale_partial_files_and_restores_latest_live_view()
         Some(&FieldValue::Bool(true))
     );
     assert!(
-        !collection_dir.join("stale.tmp").exists(),
+        !storage_dir_with_file(temp.path(), "docs", "records.bin")
+            .join("stale.tmp")
+            .exists(),
         "stale files should be removed when the collection is replayed"
     );
     assert!(
-        collection_dir.join("records.bin").exists(),
+        storage_dir_with_file(temp.path(), "docs", "records.bin")
+            .join("records.bin")
+            .exists(),
         "records file should be recreated by replay"
+    );
+}
+
+#[test]
+fn wal_recovery_replays_segmented_post_rollover_latest_live_view() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut db = HannsDb::open(temp.path()).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let documents = ids
+        .iter()
+        .map(|id| custom_document(*id, "s1", *id, true, vec![*id as f32, 0.0]))
+        .collect::<Vec<_>>();
+    db.insert_documents("docs", &documents)
+        .expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert_documents(
+        "docs",
+        &[custom_document(200, "s2", 200, true, vec![0.0, 0.0])],
+    )
+    .expect("trigger rollover");
+    db.insert_documents(
+        "docs",
+        &[custom_document(201, "s3", 201, false, vec![0.1, 0.1])],
+    )
+    .expect("insert after rollover");
+    drop(db);
+
+    let active_records =
+        storage_dir_with_file(temp.path(), "docs", "records.bin").join("records.bin");
+    fs::remove_file(&active_records).expect("remove active records to force replay");
+
+    let reopened = HannsDb::open(temp.path()).expect("reopen should replay segmented rollover");
+    let fetched = reopened
+        .fetch_documents("docs", &[200, 201])
+        .expect("fetch replayed post-rollover docs");
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![200, 201]);
+    assert_eq!(
+        fetched[0].fields.get("session_id"),
+        Some(&FieldValue::String("s2".into()))
+    );
+    assert_eq!(
+        fetched[1].fields.get("session_id"),
+        Some(&FieldValue::String("s3".into()))
     );
 }
 

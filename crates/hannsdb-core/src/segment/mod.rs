@@ -25,7 +25,7 @@ pub use records::{
     load_records_f16,
 };
 pub use segment_set::SegmentSet;
-pub use sparse::{append_sparse_vectors, load_sparse_vectors};
+pub use sparse::{append_sparse_vectors, ensure_sparse_rows, load_sparse_vectors};
 pub use tombstone::TombstoneMask;
 pub use vectors::{append_vectors, ensure_vector_rows, load_vectors, load_vectors_jsonl};
 pub use version_set::{atomic_write, VersionSet};

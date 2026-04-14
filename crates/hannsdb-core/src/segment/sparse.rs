@@ -40,6 +40,27 @@ pub fn load_sparse_vectors(path: &Path) -> io::Result<Vec<BTreeMap<String, Spars
     Ok(vectors)
 }
 
+pub fn ensure_sparse_rows(path: &Path, existing_rows: usize) -> io::Result<()> {
+    match super::payloads::count_jsonl_lines(path) {
+        Ok(count) => {
+            if count != existing_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sparse vector row count is misaligned with existing records",
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if existing_rows > 0 {
+                let _ = append_sparse_vectors(path, &vec![BTreeMap::new(); existing_rows])?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn json_to_io_error(err: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
 }

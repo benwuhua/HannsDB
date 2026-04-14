@@ -13,7 +13,8 @@ use hannsdb_core::document::{
 };
 use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery, VectorQueryParam};
 use hannsdb_core::segment::{
-    append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
+    append_payloads, append_record_ids, append_records, load_record_ids, SegmentMetadata,
+    SegmentSet, TombstoneMask,
 };
 use hannsdb_core::wal::{append_wal_record, WalRecord};
 use hannsdb_index::descriptor::{
@@ -417,6 +418,39 @@ fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layou
         collection_dir.join("segments").exists(),
         "auto-rollover should create segments/ directory"
     );
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let sealed_segment_id = version_set
+        .immutable_segment_ids
+        .first()
+        .expect("first rollover should create one immutable segment");
+    assert!(
+        collection_dir
+            .join("segments")
+            .join(sealed_segment_id)
+            .join("vectors.arrow")
+            .exists(),
+        "first rollover should seal the previous active segment into vectors.arrow"
+    );
+    let sealed_meta = SegmentMetadata::load_from_path(
+        &collection_dir
+            .join("segments")
+            .join(sealed_segment_id)
+            .join("segment.json"),
+    )
+    .expect("load sealed seg-000001 metadata");
+    assert_eq!(
+        sealed_meta.storage_format, "arrow",
+        "first rollover should mark the previous active segment as arrow-backed"
+    );
+    assert!(
+        !collection_dir.join("payloads.jsonl").exists(),
+        "first rollover should migrate root-level payloads.jsonl into segmented layout"
+    );
+    assert!(
+        !collection_dir.join("vectors.jsonl").exists(),
+        "first rollover should migrate root-level vectors.jsonl into segmented layout"
+    );
 
     let info = db.get_collection_info("docs").expect("collection info");
     assert_eq!(info.record_count, 101);
@@ -444,6 +478,154 @@ fn collection_api_rollover_eligible_sequence_keeps_follow_up_reads_on_flat_layou
         .map(|document| document.id)
         .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![21, 22, 200]);
+}
+
+#[test]
+fn collection_api_post_rollover_insert_lands_in_active_segment_and_survives_reopen() {
+    let root = unique_temp_dir("hannsdb_collection_api_post_rollover_insert");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let active_segment_id = version_set.active_segment_id.clone();
+    let active_segment_ids_path = collection_dir
+        .join("segments")
+        .join(&active_segment_id)
+        .join("ids.bin");
+
+    db.insert("docs", &[201], &[0.0_f32, 0.0])
+        .expect("insert after rollover");
+
+    let active_segment_ids =
+        load_record_ids(&active_segment_ids_path).expect("load active segment ids after insert");
+    assert!(
+        active_segment_ids.contains(&201),
+        "post-rollover write must land in the active segment, got {active_segment_ids:?}"
+    );
+
+    let reopened = HannsDb::open(&root).expect("reopen after post-rollover insert");
+    let fetched = reopened
+        .fetch_documents("docs", &[200, 201])
+        .expect("fetch post-rollover docs after reopen");
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![200, 201]);
+}
+
+#[test]
+fn collection_api_post_rollover_duplicate_id_is_rejected_across_segments() {
+    let root = unique_temp_dir("hannsdb_collection_api_post_rollover_duplicate");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+
+    let err = db
+        .insert("docs", &[21], &[21.0_f32, 0.0])
+        .expect_err("duplicate live id across segments must be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("external id already exists"),
+        "unexpected duplicate-id error: {err}"
+    );
+}
+
+#[test]
+fn collection_api_post_rollover_update_writes_latest_live_row_into_active_segment() {
+    let root = unique_temp_dir("hannsdb_collection_api_post_rollover_update");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+
+    db.update_documents(
+        "docs",
+        &[DocumentUpdate {
+            id: 200,
+            fields: BTreeMap::new(),
+            vectors: BTreeMap::from([("vector".to_string(), Some(vec![0.5_f32, 0.5]))]),
+            sparse_vectors: BTreeMap::new(),
+        }],
+    )
+    .expect("update after rollover");
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let active_segment_id = version_set.active_segment_id.clone();
+    let active_segment_ids = load_record_ids(
+        &collection_dir
+            .join("segments")
+            .join(&active_segment_id)
+            .join("ids.bin"),
+    )
+    .expect("load active segment ids after update");
+    assert!(
+        active_segment_ids.contains(&200),
+        "post-rollover update should append the latest live row into the active segment"
+    );
+
+    let reopened = HannsDb::open(&root).expect("reopen after update");
+    let fetched = reopened
+        .fetch_documents("docs", &[200])
+        .expect("fetch updated doc after reopen");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].primary_vector(), &[0.5_f32, 0.5]);
+}
+
+#[test]
+fn collection_api_post_rollover_delete_keeps_writer_boundary_and_latest_live_view() {
+    let root = unique_temp_dir("hannsdb_collection_api_post_rollover_delete");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+
+    let deleted = db.delete("docs", &[200]).expect("delete post-rollover doc");
+    assert_eq!(deleted, 1);
+
+    let reopened = HannsDb::open(&root).expect("reopen after delete");
+    let fetched = reopened
+        .fetch_documents("docs", &[200])
+        .expect("fetch deleted doc after reopen");
+    assert!(
+        fetched.is_empty(),
+        "post-rollover delete should still remove the latest live row without changing writer authority"
+    );
 }
 
 #[test]

@@ -3,11 +3,13 @@ use std::io;
 use std::path::PathBuf;
 
 use super::{
-    append_payloads, append_record_ids, append_records, append_vectors, ensure_payload_rows,
-    ensure_vector_rows, load_payloads_jsonl, load_vectors_jsonl, write_payloads_arrow,
-    write_vectors_arrow, SegmentManager, SegmentMetadata, SegmentPaths, TombstoneMask, VersionSet,
+    append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
+    append_vectors, ensure_payload_rows, ensure_sparse_rows, ensure_vector_rows,
+    load_payloads_jsonl, load_vectors_jsonl, write_payloads_arrow, write_vectors_arrow,
+    SegmentManager, SegmentMetadata, SegmentPaths, TombstoneMask, VersionSet,
 };
 use crate::catalog::CollectionMetadata;
+use crate::document::{Document, FieldValue};
 
 /// Manages writes to the active segment of a collection, including
 /// auto-rollover when the segment exceeds size or tombstone thresholds.
@@ -51,26 +53,33 @@ impl SegmentWriter {
         }
     }
 
-    /// Append raw vectors and IDs to the active segment.
-    pub fn append_records(
+    fn append_batch(
         &self,
         dimension: usize,
         external_ids: &[i64],
-        vectors: &[f32],
-        payloads: &[BTreeMap<String, crate::document::FieldValue>],
+        records: &[f32],
+        payloads: &[BTreeMap<String, FieldValue>],
         vector_rows: &[BTreeMap<String, Vec<f32>>],
+        sparse_rows: &[BTreeMap<String, crate::document::SparseVector>],
+        fp16: bool,
     ) -> io::Result<AppendResult> {
         let mut active = self.active_paths()?;
 
         ensure_payload_rows(&active.paths.payloads, active.meta.record_count)?;
         ensure_vector_rows(&active.paths.vectors, active.meta.record_count)?;
+        ensure_sparse_rows(&active.paths.sparse_vectors, active.meta.record_count)?;
 
         let mut tombstone = TombstoneMask::load_from_path(&active.paths.tombstones)?;
 
-        let inserted = append_records(&active.paths.records, dimension, vectors)?;
+        let inserted = if fp16 {
+            append_records_f16(&active.paths.records, dimension, records)?
+        } else {
+            append_records(&active.paths.records, dimension, records)?
+        };
         let _ = append_record_ids(&active.paths.external_ids, external_ids)?;
         let _ = append_payloads(&active.paths.payloads, payloads)?;
         let _ = append_vectors(&active.paths.vectors, vector_rows)?;
+        let _ = append_sparse_vectors(&active.paths.sparse_vectors, sparse_rows)?;
 
         active.meta.record_count += inserted;
         active.meta.deleted_count = tombstone.deleted_count();
@@ -94,6 +103,73 @@ impl SegmentWriter {
             inserted,
             rolled_over,
         })
+    }
+
+    /// Append raw vectors and IDs to the active segment.
+    pub fn append_records(
+        &self,
+        dimension: usize,
+        external_ids: &[i64],
+        vectors: &[f32],
+        payloads: &[BTreeMap<String, FieldValue>],
+        vector_rows: &[BTreeMap<String, Vec<f32>>],
+        sparse_rows: &[BTreeMap<String, crate::document::SparseVector>],
+        fp16: bool,
+    ) -> io::Result<AppendResult> {
+        self.append_batch(
+            dimension,
+            external_ids,
+            vectors,
+            payloads,
+            vector_rows,
+            sparse_rows,
+            fp16,
+        )
+    }
+
+    pub fn append_documents(
+        &self,
+        collection_meta: &CollectionMetadata,
+        documents: &[Document],
+    ) -> io::Result<AppendResult> {
+        let mut ids = Vec::with_capacity(documents.len());
+        let mut records =
+            Vec::with_capacity(documents.len().saturating_mul(collection_meta.dimension));
+        let mut payloads = Vec::with_capacity(documents.len());
+        let mut vectors = Vec::with_capacity(documents.len());
+        let mut sparse_rows = Vec::with_capacity(documents.len());
+
+        for document in documents {
+            ids.push(document.id);
+            let primary = document
+                .vectors
+                .get(collection_meta.primary_vector.as_str())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "document {} is missing primary vector '{}'",
+                            document.id, collection_meta.primary_vector
+                        ),
+                    )
+                })?;
+            records.extend_from_slice(primary);
+            payloads.push(document.fields.clone());
+            let mut secondary = document.vectors.clone();
+            secondary.remove(collection_meta.primary_vector.as_str());
+            vectors.push(secondary);
+            sparse_rows.push(document.sparse_vectors.clone());
+        }
+
+        self.append_batch(
+            collection_meta.dimension,
+            &ids,
+            &records,
+            &payloads,
+            &vectors,
+            &sparse_rows,
+            collection_meta.primary_is_fp16(),
+        )
     }
 
     /// Update tombstone count and save. Used by upsert (which tombstones
@@ -121,10 +197,11 @@ impl SegmentWriter {
 
         // If this was a legacy single-segment layout, we need to migrate
         // the root-level files into segments/seg-000001/.
-        if !active.multi_segment {
+        let old_dir = if !active.multi_segment {
             let segments_dir = self.segment_manager.segments_dir();
             let old_seg_dir = segments_dir.join(&active.paths.segment_id);
             std::fs::create_dir_all(&segments_dir)?;
+            std::fs::create_dir_all(&old_seg_dir)?;
 
             // Move root-level segment files into segments/<old_id>/
             let files_to_move = [
@@ -133,20 +210,22 @@ impl SegmentWriter {
                 "ids.bin",
                 "payloads.jsonl",
                 "vectors.jsonl",
+                "sparse_vectors.jsonl",
                 "tombstones.json",
             ];
             for file_name in &files_to_move {
                 let src = self.collection_dir.join(file_name);
                 if src.exists() {
                     let dst = old_seg_dir.join(file_name);
-                    std::fs::create_dir_all(old_seg_dir.parent().unwrap())?;
                     std::fs::rename(&src, &dst)?;
                 }
             }
-        }
+            old_seg_dir
+        } else {
+            active.paths.dir.clone()
+        };
 
         // Convert JSONL → Arrow IPC for the now-immutable segment.
-        let old_dir = active.paths.dir.clone();
         if let Err(e) = self.convert_jsonl_to_arrow(&old_dir) {
             log::warn!(
                 "JSONL→Arrow conversion failed for {}, keeping JSONL: {}",

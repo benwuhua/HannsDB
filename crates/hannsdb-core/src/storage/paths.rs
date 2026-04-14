@@ -29,7 +29,6 @@ pub(crate) fn collection_paths_for_dir(dir: &Path) -> CollectionPaths {
         external_ids: dir.join("ids.bin"),
         payloads: dir.join("payloads.jsonl"),
         vectors: dir.join("vectors.jsonl"),
-        sparse_vectors: dir.join("sparse_vectors.jsonl"),
         tombstones: dir.join("tombstones.json"),
     }
 }
@@ -46,6 +45,5 @@ pub(crate) struct CollectionPaths {
     pub(crate) external_ids: PathBuf,
     pub(crate) payloads: PathBuf,
     pub(crate) vectors: PathBuf,
-    pub(crate) sparse_vectors: PathBuf,
     pub(crate) tombstones: PathBuf,
 }
