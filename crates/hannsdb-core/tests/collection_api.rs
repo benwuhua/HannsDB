@@ -1779,6 +1779,136 @@ fn collection_api_reopen_uses_immutable_forward_store_when_arrow_sidecars_are_mi
 }
 
 #[test]
+fn collection_api_query_documents_uses_forward_store_when_dense_sidecars_are_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_query_forward_store_dense_sidecars");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                10,
+                vec![("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                20,
+                vec![("group".to_string(), FieldValue::Int64(2))],
+                vec![2.0_f32, 2.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+    db.flush_collection("docs")
+        .expect("flush authoritative forward_store");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let hits = reopened
+        .query_documents("docs", &[0.0_f32, 0.0], 2, Some("group == 1"))
+        .expect("query should use forward_store-backed dense rows");
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![10]);
+}
+
+#[test]
+fn collection_api_stale_forward_store_does_not_hide_newer_payloads_jsonl() {
+    let root = unique_temp_dir("hannsdb_collection_api_stale_forward_store_payloads");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            10,
+            vec![("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0_f32, 0.0],
+        )],
+    )
+    .expect("insert documents");
+    db.flush_collection("docs")
+        .expect("flush authoritative forward_store");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    append_payloads(
+        &collection_dir.join("payloads.jsonl"),
+        &[BTreeMap::from([("group".to_string(), FieldValue::Int64(9))])],
+    )
+    .expect("rewrite fresher payloads jsonl");
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let hits = reopened
+        .query_documents("docs", &[0.0_f32, 0.0], 1, Some("group == 9"))
+        .expect("query should prefer fresher compatibility payloads");
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), vec![10]);
+}
+
+#[test]
+fn collection_api_delete_by_filter_uses_forward_store_when_dense_sidecars_are_missing() {
+    let root = unique_temp_dir("hannsdb_collection_api_delete_forward_store_dense_sidecars");
+    let mut db = HannsDb::open(&root).expect("open db");
+    let schema = CollectionSchema::new(
+        "vector",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+    );
+    db.create_collection_with_schema("docs", &schema)
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(
+                10,
+                vec![("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0_f32, 0.0],
+            ),
+            Document::new(
+                20,
+                vec![("group".to_string(), FieldValue::Int64(2))],
+                vec![2.0_f32, 2.0],
+            ),
+        ],
+    )
+    .expect("insert documents");
+    db.flush_collection("docs")
+        .expect("flush authoritative forward_store");
+    drop(db);
+
+    let collection_dir = root.join("collections").join("docs");
+    fs::remove_file(collection_dir.join("records.bin")).expect("remove records.bin");
+    fs::remove_file(collection_dir.join("ids.bin")).expect("remove ids.bin");
+
+    let mut reopened = HannsDb::open(&root).expect("reopen db");
+    let deleted = reopened
+        .delete_by_filter("docs", "group == 1")
+        .expect("delete should use forward_store-backed dense rows");
+    assert_eq!(deleted, 1);
+    assert!(
+        !collection_dir.join("forward_store.json").exists(),
+        "delete should invalidate the stale forward_store snapshot after mutating the segment"
+    );
+}
+
+#[test]
 fn collection_api_reopen_preserves_refreshed_active_arrow_snapshots_after_later_write() {
     let root = unique_temp_dir("hannsdb_collection_api_reopen_refreshed_arrow_after_write");
     let mut db = HannsDb::open(&root).expect("open db");

@@ -5,11 +5,9 @@ use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
 use crate::document::{compare_field_value_for_sort, FieldValue};
-use crate::segment::{
-    load_record_ids, load_records, load_sparse_vectors, SegmentManager, SegmentMetadata,
-    TombstoneMask,
-};
+use crate::segment::{load_sparse_vectors, SegmentManager, SegmentMetadata, TombstoneMask};
 use crate::storage::segment_io::{
+    load_primary_dense_rows_for_segment_or_empty,
     load_payloads_or_empty as load_segment_payloads_or_empty,
     load_vectors_or_empty as load_segment_vectors_or_empty,
 };
@@ -71,8 +69,15 @@ impl QueryExecutor {
             .any(|source| matches!(&source.vector, QueryVector::Sparse(_)));
         for segment in segment_manager.segment_paths()? {
             let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let records = load_records_or_empty(&segment.records, collection.dimension)?;
-            let external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+                &segment,
+                &segment_meta,
+                &collection.primary_vector,
+                collection.dimension,
+                collection.primary_is_fp16(),
+            )?;
+            let records = dense_rows.primary_vectors;
+            let external_ids = dense_rows.external_ids;
             let payloads =
                 load_segment_payloads_or_empty(&segment, &segment_meta, external_ids.len())?;
             let vectors = if needs_secondary_vectors {
@@ -407,22 +412,6 @@ impl FloatGroupKey {
         } else {
             Self::Exact(value.to_bits())
         }
-    }
-}
-
-fn load_records_or_empty(path: &Path, dimension: usize) -> io::Result<Vec<f32>> {
-    match load_records(path, dimension) {
-        Ok(records) => Ok(records),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
-    match load_record_ids(path) {
-        Ok(ids) => Ok(ids),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
     }
 }
 

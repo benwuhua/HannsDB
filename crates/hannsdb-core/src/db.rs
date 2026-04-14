@@ -48,9 +48,10 @@ use crate::storage::primary_keys::{
 use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
 use crate::storage::segment_io::{
     invalidate_forward_store_snapshot, latest_live_row_index, latest_row_index_for_id,
-    load_payloads_or_empty, load_payloads_with_fields_or_empty, load_record_ids_or_empty,
-    load_records_or_empty, load_shadowed_live_records, load_shadowed_live_vector_records,
-    load_sparse_vectors_or_empty, load_vectors_or_empty,
+    load_external_ids_for_segment_or_empty, load_payloads_or_empty,
+    load_payloads_with_fields_or_empty, load_primary_dense_rows_for_segment_or_empty,
+    load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
+    load_vectors_or_empty,
     materialize_active_segment_arrow_snapshots, materialize_latest_live_forward_store_snapshot,
     next_compacted_segment_id, persisted_ann_exists,
 };
@@ -1205,12 +1206,11 @@ impl HannsDb {
                 break;
             }
 
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let stored_ids = load_external_ids_for_segment_or_empty(&segment, &segment_meta)?;
             if stored_ids.is_empty() {
                 continue;
             }
-
-            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
             let mut segment_changed = false;
             let row_limit = segment_meta.record_count.min(stored_ids.len());
@@ -1235,7 +1235,9 @@ impl HannsDb {
                 segment_meta.deleted_count = tombstone.deleted_count();
                 segment_meta.save_to_path(&segment.metadata)?;
                 tombstone.save_to_path(&segment.tombstones)?;
-                invalidate_forward_store_snapshot(&segment)?;
+                if segment.records.exists() && segment.external_ids.exists() {
+                    invalidate_forward_store_snapshot(&segment)?;
+                }
             }
         }
 
@@ -1261,12 +1263,15 @@ impl HannsDb {
 
         for segment in segment_paths {
             let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let records = load_records_or_empty(
-                &segment.records,
+            let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+                &segment,
+                &segment_meta,
+                &collection_meta.primary_vector,
                 collection_meta.dimension,
                 collection_meta.primary_is_fp16(),
             )?;
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let records = dense_rows.primary_vectors;
+            let stored_ids = dense_rows.external_ids;
             let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
@@ -1374,12 +1379,11 @@ impl HannsDb {
                 break;
             }
 
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let stored_ids = load_external_ids_for_segment_or_empty(&segment, &segment_meta)?;
             if stored_ids.is_empty() {
                 continue;
             }
-
-            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
             let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
             let mut segment_changed = false;
             let row_limit = segment_meta.record_count.min(stored_ids.len());
@@ -1449,7 +1453,7 @@ impl HannsDb {
 
         let manifest_path = manifest_path(&self.root);
         let mut manifest = ManifestMetadata::load_from_path(&manifest_path)?;
-        for collection in plan.owned_collections() {
+        for collection in plan.collections_to_reset() {
             let paths = self.collection_paths(collection);
             if paths.dir.exists() {
                 fs::remove_dir_all(&paths.dir)?;
@@ -1619,7 +1623,8 @@ impl CollectionHandle {
         let mut shadowed: HashSet<i64> = HashSet::new();
 
         for segment in &segment_paths {
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+            let stored_ids = load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
             let sparse_rows =
                 load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
             let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
@@ -1844,8 +1849,8 @@ impl CollectionHandle {
             let mut all_payloads: Vec<BTreeMap<String, FieldValue>> = Vec::new();
             let mut all_ids: Vec<i64> = Vec::new();
             for segment in &segment_paths {
-                let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
                 let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+                let stored_ids = load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
                 let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
                 let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
                 for (row_idx, ext_id) in stored_ids.iter().enumerate() {
@@ -1909,7 +1914,8 @@ impl CollectionHandle {
                 let mut shadowed: HashSet<i64> = HashSet::new();
 
                 for segment in &segment_paths {
-                    let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+                    let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+                    let stored_ids = load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
                     let sparse_rows =
                         load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
                     let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
@@ -2365,12 +2371,15 @@ impl CollectionHandle {
         let mut heap: BinaryHeap<RankedDocumentHit> = BinaryHeap::new();
         for segment in segment_paths {
             let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let records = load_records_or_empty(
-                &segment.records,
+            let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+                &segment,
+                &segment_meta,
+                &collection_meta.primary_vector,
                 collection_meta.dimension,
                 collection_meta.primary_is_fp16(),
             )?;
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+            let records = dense_rows.primary_vectors;
+            let stored_ids = dense_rows.external_ids;
             let payloads = if projection.is_some() {
                 load_payloads_with_fields_or_empty(
                     &segment,
@@ -2550,6 +2559,7 @@ impl CollectionHandle {
             load_shadowed_live_records(
                 &self.segment_manager,
                 vector_schema.dimension,
+                &collection_meta.primary_vector,
                 collection_meta.primary_is_fp16(),
             )?
         } else {
@@ -2637,12 +2647,15 @@ impl CollectionHandle {
 
         for segment in &segment_paths {
             let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
-            let records = load_records_or_empty(
-                &segment.records,
+            let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+                &segment,
+                &segment_meta,
+                &collection_meta.primary_vector,
                 collection_meta.dimension,
                 collection_meta.primary_is_fp16(),
             )?;
+            let stored_ids = dense_rows.external_ids;
+            let records = dense_rows.primary_vectors;
             let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
             let vectors = load_vectors_or_empty(
                 &segment,

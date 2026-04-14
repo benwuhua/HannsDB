@@ -24,9 +24,9 @@ fn load_payloads_for_segment(
     segment_meta: &SegmentMetadata,
     fields: Option<&[String]>,
 ) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    if prefers_forward_store_authority(segment, segment_meta) {
-        if let Ok(payloads) = load_payloads_from_forward_store(segment, fields) {
-            return Ok(payloads);
+    if !payload_sidecars_are_newer_than_forward_store(segment) {
+        if let Ok(Some(rows)) = load_authoritative_forward_store_rows(segment, segment_meta) {
+            return Ok(project_forward_store_payloads(rows, fields));
         }
     }
     match segment_meta.normalized_storage_format() {
@@ -130,6 +130,93 @@ pub(crate) fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err),
     }
+}
+
+pub(crate) struct DenseSegmentRows {
+    pub(crate) external_ids: Vec<i64>,
+    pub(crate) primary_vectors: Vec<f32>,
+}
+
+pub(crate) fn load_external_ids_for_segment_or_empty(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<Vec<i64>> {
+    if !ids_sidecar_is_newer_than_forward_store(segment) {
+        if let Ok(Some(rows)) = load_authoritative_forward_store_rows(segment, segment_meta) {
+            return rows
+                .into_iter()
+                .map(|row| {
+                    i64::try_from(row.internal_id).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "forward_store row internal id {} exceeds supported external id range",
+                                row.internal_id
+                            ),
+                        )
+                    })
+                })
+                .collect();
+        }
+    }
+    load_record_ids_or_empty(&segment.external_ids)
+}
+
+pub(crate) fn load_primary_dense_rows_for_segment_or_empty(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+    primary_vector_name: &str,
+    dimension: usize,
+    fp16: bool,
+) -> io::Result<DenseSegmentRows> {
+    if !dense_sidecars_are_newer_than_forward_store(segment) {
+        if let Ok(Some(rows)) = load_authoritative_forward_store_rows(segment, segment_meta) {
+            let mut external_ids = Vec::with_capacity(rows.len());
+            let mut primary_vectors = Vec::with_capacity(rows.len().saturating_mul(dimension));
+            for row in rows {
+                let external_id = i64::try_from(row.internal_id).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "forward_store row internal id {} exceeds supported external id range",
+                            row.internal_id
+                        ),
+                    )
+                })?;
+                let vector = row.vectors.get(primary_vector_name).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "forward_store row for id {} is missing primary vector '{}'",
+                            external_id, primary_vector_name
+                        ),
+                    )
+                })?;
+                if vector.len() != dimension {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "forward_store primary vector '{}' dimension mismatch: expected {}, got {}",
+                            primary_vector_name,
+                            dimension,
+                            vector.len()
+                        ),
+                    ));
+                }
+                external_ids.push(external_id);
+                primary_vectors.extend_from_slice(vector);
+            }
+            return Ok(DenseSegmentRows {
+                external_ids,
+                primary_vectors,
+            });
+        }
+    }
+
+    Ok(DenseSegmentRows {
+        external_ids: load_record_ids_or_empty(&segment.external_ids)?,
+        primary_vectors: load_records_or_empty(&segment.records, dimension, fp16)?,
+    })
 }
 
 pub(crate) fn materialize_active_segment_arrow_snapshots(
@@ -366,9 +453,9 @@ fn load_vectors_for_segment(
     segment_meta: &SegmentMetadata,
     primary_vector_name: &str,
 ) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    if prefers_forward_store_authority(segment, segment_meta) {
-        if let Ok(vectors) = load_vectors_from_forward_store(segment, primary_vector_name) {
-            return Ok(vectors);
+    if !vector_sidecars_are_newer_than_forward_store(segment) {
+        if let Ok(Some(rows)) = load_authoritative_forward_store_rows(segment, segment_meta) {
+            return Ok(project_forward_store_vectors(rows, primary_vector_name));
         }
     }
     match segment_meta.normalized_storage_format() {
@@ -405,7 +492,7 @@ fn load_vectors_for_segment(
     }
 }
 
-fn prefers_forward_store_authority(
+pub(crate) fn segment_prefers_forward_store_authority(
     segment: &SegmentPaths,
     segment_meta: &SegmentMetadata,
 ) -> bool {
@@ -420,6 +507,68 @@ fn prefers_forward_store_authority(
         return false;
     };
     descriptor.row_count == segment_meta.record_count
+}
+
+pub(crate) fn load_authoritative_forward_store_rows(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<Option<Vec<ForwardRow>>> {
+    if !segment_prefers_forward_store_authority(segment, segment_meta) {
+        return Ok(None);
+    }
+    load_forward_store_rows(segment).map(Some)
+}
+
+fn forward_store_mtime(segment: &SegmentPaths) -> Option<std::time::SystemTime> {
+    newest_mtime(&[
+        segment.forward_store_descriptor(),
+        segment.forward_store_artifact(ForwardFileFormat::ArrowIpc),
+        segment.forward_store_artifact(ForwardFileFormat::Parquet),
+    ])
+}
+
+fn payload_sidecars_are_newer_than_forward_store(segment: &SegmentPaths) -> bool {
+    any_paths_newer_than_forward_store(
+        segment,
+        &[segment.payloads.clone(), segment.payloads_arrow.clone()],
+    )
+}
+
+fn vector_sidecars_are_newer_than_forward_store(segment: &SegmentPaths) -> bool {
+    any_paths_newer_than_forward_store(
+        segment,
+        &[segment.vectors.clone(), segment.vectors_arrow.clone()],
+    )
+}
+
+fn ids_sidecar_is_newer_than_forward_store(segment: &SegmentPaths) -> bool {
+    segment.external_ids.exists()
+        && any_paths_newer_than_forward_store(segment, &[segment.external_ids.clone()])
+}
+
+fn dense_sidecars_are_newer_than_forward_store(segment: &SegmentPaths) -> bool {
+    segment.records.exists()
+        && segment.external_ids.exists()
+        && any_paths_newer_than_forward_store(
+            segment,
+            &[segment.records.clone(), segment.external_ids.clone()],
+        )
+}
+
+fn any_paths_newer_than_forward_store(
+    segment: &SegmentPaths,
+    paths: &[std::path::PathBuf],
+) -> bool {
+    let Some(forward_store_mtime) = forward_store_mtime(segment) else {
+        return false;
+    };
+    newest_mtime(paths).is_some_and(|compat_mtime| compat_mtime > forward_store_mtime)
+}
+
+fn newest_mtime(paths: &[std::path::PathBuf]) -> Option<std::time::SystemTime> {
+    paths.iter()
+        .filter_map(|path| fs::metadata(path).ok()?.modified().ok())
+        .max()
 }
 
 fn load_forward_store_descriptor(segment: &SegmentPaths) -> io::Result<ForwardStoreDescriptor> {
@@ -451,13 +600,12 @@ fn load_forward_store_rows(segment: &SegmentPaths) -> io::Result<Vec<ForwardRow>
     reader.scan_columns(None)
 }
 
-fn load_payloads_from_forward_store(
-    segment: &SegmentPaths,
+fn project_forward_store_payloads(
+    rows: Vec<ForwardRow>,
     fields: Option<&[String]>,
-) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    let rows = load_forward_store_rows(segment)?;
+) -> Vec<BTreeMap<String, FieldValue>> {
     let keep = fields.map(|names| names.iter().cloned().collect::<BTreeSet<_>>());
-    Ok(rows
+    rows
         .into_iter()
         .map(|mut row| {
             if let Some(ref keep) = keep {
@@ -465,20 +613,20 @@ fn load_payloads_from_forward_store(
             }
             row.fields
         })
-        .collect())
+        .collect()
 }
 
-fn load_vectors_from_forward_store(
-    segment: &SegmentPaths,
+fn project_forward_store_vectors(
+    rows: Vec<ForwardRow>,
     primary_vector_name: &str,
-) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    Ok(load_forward_store_rows(segment)?
+) -> Vec<BTreeMap<String, Vec<f32>>> {
+    rows
         .into_iter()
         .map(|mut row| {
             row.vectors.remove(primary_vector_name);
             row.vectors
         })
-        .collect())
+        .collect()
 }
 
 pub(crate) fn load_payloads_with_fields_or_empty(
@@ -537,6 +685,7 @@ pub(crate) fn load_sparse_vectors_or_empty(
 pub(crate) fn load_shadowed_live_records(
     segment_manager: &SegmentManager,
     dimension: usize,
+    primary_vector_name: &str,
     fp16: bool,
 ) -> io::Result<(Vec<f32>, Vec<i64>)> {
     let mut records = Vec::new();
@@ -544,8 +693,16 @@ pub(crate) fn load_shadowed_live_records(
     let mut shadowed_ids = HashSet::new();
 
     for segment in segment_manager.segment_paths()? {
-        let segment_records = load_records_or_empty(&segment.records, dimension, fp16)?;
-        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+        let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+        let dense_rows = load_primary_dense_rows_for_segment_or_empty(
+            &segment,
+            &segment_meta,
+            primary_vector_name,
+            dimension,
+            fp16,
+        )?;
+        let segment_records = dense_rows.primary_vectors;
+        let segment_external_ids = dense_rows.external_ids;
         let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
 
         if segment_external_ids.len().saturating_mul(dimension) != segment_records.len() {
@@ -585,7 +742,7 @@ pub(crate) fn load_shadowed_live_vector_records(
 
     for segment in segment_manager.segment_paths()? {
         let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
+        let segment_external_ids = load_external_ids_for_segment_or_empty(&segment, &segment_meta)?;
         let segment_vectors = load_vectors_or_empty(
             &segment,
             &segment_meta,
@@ -643,7 +800,8 @@ pub(crate) fn load_all_collection_ids(paths: &CollectionPaths) -> io::Result<Vec
     let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
     let mut all_ids = Vec::new();
     for segment in segment_paths {
-        all_ids.extend(load_record_ids_or_empty(&segment.external_ids)?);
+        let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+        all_ids.extend(load_external_ids_for_segment_or_empty(&segment, &segment_meta)?);
     }
     Ok(all_ids)
 }
