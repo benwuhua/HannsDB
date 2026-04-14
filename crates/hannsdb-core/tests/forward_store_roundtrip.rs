@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use hannsdb_core::document::{CollectionSchema, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema};
+use hannsdb_core::document::{
+    CollectionSchema, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+};
 use hannsdb_core::forward_store::{
     ChunkedFileWriter, ForwardFileFormat, ForwardRow, ForwardStoreReader, MemForwardStore,
 };
@@ -105,8 +107,9 @@ fn build_store(rows: &[ForwardRow]) -> MemForwardStore {
 
 fn write_descriptor(rows: &[ForwardRow]) -> hannsdb_core::forward_store::ForwardStoreDescriptor {
     let temp = tempfile::tempdir().expect("tempdir");
+    let base_dir = temp.keep();
     let store = build_store(rows);
-    let writer = ChunkedFileWriter::new(temp.path());
+    let writer = ChunkedFileWriter::new(&base_dir);
     let descriptor = writer
         .write(
             "forward_store_roundtrip",
@@ -149,7 +152,9 @@ fn forward_store_roundtrip_arrow_and_parquet_are_equivalent() {
     assert_eq!(parquet_reader.row_count(), rows.len());
     assert_eq!(
         arrow_reader.scan_columns(None).expect("scan arrow rows"),
-        parquet_reader.scan_columns(None).expect("scan parquet rows"),
+        parquet_reader
+            .scan_columns(None)
+            .expect("scan parquet rows"),
     );
 }
 
@@ -165,7 +170,7 @@ fn forward_store_fetch_rows_projects_requested_columns_for_both_formats() {
             op_seq: 0,
             is_deleted: false,
             fields: BTreeMap::from([("turn".to_string(), FieldValue::Int64(2))]),
-            vectors: BTreeMap::from([("secondary".to_string(), vec![0.0, 0.0])]),
+            vectors: BTreeMap::new(),
         },
         ForwardRow {
             internal_id: 30,
@@ -247,7 +252,8 @@ fn forward_store_rejects_undeclared_fields_inside_the_new_core_only() {
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert!(
-        err.to_string().contains("undeclared forward-store field: unexpected"),
+        err.to_string()
+            .contains("undeclared forward-store field: unexpected"),
         "unexpected error: {err}"
     );
 }
