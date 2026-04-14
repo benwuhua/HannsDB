@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod db;
 mod db_types;
 pub mod document;
+pub mod forward_store;
 pub mod pk;
 pub mod query;
 pub mod segment;
