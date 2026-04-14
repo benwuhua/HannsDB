@@ -1,241 +1,253 @@
 use std::collections::BTreeMap;
 
-use hannsdb_core::document::{
-    CollectionSchema, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
-};
+use hannsdb_core::document::{CollectionSchema, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema};
 use hannsdb_core::forward_store::{
     ChunkedFileWriter, ForwardFileFormat, ForwardRow, ForwardStoreReader, MemForwardStore,
 };
-use tempfile::tempdir;
 
-fn test_schema() -> CollectionSchema {
-    CollectionSchema {
-        primary_vector: "vector".to_string(),
-        fields: vec![
-            ScalarFieldSchema::new("title", FieldType::String),
-            ScalarFieldSchema::new("score", FieldType::Float64).with_flags(true, false),
-            ScalarFieldSchema::new("active", FieldType::Bool).with_flags(true, false),
+fn sample_schema() -> CollectionSchema {
+    let mut schema = CollectionSchema::new(
+        "dense",
+        3,
+        "l2",
+        vec![
+            ScalarFieldSchema::new("session_id", FieldType::String).with_flags(true, false),
+            ScalarFieldSchema::new("turn", FieldType::Int64),
+            ScalarFieldSchema::new("score", FieldType::Float).with_flags(true, false),
         ],
-        vectors: vec![
-            VectorFieldSchema::new("vector", 3),
-            VectorFieldSchema::new("aux", 2),
-        ],
-    }
+    );
+    schema.vectors.push(VectorFieldSchema::new("secondary", 2));
+    schema
 }
 
-fn row(
-    internal_id: u64,
-    op_seq: u64,
-    is_deleted: bool,
-    title: Option<&str>,
-    score: Option<f64>,
-    active: Option<bool>,
-    vector: Option<Vec<f32>>,
-    aux: Option<Vec<f32>>,
-) -> ForwardRow {
-    let mut fields = BTreeMap::new();
-    if let Some(title) = title {
-        fields.insert("title".to_string(), FieldValue::String(title.to_string()));
-    }
-    if let Some(score) = score {
-        fields.insert("score".to_string(), FieldValue::Float64(score));
-    }
-    if let Some(active) = active {
-        fields.insert("active".to_string(), FieldValue::Bool(active));
-    }
-
-    let mut vectors = BTreeMap::new();
-    if let Some(vector) = vector {
-        vectors.insert("vector".to_string(), vector);
-    }
-    if let Some(aux) = aux {
-        vectors.insert("aux".to_string(), aux);
-    }
-
-    ForwardRow {
-        internal_id,
-        op_seq,
-        is_deleted,
-        fields,
-        vectors,
-    }
+fn base_rows() -> Vec<ForwardRow> {
+    vec![
+        ForwardRow {
+            internal_id: 10,
+            op_seq: 1,
+            is_deleted: false,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("alpha".to_string()),
+                ),
+                ("turn".to_string(), FieldValue::Int64(1)),
+                ("score".to_string(), FieldValue::Float(1.5)),
+            ]),
+            vectors: BTreeMap::from([
+                ("dense".to_string(), vec![0.1, 0.2, 0.3]),
+                ("secondary".to_string(), vec![9.0, 9.5]),
+            ]),
+        },
+        ForwardRow {
+            internal_id: 10,
+            op_seq: 2,
+            is_deleted: false,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("alpha".to_string()),
+                ),
+                ("turn".to_string(), FieldValue::Int64(2)),
+                ("score".to_string(), FieldValue::Float(2.5)),
+            ]),
+            vectors: BTreeMap::from([("dense".to_string(), vec![1.0, 1.1, 1.2])]),
+        },
+        ForwardRow {
+            internal_id: 20,
+            op_seq: 1,
+            is_deleted: false,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("beta".to_string()),
+                ),
+                ("turn".to_string(), FieldValue::Int64(1)),
+            ]),
+            vectors: BTreeMap::from([
+                ("dense".to_string(), vec![2.0, 2.1, 2.2]),
+                ("secondary".to_string(), vec![8.0, 8.5]),
+            ]),
+        },
+        ForwardRow {
+            internal_id: 20,
+            op_seq: 3,
+            is_deleted: true,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("beta".to_string()),
+                ),
+                ("turn".to_string(), FieldValue::Int64(3)),
+            ]),
+            vectors: BTreeMap::new(),
+        },
+        ForwardRow {
+            internal_id: 30,
+            op_seq: 4,
+            is_deleted: false,
+            fields: BTreeMap::from([("turn".to_string(), FieldValue::Int64(9))]),
+            vectors: BTreeMap::from([
+                ("dense".to_string(), vec![3.0, 3.1, 3.2]),
+                ("secondary".to_string(), vec![7.0, 7.5]),
+            ]),
+        },
+    ]
 }
 
-#[test]
-fn forward_store_roundtrips_arrow_and_parquet_equivalently() {
-    let schema = test_schema();
-    let mut store = MemForwardStore::new(schema.clone());
-    let rows = vec![
-        row(
-            10,
-            1,
-            false,
-            Some("alpha"),
-            Some(1.5),
-            Some(true),
-            Some(vec![1.0, 2.0, 3.0]),
-            Some(vec![0.1, 0.2]),
-        ),
-        row(
-            20,
-            2,
-            false,
-            Some("beta"),
-            None,
-            Some(false),
-            Some(vec![4.0, 5.0, 6.0]),
-            None,
-        ),
-        row(
-            30,
-            3,
-            false,
-            Some("gamma"),
-            Some(8.25),
-            None,
-            Some(vec![7.0, 8.0, 9.0]),
-            Some(vec![0.3, 0.4]),
-        ),
-    ];
-    for row in rows.clone() {
-        store.append(row).expect("append test row");
+fn build_store(rows: &[ForwardRow]) -> MemForwardStore {
+    let mut store = MemForwardStore::new(sample_schema());
+    for row in rows {
+        store.append(row.clone()).expect("append forward-store row");
     }
+    store
+}
 
-    let dir = tempdir().expect("tempdir");
-    let writer = ChunkedFileWriter::new(dir.path());
+fn write_descriptor(rows: &[ForwardRow]) -> hannsdb_core::forward_store::ForwardStoreDescriptor {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = build_store(rows);
+    let writer = ChunkedFileWriter::new(temp.path());
     let descriptor = writer
         .write(
-            "roundtrip",
+            "forward_store_roundtrip",
             &store,
             &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
         )
-        .expect("write both forward-store formats");
+        .expect("write forward-store artifacts");
 
-    let arrow_reader = ForwardStoreReader::open(&descriptor, ForwardFileFormat::ArrowIpc)
-        .expect("open arrow reader");
-    let parquet_reader = ForwardStoreReader::open(&descriptor, ForwardFileFormat::Parquet)
-        .expect("open parquet reader");
+    assert_eq!(descriptor.row_count, rows.len());
+    assert!(
+        descriptor.artifact(ForwardFileFormat::ArrowIpc).is_some(),
+        "descriptor should include Arrow IPC artifact"
+    );
+    assert!(
+        descriptor.artifact(ForwardFileFormat::Parquet).is_some(),
+        "descriptor should include Parquet artifact"
+    );
+
+    descriptor
+}
+
+fn open_pair(
+    descriptor: &hannsdb_core::forward_store::ForwardStoreDescriptor,
+) -> (ForwardStoreReader, ForwardStoreReader) {
+    (
+        ForwardStoreReader::open(descriptor, ForwardFileFormat::ArrowIpc)
+            .expect("open arrow reader"),
+        ForwardStoreReader::open(descriptor, ForwardFileFormat::Parquet)
+            .expect("open parquet reader"),
+    )
+}
+
+#[test]
+fn forward_store_roundtrip_arrow_and_parquet_are_equivalent() {
+    let rows = base_rows();
+    let descriptor = write_descriptor(&rows);
+    let (arrow_reader, parquet_reader) = open_pair(&descriptor);
 
     assert_eq!(arrow_reader.row_count(), rows.len());
     assert_eq!(parquet_reader.row_count(), rows.len());
     assert_eq!(
         arrow_reader.scan_columns(None).expect("scan arrow rows"),
-        rows,
-        "arrow reopen should preserve every logical row",
-    );
-    assert_eq!(
-        parquet_reader
-            .scan_columns(None)
-            .expect("scan parquet rows"),
-        rows,
-        "parquet reopen should preserve every logical row",
-    );
-
-    let projection = ["internal_id", "is_deleted", "title", "aux"];
-    let expected_projection = vec![
-        row(
-            30,
-            0,
-            false,
-            Some("gamma"),
-            None,
-            None,
-            None,
-            Some(vec![0.3, 0.4]),
-        ),
-        row(
-            10,
-            0,
-            false,
-            Some("alpha"),
-            None,
-            None,
-            None,
-            Some(vec![0.1, 0.2]),
-        ),
-    ];
-    assert_eq!(
-        arrow_reader
-            .fetch_rows(&[2, 0], Some(&projection))
-            .expect("projected arrow fetch"),
-        expected_projection,
-    );
-    assert_eq!(
-        parquet_reader
-            .fetch_rows(&[2, 0], Some(&projection))
-            .expect("projected parquet fetch"),
-        expected_projection,
+        parquet_reader.scan_columns(None).expect("scan parquet rows"),
     );
 }
 
 #[test]
-fn forward_store_preserves_latest_live_semantics_across_formats() {
-    let schema = test_schema();
-    let mut store = MemForwardStore::new(schema);
-    let rows = vec![
-        row(
-            10,
-            1,
-            false,
-            Some("stale"),
-            Some(0.5),
-            Some(true),
-            Some(vec![1.0, 1.0, 1.0]),
-            None,
-        ),
-        row(
-            10,
-            2,
-            false,
-            Some("fresh"),
-            Some(2.5),
-            Some(false),
-            Some(vec![2.0, 2.0, 2.0]),
-            Some(vec![0.5, 0.6]),
-        ),
-        row(
-            20,
-            3,
-            false,
-            Some("delete-me"),
-            Some(5.0),
-            Some(true),
-            Some(vec![3.0, 3.0, 3.0]),
-            None,
-        ),
-        row(20, 4, true, None, None, None, None, None),
+fn forward_store_fetch_rows_projects_requested_columns_for_both_formats() {
+    let descriptor = write_descriptor(&base_rows());
+    let (arrow_reader, parquet_reader) = open_pair(&descriptor);
+    let requested_columns = ["internal_id", "turn", "secondary"];
+
+    let expected = vec![
+        ForwardRow {
+            internal_id: 10,
+            op_seq: 0,
+            is_deleted: false,
+            fields: BTreeMap::from([("turn".to_string(), FieldValue::Int64(2))]),
+            vectors: BTreeMap::from([("secondary".to_string(), vec![0.0, 0.0])]),
+        },
+        ForwardRow {
+            internal_id: 30,
+            op_seq: 0,
+            is_deleted: false,
+            fields: BTreeMap::from([("turn".to_string(), FieldValue::Int64(9))]),
+            vectors: BTreeMap::from([("secondary".to_string(), vec![7.0, 7.5])]),
+        },
     ];
-    for row in rows {
-        store.append(row).expect("append versioned row");
-    }
 
-    let dir = tempdir().expect("tempdir");
-    let writer = ChunkedFileWriter::new(dir.path());
-    let descriptor = writer
-        .write(
-            "latest-live",
-            &store,
-            &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
-        )
-        .expect("write latest-live fixture");
+    let arrow_rows = arrow_reader
+        .fetch_rows(&[1, 4], Some(&requested_columns))
+        .expect("fetch projected arrow rows");
+    let parquet_rows = parquet_reader
+        .fetch_rows(&[1, 4], Some(&requested_columns))
+        .expect("fetch projected parquet rows");
 
-    let arrow_latest = ForwardStoreReader::open(&descriptor, ForwardFileFormat::ArrowIpc)
-        .expect("open arrow latest-live reader")
-        .latest_live_rows();
-    let parquet_latest = ForwardStoreReader::open(&descriptor, ForwardFileFormat::Parquet)
-        .expect("open parquet latest-live reader")
-        .latest_live_rows();
+    assert_eq!(arrow_rows, expected);
+    assert_eq!(parquet_rows, expected);
+}
 
-    let expected = vec![row(
-        10,
-        2,
-        false,
-        Some("fresh"),
-        Some(2.5),
-        Some(false),
-        Some(vec![2.0, 2.0, 2.0]),
-        Some(vec![0.5, 0.6]),
-    )];
-    assert_eq!(arrow_latest, expected);
-    assert_eq!(parquet_latest, expected);
+#[test]
+fn forward_store_latest_live_rows_respect_versions_and_terminal_tombstones() {
+    let descriptor = write_descriptor(&base_rows());
+    let (arrow_reader, parquet_reader) = open_pair(&descriptor);
+
+    let expected = vec![
+        ForwardRow {
+            internal_id: 10,
+            op_seq: 2,
+            is_deleted: false,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("alpha".to_string()),
+                ),
+                ("turn".to_string(), FieldValue::Int64(2)),
+                ("score".to_string(), FieldValue::Float(2.5)),
+            ]),
+            vectors: BTreeMap::from([("dense".to_string(), vec![1.0, 1.1, 1.2])]),
+        },
+        ForwardRow {
+            internal_id: 30,
+            op_seq: 4,
+            is_deleted: false,
+            fields: BTreeMap::from([("turn".to_string(), FieldValue::Int64(9))]),
+            vectors: BTreeMap::from([
+                ("dense".to_string(), vec![3.0, 3.1, 3.2]),
+                ("secondary".to_string(), vec![7.0, 7.5]),
+            ]),
+        },
+    ];
+
+    assert_eq!(arrow_reader.latest_live_rows(), expected);
+    assert_eq!(parquet_reader.latest_live_rows(), expected);
+}
+
+#[test]
+fn forward_store_rejects_undeclared_fields_inside_the_new_core_only() {
+    let mut store = MemForwardStore::new(sample_schema());
+    let err = store
+        .append(ForwardRow {
+            internal_id: 40,
+            op_seq: 1,
+            is_deleted: false,
+            fields: BTreeMap::from([
+                (
+                    "session_id".to_string(),
+                    FieldValue::String("gamma".to_string()),
+                ),
+                (
+                    "unexpected".to_string(),
+                    FieldValue::String("out-of-scope".to_string()),
+                ),
+            ]),
+            vectors: BTreeMap::from([("dense".to_string(), vec![4.0, 4.1, 4.2])]),
+        })
+        .expect_err("undeclared field should be rejected by forward-store core");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("undeclared forward-store field: unexpected"),
+        "unexpected error: {err}"
+    );
 }
