@@ -534,6 +534,16 @@ fn collection_api_post_rollover_insert_lands_in_active_segment_and_survives_reop
         .map(|document| document.id)
         .collect::<Vec<_>>();
     assert_eq!(fetched_ids, vec![200, 201]);
+
+    let reopened_hits = reopened
+        .search("docs", &[0.0_f32, 0.0], 2)
+        .expect("search post-rollover docs after reopen");
+    let reopened_hit_ids = reopened_hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    assert_eq!(
+        reopened_hit_ids,
+        vec![200, 201],
+        "reopen should preserve the existing search surface for the refreshed active segment"
+    );
 }
 
 #[test]
@@ -1467,8 +1477,7 @@ fn collection_api_flush_collection_persists_forward_store_artifacts_with_latest_
         "flush should persist at least the active forward_store rows"
     );
     assert_eq!(
-        descriptor.row_count,
-        active_meta.record_count,
+        descriptor.row_count, active_meta.record_count,
         "flush should persist a row-aligned active forward_store snapshot"
     );
     assert!(

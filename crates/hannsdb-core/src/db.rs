@@ -51,9 +51,8 @@ use crate::storage::segment_io::{
     load_external_ids_for_segment_or_empty, load_payloads_or_empty,
     load_payloads_with_fields_or_empty, load_primary_dense_rows_for_segment_or_empty,
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
-    load_vectors_or_empty,
-    materialize_active_segment_arrow_snapshots, materialize_forward_store_snapshot,
-    next_compacted_segment_id, persisted_ann_exists,
+    load_vectors_or_empty, materialize_active_segment_arrow_snapshots,
+    materialize_forward_store_snapshot, next_compacted_segment_id, persisted_ann_exists,
 };
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
@@ -1914,7 +1913,8 @@ impl CollectionHandle {
 
                 for segment in &segment_paths {
                     let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-                    let stored_ids = load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
+                    let stored_ids =
+                        load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
                     let sparse_rows =
                         load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
                     let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;

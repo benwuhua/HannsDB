@@ -29,6 +29,14 @@ fn load_payloads_for_segment(
             return Ok(project_forward_store_payloads(rows, fields));
         }
     }
+    load_payloads_without_forward_store(segment, segment_meta, fields)
+}
+
+fn load_payloads_without_forward_store(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+    fields: Option<&[String]>,
+) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
     match segment_meta.normalized_storage_format() {
         NormalizedStorageFormat::ForwardStore => {
             if segment.payloads_arrow.exists() {
@@ -381,6 +389,13 @@ fn load_vectors_for_segment(
             return Ok(project_forward_store_vectors(rows, primary_vector_name));
         }
     }
+    load_vectors_without_forward_store(segment, segment_meta)
+}
+
+fn load_vectors_without_forward_store(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
     match segment_meta.normalized_storage_format() {
         NormalizedStorageFormat::ForwardStore => {
             if segment.vectors_arrow.exists() {
@@ -442,8 +457,11 @@ pub(crate) fn segment_has_authoritative_persisted_image(
         return Ok(false);
     }
 
-    if forward_store_matches_segment_rows(segment, segment_meta)? {
-        return Ok(true);
+    match forward_store_matches_segment_rows(segment, segment_meta) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(err) if image_read_error_means_non_authoritative(&err) => {}
+        Err(err) => return Err(err),
     }
 
     if segment_meta.record_count > 0
@@ -452,20 +470,12 @@ pub(crate) fn segment_has_authoritative_persisted_image(
         return Ok(false);
     }
 
-    if requires_data_files && !segment_has_payload_image(segment) {
+    if requires_data_files && !compat_payload_image_is_authoritative(segment, segment_meta)? {
         return Ok(false);
     }
 
-    if requires_vector_sidecar {
-        match load_vectors(&segment.vectors) {
-            Ok(vectors) => {
-                if vectors.len() != segment_meta.record_count {
-                    return Ok(false);
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err),
-        }
+    if requires_vector_sidecar && !compat_vector_image_is_authoritative(segment, segment_meta)? {
+        return Ok(false);
     }
 
     Ok(true)
@@ -536,6 +546,39 @@ fn newest_mtime(paths: &[std::path::PathBuf]) -> Option<std::time::SystemTime> {
 
 fn segment_has_payload_image(segment: &SegmentPaths) -> bool {
     segment.payloads.exists() || segment.payloads_arrow.exists()
+}
+
+fn compat_payload_image_is_authoritative(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<bool> {
+    if !segment_has_payload_image(segment) {
+        return Ok(false);
+    }
+
+    match load_payloads_without_forward_store(segment, segment_meta, None) {
+        Ok(_) => Ok(true),
+        Err(err) if image_read_error_means_non_authoritative(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn compat_vector_image_is_authoritative(
+    segment: &SegmentPaths,
+    segment_meta: &SegmentMetadata,
+) -> io::Result<bool> {
+    match load_vectors_without_forward_store(segment, segment_meta) {
+        Ok(vectors) => Ok(vectors.len() == segment_meta.record_count),
+        Err(err) if image_read_error_means_non_authoritative(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn image_read_error_means_non_authoritative(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn forward_store_matches_segment_rows(

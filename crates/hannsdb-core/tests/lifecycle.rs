@@ -246,6 +246,14 @@ fn lifecycle_reopen_preserves_flushed_active_segment_after_rollover_write() {
         fetched.iter().map(|doc| doc.id).collect::<Vec<_>>(),
         vec![200, 300]
     );
+    let hits = reopened
+        .search("docs", &[99.0_f32, 99.0], 2)
+        .expect("search rollover active docs after reopen");
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![200, 300],
+        "reopen should preserve the existing search behavior for the flushed active segment"
+    );
 
     let segment_set_after =
         SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("reload segment_set");

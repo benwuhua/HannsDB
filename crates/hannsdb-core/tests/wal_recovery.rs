@@ -684,11 +684,11 @@ fn wal_recovery_open_skips_replay_when_forward_store_descriptor_can_authoritativ
         Some(&FieldValue::String("s-forward".to_string()))
     );
     assert_eq!(fetched[0].fields.get("turn"), Some(&FieldValue::Int64(9)));
-    assert_eq!(fetched[0].fields.get("active"), Some(&FieldValue::Bool(false)));
     assert_eq!(
-        fetched[0].primary_vector_for("dense").unwrap(),
-        &[0.9, 0.8]
+        fetched[0].fields.get("active"),
+        Some(&FieldValue::Bool(false))
     );
+    assert_eq!(fetched[0].primary_vector_for("dense").unwrap(), &[0.9, 0.8]);
     assert!(
         !payloads_jsonl.exists(),
         "reopen should not replay WAL and recreate payloads.jsonl when forward_store is authoritative"
@@ -708,7 +708,8 @@ fn wal_recovery_open_skips_replay_when_forward_store_descriptor_can_authoritativ
 }
 
 #[test]
-fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compatibility_artifact() {
+fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compatibility_artifact()
+{
     let temp = tempfile::tempdir().expect("tempdir");
     let wal_path = temp.path().join("wal.jsonl");
     let mut db = HannsDb::open(temp.path()).expect("open db");
@@ -758,17 +759,14 @@ fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compa
     )
     .expect("append insert to mimic pre-truncation WAL");
 
-    let reopened =
-        HannsDb::open(temp.path()).expect("reopen should replay when descriptor is not authoritative");
+    let reopened = HannsDb::open(temp.path())
+        .expect("reopen should replay when descriptor is not authoritative");
     let fetched = reopened
         .fetch_documents("docs", &[11])
         .expect("fetch from replayed reopen");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].id, 11);
-    assert_eq!(
-        fetched[0].primary_vector_for("dense").unwrap(),
-        &[0.1, 0.2]
-    );
+    assert_eq!(fetched[0].primary_vector_for("dense").unwrap(), &[0.1, 0.2]);
     assert_eq!(
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("s1".to_string()))
@@ -780,6 +778,70 @@ fn wal_recovery_open_replays_when_forward_store_descriptor_is_only_a_stale_compa
     assert!(
         storage_file_path(temp.path(), "docs", &["vectors.jsonl", "vectors.arrow"]).exists(),
         "reopen should replay WAL and recreate vector storage when jsonl storage remains authoritative"
+    );
+}
+
+#[test]
+fn wal_recovery_replays_when_active_arrow_only_payload_image_is_unreadable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let wal_path = temp.path().join("wal.jsonl");
+    let mut db = HannsDb::open(temp.path()).expect("open db");
+    db.create_collection_with_schema("docs", &sample_schema())
+        .expect("create collection");
+    db.insert_documents("docs", &[sample_document(11)])
+        .expect("insert document");
+    db.flush_collection("docs")
+        .expect("flush should materialize active-segment arrows");
+    drop(db);
+
+    let collection_dir = storage_dir_with_file(temp.path(), "docs", "forward_store.json");
+    let payloads_jsonl = collection_dir.join("payloads.jsonl");
+    let payloads_arrow = collection_dir.join("payloads.arrow");
+    assert!(
+        payloads_arrow.exists(),
+        "flush should create payloads.arrow before the fixture corrupts it"
+    );
+    for forward_store_artifact in [
+        collection_dir.join("forward_store.json"),
+        collection_dir.join("forward_store.arrow"),
+        collection_dir.join("forward_store.parquet"),
+    ] {
+        let _ = fs::remove_file(forward_store_artifact);
+    }
+    let _ = fs::remove_file(&payloads_jsonl);
+    fs::write(&payloads_arrow, b"corrupt-arrow").expect("corrupt arrow-only payload snapshot");
+
+    append_wal_record(
+        &wal_path,
+        &WalRecord::CreateCollection {
+            collection: "docs".to_string(),
+            schema: sample_schema(),
+        },
+    )
+    .expect("append create to mimic pre-truncation WAL");
+    append_wal_record(
+        &wal_path,
+        &WalRecord::InsertDocuments {
+            collection: "docs".to_string(),
+            documents: vec![sample_document(11)],
+        },
+    )
+    .expect("append insert to mimic pre-truncation WAL");
+
+    let reopened = HannsDb::open(temp.path())
+        .expect("reopen should replay WAL when the only active payload image is unreadable");
+    let fetched = reopened
+        .fetch_documents("docs", &[11])
+        .expect("fetch from replayed reopen");
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].id, 11);
+    assert_eq!(
+        fetched[0].fields.get("session_id"),
+        Some(&FieldValue::String("s1".to_string()))
+    );
+    assert!(
+        storage_file_path(temp.path(), "docs", &["payloads.jsonl", "payloads.arrow"]).exists(),
+        "reopen should replay WAL and restore a readable payload image"
     );
 }
 
@@ -813,8 +875,9 @@ fn wal_recovery_reopen_keeps_compacted_immutable_arrow_storage_without_recreatin
     let compacted_segment_dir = collection_dir
         .join("segments")
         .join(&segment_set_before.immutable_segment_ids[0]);
-    let compacted_meta = SegmentMetadata::load_from_path(&compacted_segment_dir.join("segment.json"))
-        .expect("load compacted metadata");
+    let compacted_meta =
+        SegmentMetadata::load_from_path(&compacted_segment_dir.join("segment.json"))
+            .expect("load compacted metadata");
     assert_eq!(
         compacted_meta.storage_format, "forward_store",
         "compaction recovery fixture should advertise forward_store-backed immutable storage"
@@ -1115,10 +1178,7 @@ fn wal_recovery_open_replays_delta_only_upsert_after_flush() {
         .expect("fetch replayed delta-only upsert");
     assert_eq!(fetched.len(), 1);
     assert_eq!(fetched[0].id, 11);
-    assert_eq!(
-        fetched[0].primary_vector_for("dense").unwrap(),
-        &[0.9, 0.8]
-    );
+    assert_eq!(fetched[0].primary_vector_for("dense").unwrap(), &[0.9, 0.8]);
     assert_eq!(
         fetched[0].fields.get("session_id"),
         Some(&FieldValue::String("s9".to_string()))
