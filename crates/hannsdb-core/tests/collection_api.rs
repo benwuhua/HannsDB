@@ -11,6 +11,7 @@ use hannsdb_core::document::{
     CollectionSchema, Document, DocumentUpdate, FieldType, FieldValue, ScalarFieldSchema,
     VectorFieldSchema, VectorIndexSchema,
 };
+use hannsdb_core::forward_store::{ForwardFileFormat, ForwardStoreDescriptor, ForwardStoreReader};
 use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery, VectorQueryParam};
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, load_record_ids, SegmentMetadata,
@@ -28,6 +29,11 @@ fn unique_temp_dir(name: &str) -> PathBuf {
         .expect("system time before unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("{}_{}", name, nanos))
+}
+
+fn load_forward_store_descriptor(path: &std::path::Path) -> ForwardStoreDescriptor {
+    serde_json::from_slice(&fs::read(path).expect("read persisted forward_store descriptor json"))
+        .expect("parse persisted forward_store descriptor")
 }
 
 fn rewrite_collection_to_two_segment_layout(
@@ -49,7 +55,12 @@ fn rewrite_collection_to_two_segment_layout(
         "records.bin",
         "ids.bin",
         "payloads.jsonl",
+        "payloads.arrow",
         "vectors.jsonl",
+        "vectors.arrow",
+        "forward_store.json",
+        "forward_store.arrow",
+        "forward_store.parquet",
         "tombstones.json",
     ] {
         let source = collection_dir.join(file);
@@ -674,10 +685,8 @@ fn collection_api_flush_after_rollover_materializes_active_segment_arrow_snapsho
         "flush should not materialize a stale root-level vectors.arrow after rollover"
     );
 
-    fs::remove_file(active_segment_dir.join("payloads.jsonl"))
-        .expect("remove active payloads jsonl after flush");
-    fs::remove_file(active_segment_dir.join("vectors.jsonl"))
-        .expect("remove active vectors jsonl after flush");
+    let _ = fs::remove_file(active_segment_dir.join("payloads.jsonl"));
+    let _ = fs::remove_file(active_segment_dir.join("vectors.jsonl"));
 
     let reopened = HannsDb::open(&root).expect("reopen after active-segment flush");
     let fetched = reopened
@@ -1406,6 +1415,124 @@ fn collection_api_flush_collection_materializes_active_segment_arrow_snapshots()
 }
 
 #[test]
+fn collection_api_flush_collection_persists_forward_store_artifacts_with_latest_live_view() {
+    let root = unique_temp_dir("hannsdb_collection_api_flush_forward_store");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            10,
+            Vec::<(String, FieldValue)>::new(),
+            vec![0.0_f32, 0.0],
+        )],
+    )
+    .expect("insert first version");
+    db.upsert_documents(
+        "docs",
+        &[Document::new(
+            10,
+            Vec::<(String, FieldValue)>::new(),
+            vec![1.0_f32, 1.0],
+        )],
+    )
+    .expect("upsert latest version");
+    db.insert_documents(
+        "docs",
+        &[Document::new(
+            20,
+            Vec::<(String, FieldValue)>::new(),
+            vec![2.0_f32, 2.0],
+        )],
+    )
+    .expect("insert tombstoned doc");
+    db.delete("docs", &[20]).expect("delete doc 20");
+
+    db.flush_collection("docs")
+        .expect("flush should persist forward_store artifacts");
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let active_segment_dir = collection_dir
+        .join("segments")
+        .join(&version_set.active_segment_id);
+    let descriptor = load_forward_store_descriptor(&active_segment_dir.join("forward_store.json"));
+    assert!(
+        descriptor.row_count >= 1,
+        "flush should persist at least the active forward_store rows"
+    );
+    assert!(
+        descriptor.artifact(ForwardFileFormat::ArrowIpc).is_some(),
+        "flush should persist Arrow IPC forward_store artifact"
+    );
+    assert!(
+        descriptor.artifact(ForwardFileFormat::Parquet).is_some(),
+        "flush should persist Parquet forward_store artifact"
+    );
+
+    let reader = ForwardStoreReader::open(&descriptor, ForwardFileFormat::ArrowIpc)
+        .expect("open forward_store arrow snapshot");
+    let latest_live_ids = reader
+        .latest_live_rows()
+        .into_iter()
+        .map(|row| row.internal_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latest_live_ids,
+        vec![10],
+        "persisted forward_store snapshot should preserve latest-live semantics"
+    );
+}
+
+#[test]
+fn collection_api_rollover_seals_forward_store_artifacts_for_the_immutable_segment() {
+    let root = unique_temp_dir("hannsdb_collection_api_rollover_forward_store");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert docs");
+    db.delete("docs", &(0..21).collect::<Vec<_>>())
+        .expect("delete docs");
+    db.insert("docs", &[200], &[0.0_f32, 0.0])
+        .expect("trigger rollover");
+
+    let collection_dir = root.join("collections").join("docs");
+    let version_set =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("load set");
+    let sealed_segment_dir = collection_dir
+        .join("segments")
+        .join(&version_set.immutable_segment_ids[0]);
+    let descriptor = load_forward_store_descriptor(&sealed_segment_dir.join("forward_store.json"));
+    assert!(
+        descriptor.artifact(ForwardFileFormat::ArrowIpc).is_some(),
+        "rollover should persist Arrow IPC forward_store artifact for the sealed segment"
+    );
+    assert!(
+        descriptor.artifact(ForwardFileFormat::Parquet).is_some(),
+        "rollover should persist Parquet forward_store artifact for the sealed segment"
+    );
+
+    let reader = ForwardStoreReader::open(&descriptor, ForwardFileFormat::Parquet)
+        .expect("open sealed forward_store parquet snapshot");
+    let latest_live_ids = reader
+        .latest_live_rows()
+        .into_iter()
+        .map(|row| row.internal_id as i64)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        latest_live_ids,
+        (21..100).collect::<Vec<_>>(),
+        "sealed forward_store snapshot should match the immutable segment latest-live view"
+    );
+}
+
+#[test]
 fn collection_api_flush_collection_refreshes_arrow_snapshots_after_subsequent_writes() {
     let root = unique_temp_dir("hannsdb_collection_api_flush_arrow_refresh");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1452,7 +1579,58 @@ fn collection_api_flush_collection_refreshes_arrow_snapshots_after_subsequent_wr
 }
 
 #[test]
-fn collection_api_insert_after_flush_invalidates_active_arrow_snapshots_until_next_flush() {
+fn collection_api_active_document_writes_materialize_forward_store_without_jsonl_sidecars() {
+    let root = unique_temp_dir("hannsdb_collection_api_active_forward_store");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert_documents(
+        "docs",
+        &[
+            Document::new(10, BTreeMap::new(), vec![0.0, 0.0]),
+            Document::new(20, BTreeMap::new(), vec![1.0, 1.0]),
+        ],
+    )
+    .expect("insert documents");
+
+    let collection_dir = root.join("collections").join("docs");
+    assert!(
+        !collection_dir.join("payloads.jsonl").exists(),
+        "active document writes should not rely on payload JSONL sidecars"
+    );
+    assert!(
+        !collection_dir.join("vectors.jsonl").exists(),
+        "active document writes should not rely on vector JSONL sidecars"
+    );
+    assert!(
+        collection_dir.join("payloads.arrow").exists(),
+        "active document writes should materialize payloads.arrow immediately"
+    );
+    assert!(
+        collection_dir.join("vectors.arrow").exists(),
+        "active document writes should materialize vectors.arrow immediately"
+    );
+    assert!(
+        collection_dir.join("forward_store.arrow").exists(),
+        "active document writes should persist forward-store Arrow IPC artifacts"
+    );
+    assert!(
+        collection_dir.join("forward_store.parquet").exists(),
+        "active document writes should persist forward-store Parquet artifacts"
+    );
+
+    let fetched = db
+        .fetch_documents("docs", &[10, 20])
+        .expect("fetch documents");
+    let fetched_ids = fetched
+        .iter()
+        .map(|document| document.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fetched_ids, vec![10, 20]);
+}
+
+#[test]
+fn collection_api_insert_after_flush_refreshes_active_arrow_snapshots_immediately() {
     let root = unique_temp_dir("hannsdb_collection_api_flush_arrow_invalidation");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
@@ -1472,17 +1650,42 @@ fn collection_api_insert_after_flush_invalidates_active_arrow_snapshots_until_ne
         vectors_arrow.exists(),
         "vectors.arrow should exist after flush"
     );
+    let payloads_mtime_before = fs::metadata(&payloads_arrow)
+        .expect("payloads.arrow metadata before later insert")
+        .modified()
+        .expect("payloads.arrow modified before later insert");
+    let vectors_mtime_before = fs::metadata(&vectors_arrow)
+        .expect("vectors.arrow metadata before later insert")
+        .modified()
+        .expect("vectors.arrow modified before later insert");
 
+    std::thread::sleep(std::time::Duration::from_millis(5));
     db.insert("docs", &[20], &[1.0_f32, 1.0])
         .expect("insert second vector");
 
     assert!(
-        !payloads_arrow.exists(),
-        "payloads.arrow should be invalidated after later active-segment write"
+        payloads_arrow.exists(),
+        "payloads.arrow should be refreshed immediately after later active-segment write"
     );
     assert!(
-        !vectors_arrow.exists(),
-        "vectors.arrow should be invalidated after later active-segment write"
+        vectors_arrow.exists(),
+        "vectors.arrow should be refreshed immediately after later active-segment write"
+    );
+    let payloads_mtime_after = fs::metadata(&payloads_arrow)
+        .expect("payloads.arrow metadata after later insert")
+        .modified()
+        .expect("payloads.arrow modified after later insert");
+    let vectors_mtime_after = fs::metadata(&vectors_arrow)
+        .expect("vectors.arrow metadata after later insert")
+        .modified()
+        .expect("vectors.arrow modified after later insert");
+    assert!(
+        payloads_mtime_after >= payloads_mtime_before,
+        "payloads.arrow should be rewritten after later active-segment write"
+    );
+    assert!(
+        vectors_mtime_after >= vectors_mtime_before,
+        "vectors.arrow should be rewritten after later active-segment write"
     );
 }
 
@@ -1509,8 +1712,8 @@ fn collection_api_reopen_fetch_documents_uses_active_arrow_snapshots_when_jsonl_
         collection_dir.join("vectors.arrow").exists(),
         "vectors.arrow should exist before removing jsonl sidecars"
     );
-    fs::remove_file(&payloads_jsonl).expect("remove payloads.jsonl");
-    fs::remove_file(&vectors_jsonl).expect("remove vectors.jsonl");
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
 
     let reopened = HannsDb::open(&root).expect("reopen db");
     let docs = reopened
@@ -1533,6 +1736,55 @@ fn collection_api_reopen_fetch_documents_uses_active_arrow_snapshots_when_jsonl_
             .get("vector")
             .expect("doc 20 primary vector from vectors.arrow"),
         &vec![1.0_f32, 1.0]
+    );
+}
+
+#[test]
+fn collection_api_reopen_preserves_refreshed_active_arrow_snapshots_after_later_write() {
+    let root = unique_temp_dir("hannsdb_collection_api_reopen_refreshed_arrow_after_write");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10], &[0.0_f32, 0.0])
+        .expect("insert first vector");
+    db.flush_collection("docs").expect("flush first state");
+    db.insert("docs", &[20], &[1.0_f32, 1.0])
+        .expect("insert second vector");
+    db.flush_collection("docs").expect("flush refreshed state");
+
+    let collection_dir = root.join("collections").join("docs");
+    let payloads_jsonl = collection_dir.join("payloads.jsonl");
+    let vectors_jsonl = collection_dir.join("vectors.jsonl");
+    let payloads_arrow = collection_dir.join("payloads.arrow");
+    let vectors_arrow = collection_dir.join("vectors.arrow");
+    assert!(
+        payloads_arrow.exists(),
+        "payloads.arrow should exist after second flush"
+    );
+    assert!(
+        vectors_arrow.exists(),
+        "vectors.arrow should exist after second flush"
+    );
+
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
+
+    let reopened = HannsDb::open(&root).expect("reopen db");
+    let docs = reopened
+        .fetch_documents("docs", &[10, 20])
+        .expect("fetch should use refreshed active arrows without WAL replay");
+
+    assert_eq!(
+        docs.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        vec![10, 20]
+    );
+    assert!(
+        !payloads_jsonl.exists() && !vectors_jsonl.exists(),
+        "reopen should keep refreshed arrow-only active storage instead of replaying WAL back into jsonl"
+    );
+    assert!(
+        payloads_arrow.exists() && vectors_arrow.exists(),
+        "reopen should preserve refreshed active arrow snapshots"
     );
 }
 
@@ -1561,6 +1813,14 @@ fn collection_api_reopen_falls_back_to_jsonl_when_active_arrow_snapshot_is_unrea
         .expect("flush should materialize active-segment arrows");
 
     let collection_dir = root.join("collections").join("docs");
+    append_payloads(
+        &collection_dir.join("payloads.jsonl"),
+        &[BTreeMap::from([(
+            "tag".to_string(),
+            FieldValue::String("jsonl".to_string()),
+        )])],
+    )
+    .expect("recreate payloads jsonl for fallback coverage");
     fs::write(collection_dir.join("payloads.arrow"), b"not arrow").expect("corrupt payloads.arrow");
 
     let reopened = HannsDb::open(&root).expect("reopen db");

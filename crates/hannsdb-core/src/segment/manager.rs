@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::forward_store::ForwardFileFormat;
+
 use super::{SegmentMetadata, TombstoneMask, VersionSet};
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,15 @@ impl SegmentPaths {
 
     pub fn ann_dir(&self) -> PathBuf {
         self.dir.join("ann")
+    }
+
+    pub fn forward_store_descriptor(&self) -> PathBuf {
+        self.dir.join("forward_store.json")
+    }
+
+    pub fn forward_store_artifact(&self, format: ForwardFileFormat) -> PathBuf {
+        self.dir
+            .join(format!("forward_store.{}", format.extension()))
     }
 }
 

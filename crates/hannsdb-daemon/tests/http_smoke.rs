@@ -106,9 +106,17 @@ fn rewrite_delete_by_filter_latest_live_scalar_fixture_to_two_segments(
         "records.bin",
         "ids.bin",
         "payloads.jsonl",
+        "payloads.arrow",
+        "vectors.arrow",
+        "forward_store.json",
+        "forward_store.arrow",
+        "forward_store.parquet",
         "tombstones.json",
     ] {
-        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+        let source = collection_dir.join(file);
+        if source.exists() {
+            fs::rename(&source, seg1_dir.join(file)).expect("move seg-0001 file");
+        }
     }
 
     let mut ids = Vec::with_capacity(second_segment_documents.len());

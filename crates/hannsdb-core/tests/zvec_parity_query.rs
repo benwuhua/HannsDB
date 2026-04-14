@@ -53,9 +53,17 @@ fn rewrite_collection_to_two_segment_layout(
         "records.bin",
         "ids.bin",
         "payloads.jsonl",
+        "payloads.arrow",
+        "vectors.arrow",
+        "forward_store.json",
+        "forward_store.arrow",
+        "forward_store.parquet",
         "tombstones.json",
     ] {
-        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+        let source = collection_dir.join(file);
+        if source.exists() {
+            fs::rename(&source, seg1_dir.join(file)).expect("move seg-0001 file");
+        }
     }
 
     let mut ids = Vec::with_capacity(second_segment_documents.len());
@@ -119,10 +127,18 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
         "records.bin",
         "ids.bin",
         "payloads.jsonl",
+        "payloads.arrow",
         "vectors.jsonl",
+        "vectors.arrow",
+        "forward_store.json",
+        "forward_store.arrow",
+        "forward_store.parquet",
         "tombstones.json",
     ] {
-        fs::rename(collection_dir.join(file), seg1_dir.join(file)).expect("move seg-0001 file");
+        let source = collection_dir.join(file);
+        if source.exists() {
+            fs::rename(&source, seg1_dir.join(file)).expect("move seg-0001 file");
+        }
     }
 
     let mut ids = Vec::with_capacity(second_segment_documents.len());

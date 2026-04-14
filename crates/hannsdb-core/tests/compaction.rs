@@ -214,6 +214,69 @@ fn compaction_filters_tombstoned_rows_from_merged_segment() {
 }
 
 #[test]
+fn compaction_reopen_preserves_flushed_active_segment_after_post_compaction_write() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert 100 docs");
+    let to_delete: Vec<i64> = (0..21).collect();
+    db.delete("docs", &to_delete).expect("delete 21 docs");
+    db.insert("docs", &[200], &[99.0_f32, 99.0])
+        .expect("trigger rollover");
+    db.compact_collection("docs")
+        .expect("compact rolled-over collection");
+    db.insert("docs", &[300], &[100.0_f32, 100.0])
+        .expect("insert into post-compaction active segment");
+    db.flush_collection("docs")
+        .expect("flush refreshed post-compaction active segment");
+
+    let collection_dir = root.join("collections").join("docs");
+    let segment_set_before =
+        SegmentSet::load_from_path(&collection_dir.join("segment_set.json")).expect("segment_set");
+    let active_segment_dir =
+        collection_segments_dir(root, "docs").join(&segment_set_before.active_segment_id);
+    let payloads_jsonl = active_segment_dir.join("payloads.jsonl");
+    let vectors_jsonl = active_segment_dir.join("vectors.jsonl");
+    let payloads_arrow = active_segment_dir.join("payloads.arrow");
+    let vectors_arrow = active_segment_dir.join("vectors.arrow");
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
+
+    let reopened = HannsDb::open(root).expect("reopen after compact + active flush");
+    let fetched = reopened
+        .fetch_documents("docs", &[200, 300])
+        .expect("fetch docs after compact + reopen");
+    assert_eq!(
+        fetched.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        vec![200, 300]
+    );
+
+    let segment_set_after = SegmentSet::load_from_path(&collection_dir.join("segment_set.json"))
+        .expect("segment_set after reopen");
+    assert_eq!(
+        segment_set_after.active_segment_id, segment_set_before.active_segment_id,
+        "reopen should preserve the post-compaction active segment"
+    );
+    assert_eq!(
+        segment_set_after.immutable_segment_ids, segment_set_before.immutable_segment_ids,
+        "reopen should preserve compacted immutable segments"
+    );
+    assert!(
+        !payloads_jsonl.exists() && !vectors_jsonl.exists(),
+        "reopen should preserve arrow-only active storage after post-compaction writes"
+    );
+    assert!(
+        payloads_arrow.exists() && vectors_arrow.exists(),
+        "reopen should keep flushed active arrow snapshots after compaction"
+    );
+}
+
+#[test]
 fn compaction_reopen_prefers_jsonl_when_storage_format_is_jsonl() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();

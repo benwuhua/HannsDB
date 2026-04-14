@@ -1,15 +1,20 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 
 use super::{
-    append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
-    append_vectors, ensure_payload_rows, ensure_sparse_rows, ensure_vector_rows,
-    load_payloads_jsonl, load_vectors_jsonl, write_payloads_arrow, write_vectors_arrow,
-    SegmentManager, SegmentMetadata, SegmentPaths, TombstoneMask, VersionSet,
+    append_record_ids, append_records, append_records_f16, append_sparse_vectors, load_payloads,
+    load_payloads_jsonl, load_record_ids, load_records, load_records_f16, load_vectors,
+    load_vectors_jsonl, write_payloads_arrow, write_vectors_arrow, SegmentManager, SegmentMetadata,
+    SegmentPaths, TombstoneMask, VersionSet,
 };
 use crate::catalog::CollectionMetadata;
 use crate::document::{Document, FieldValue};
+use crate::forward_store::{ChunkedFileWriter, ForwardFileFormat, ForwardRow, MemForwardStore};
+use crate::storage::segment_io::{
+    invalidate_forward_store_snapshot, materialize_forward_store_snapshot,
+};
 
 /// Manages writes to the active segment of a collection, including
 /// auto-rollover when the segment exceeds size or tombstone thresholds.
@@ -55,7 +60,7 @@ impl SegmentWriter {
 
     fn append_batch(
         &self,
-        dimension: usize,
+        collection_meta: &CollectionMetadata,
         external_ids: &[i64],
         records: &[f32],
         payloads: &[BTreeMap<String, FieldValue>],
@@ -64,30 +69,73 @@ impl SegmentWriter {
         fp16: bool,
     ) -> io::Result<AppendResult> {
         let mut active = self.active_paths()?;
-
-        ensure_payload_rows(&active.paths.payloads, active.meta.record_count)?;
-        ensure_vector_rows(&active.paths.vectors, active.meta.record_count)?;
-        ensure_sparse_rows(&active.paths.sparse_vectors, active.meta.record_count)?;
-
+        invalidate_forward_store_snapshot(&active.paths)?;
         let mut tombstone = TombstoneMask::load_from_path(&active.paths.tombstones)?;
+        if self.should_rollover(&active.meta, &tombstone) {
+            self.do_rollover(&mut active)?;
+            active = self.active_paths()?;
+            tombstone = TombstoneMask::load_from_path(&active.paths.tombstones)?;
+        }
+
+        let existing_count = active.meta.record_count;
+        let existing_ids =
+            load_rows_or_default(&active.paths.external_ids, existing_count, load_record_ids)?;
+        let existing_records = if fp16 {
+            load_fp16_records_or_default(
+                &active.paths.records,
+                collection_meta.dimension,
+                existing_count,
+            )?
+        } else {
+            load_records_or_default(
+                &active.paths.records,
+                collection_meta.dimension,
+                existing_count,
+            )?
+        };
+        let existing_payloads =
+            load_rows_or_default(&active.paths.payloads, existing_count, load_payloads)?;
+        let existing_vectors =
+            load_rows_or_default(&active.paths.vectors, existing_count, load_vectors)?;
 
         let inserted = if fp16 {
-            append_records_f16(&active.paths.records, dimension, records)?
+            append_records_f16(&active.paths.records, collection_meta.dimension, records)?
         } else {
-            append_records(&active.paths.records, dimension, records)?
+            append_records(&active.paths.records, collection_meta.dimension, records)?
         };
         let _ = append_record_ids(&active.paths.external_ids, external_ids)?;
-        let _ = append_payloads(&active.paths.payloads, payloads)?;
-        let _ = append_vectors(&active.paths.vectors, vector_rows)?;
         let _ = append_sparse_vectors(&active.paths.sparse_vectors, sparse_rows)?;
+
+        let mut all_ids = existing_ids;
+        all_ids.extend_from_slice(external_ids);
+
+        let mut all_records = existing_records;
+        all_records.extend_from_slice(records);
+
+        let mut all_payloads = existing_payloads;
+        all_payloads.extend(payloads.iter().cloned());
+
+        let mut all_vectors = existing_vectors;
+        all_vectors.extend(vector_rows.iter().cloned());
 
         active.meta.record_count += inserted;
         active.meta.deleted_count = tombstone.deleted_count();
+        active.meta.storage_format = "arrow".to_string();
 
         let needed = active.meta.record_count.saturating_sub(tombstone.len());
         if needed > 0 {
             tombstone.extend(needed);
         }
+
+        persist_forward_store_artifacts(
+            &active.paths.dir,
+            collection_meta,
+            &all_ids,
+            &all_records,
+            &all_payloads,
+            &all_vectors,
+            &tombstone,
+        )?;
 
         active.meta.save_to_path(&active.paths.metadata)?;
         tombstone.save_to_path(&active.paths.tombstones)?;
@@ -108,7 +156,7 @@ impl SegmentWriter {
     /// Append raw vectors and IDs to the active segment.
     pub fn append_records(
         &self,
-        dimension: usize,
+        collection_meta: &CollectionMetadata,
         external_ids: &[i64],
         vectors: &[f32],
         payloads: &[BTreeMap<String, FieldValue>],
@@ -117,7 +165,7 @@ impl SegmentWriter {
         fp16: bool,
     ) -> io::Result<AppendResult> {
         self.append_batch(
-            dimension,
+            collection_meta,
             external_ids,
             vectors,
             payloads,
@@ -162,7 +210,7 @@ impl SegmentWriter {
         }
 
         self.append_batch(
-            collection_meta.dimension,
+            collection_meta,
             &ids,
             &records,
             &payloads,
@@ -181,6 +229,7 @@ impl SegmentWriter {
         meta.deleted_count = tombstone.deleted_count();
         meta.save_to_path(&active.paths.metadata)?;
         tombstone.save_to_path(&active.paths.tombstones)?;
+        invalidate_forward_store_snapshot(&active.paths)?;
         Ok(())
     }
 
@@ -209,8 +258,12 @@ impl SegmentWriter {
                 "records.bin",
                 "ids.bin",
                 "payloads.jsonl",
+                "payloads.arrow",
                 "vectors.jsonl",
+                "vectors.arrow",
                 "sparse_vectors.jsonl",
+                "forward_store.arrow",
+                "forward_store.parquet",
                 "tombstones.json",
             ];
             for file_name in &files_to_move {
@@ -225,8 +278,20 @@ impl SegmentWriter {
             active.paths.dir.clone()
         };
 
+        let collection_meta_path = self.collection_dir.join("collection.json");
+        if !collection_meta_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "collection.json not found",
+            ));
+        }
+        let collection_meta = CollectionMetadata::load_from_path(&collection_meta_path)?;
+        let sealed_paths =
+            SegmentPaths::from_segment_dir(old_dir.clone(), active.paths.segment_id.clone());
+        materialize_forward_store_snapshot(&sealed_paths, &collection_meta)?;
+
         // Convert JSONL → Arrow IPC for the now-immutable segment.
-        if let Err(e) = self.convert_jsonl_to_arrow(&old_dir) {
+        if let Err(e) = self.convert_jsonl_to_arrow(&old_dir, &collection_meta) {
             log::warn!(
                 "JSONL→Arrow conversion failed for {}, keeping JSONL: {}",
                 active.paths.segment_id,
@@ -254,21 +319,15 @@ impl SegmentWriter {
     /// Convert the JSONL payload and vector files in a segment directory to
     /// Arrow IPC. On success, delete the JSONL files and update the segment
     /// metadata. On failure, leave the JSONL files intact.
-    fn convert_jsonl_to_arrow(&self, seg_dir: &std::path::Path) -> io::Result<()> {
+    fn convert_jsonl_to_arrow(
+        &self,
+        seg_dir: &std::path::Path,
+        collection_meta: &CollectionMetadata,
+    ) -> io::Result<()> {
         let jsonl_payloads = seg_dir.join("payloads.jsonl");
         let jsonl_vectors = seg_dir.join("vectors.jsonl");
         let arrow_payloads = seg_dir.join("payloads.arrow");
         let arrow_vectors = seg_dir.join("vectors.arrow");
-
-        // Load collection metadata for schema info.
-        let collection_meta_path = self.collection_dir.join("collection.json");
-        if !collection_meta_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "collection.json not found",
-            ));
-        }
-        let collection_meta = CollectionMetadata::load_from_path(&collection_meta_path)?;
 
         // Convert payloads.
         if jsonl_payloads.exists() {
@@ -298,6 +357,167 @@ impl SegmentWriter {
         }
 
         Ok(())
+    }
+}
+
+fn load_rows_or_default<T, F>(path: &Path, expected_rows: usize, loader: F) -> io::Result<Vec<T>>
+where
+    T: Clone + Default,
+    F: Fn(&Path) -> io::Result<Vec<T>>,
+{
+    match loader(path) {
+        Ok(mut rows) => {
+            if rows.len() > expected_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "row count exceeds expected active-segment row count",
+                ));
+            }
+            rows.resize(expected_rows, T::default());
+            Ok(rows)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(vec![T::default(); expected_rows]),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_records_or_default(
+    path: &Path,
+    dimension: usize,
+    expected_rows: usize,
+) -> io::Result<Vec<f32>> {
+    match load_records(path, dimension) {
+        Ok(records) => {
+            let expected_len = expected_rows.saturating_mul(dimension);
+            if records.len() > expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record vector count exceeds expected active-segment row count",
+                ));
+            }
+            if records.len() < expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record vector count is shorter than expected active-segment row count",
+                ));
+            }
+            Ok(records)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn load_fp16_records_or_default(
+    path: &Path,
+    dimension: usize,
+    expected_rows: usize,
+) -> io::Result<Vec<f32>> {
+    match load_records_f16(path, dimension) {
+        Ok(records) => {
+            let expected_len = expected_rows.saturating_mul(dimension);
+            if records.len() > expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record vector count exceeds expected active-segment row count",
+                ));
+            }
+            if records.len() < expected_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record vector count is shorter than expected active-segment row count",
+                ));
+            }
+            Ok(records)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn persist_forward_store_artifacts(
+    segment_dir: &Path,
+    collection_meta: &CollectionMetadata,
+    external_ids: &[i64],
+    records: &[f32],
+    payloads: &[BTreeMap<String, FieldValue>],
+    vector_rows: &[BTreeMap<String, Vec<f32>>],
+    tombstone: &TombstoneMask,
+) -> io::Result<()> {
+    if external_ids.len() != payloads.len() || external_ids.len() != vector_rows.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forward-store sidecar rows are misaligned with external ids",
+        ));
+    }
+    if records.len() != external_ids.len().saturating_mul(collection_meta.dimension) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "primary records are misaligned with external ids",
+        ));
+    }
+
+    let mut store = MemForwardStore::new(collection_meta.schema());
+    let declared_fields = collection_meta
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut compatibility_payloads = Vec::with_capacity(external_ids.len());
+    let mut compatibility_vectors = Vec::with_capacity(external_ids.len());
+
+    for (row_idx, external_id) in external_ids.iter().enumerate() {
+        let start = row_idx * collection_meta.dimension;
+        let end = start + collection_meta.dimension;
+        let mut row_vectors = vector_rows[row_idx].clone();
+        row_vectors.insert(
+            collection_meta.primary_vector.clone(),
+            records[start..end].to_vec(),
+        );
+        let forward_fields = payloads[row_idx]
+            .iter()
+            .filter(|(field_name, _)| declared_fields.contains(field_name.as_str()))
+            .map(|(field_name, value)| (field_name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        compatibility_payloads.push(payloads[row_idx].clone());
+        compatibility_vectors.push(vector_rows[row_idx].clone());
+        store.append(ForwardRow {
+            internal_id: *external_id as u64,
+            op_seq: row_idx as u64 + 1,
+            is_deleted: tombstone.is_deleted(row_idx),
+            fields: forward_fields,
+            vectors: row_vectors,
+        })?;
+    }
+
+    let writer = ChunkedFileWriter::new(segment_dir);
+    let _ = writer.write(
+        "forward_store",
+        &store,
+        &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
+    )?;
+    write_payloads_arrow(
+        &segment_dir.join("payloads.arrow"),
+        &compatibility_payloads,
+        &collection_meta.fields,
+    )?;
+    write_vectors_arrow(
+        &segment_dir.join("vectors.arrow"),
+        &compatibility_vectors,
+        &collection_meta.vectors,
+        &collection_meta.primary_vector,
+    )?;
+
+    remove_if_exists(&segment_dir.join("payloads.jsonl"))?;
+    remove_if_exists(&segment_dir.join("vectors.jsonl"))?;
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

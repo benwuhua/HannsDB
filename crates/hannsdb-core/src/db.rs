@@ -47,11 +47,12 @@ use crate::storage::primary_keys::{
 };
 use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
 use crate::storage::segment_io::{
-    latest_live_row_index, latest_row_index_for_id, load_payloads_or_empty,
-    load_payloads_with_fields_or_empty, load_record_ids_or_empty, load_records_or_empty,
-    load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
-    load_vectors_or_empty, materialize_active_segment_arrow_snapshots, next_compacted_segment_id,
-    persisted_ann_exists,
+    invalidate_forward_store_snapshot, latest_live_row_index, latest_row_index_for_id,
+    load_payloads_or_empty, load_payloads_with_fields_or_empty, load_record_ids_or_empty,
+    load_records_or_empty, load_shadowed_live_records, load_shadowed_live_vector_records,
+    load_sparse_vectors_or_empty, load_vectors_or_empty,
+    materialize_active_segment_arrow_snapshots, materialize_latest_live_forward_store_snapshot,
+    next_compacted_segment_id, persisted_ann_exists,
 };
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
@@ -839,7 +840,7 @@ impl HannsDb {
         let writer = self.segment_writer(&paths);
         let inserted = writer
             .append_records(
-                collection_meta.dimension,
+                &collection_meta,
                 external_ids,
                 vectors,
                 &empty_payloads,
@@ -1230,6 +1231,7 @@ impl HannsDb {
                 segment_meta.deleted_count = tombstone.deleted_count();
                 segment_meta.save_to_path(&segment.metadata)?;
                 tombstone.save_to_path(&segment.tombstones)?;
+                invalidate_forward_store_snapshot(&segment)?;
             }
         }
 
@@ -2080,6 +2082,7 @@ impl CollectionHandle {
             .unwrap_or_else(|| paths.dir.clone());
         let _ = load_wal_records(&wal_path(&root))?;
         materialize_active_segment_arrow_snapshots(&active_segment, &collection_meta)?;
+        materialize_latest_live_forward_store_snapshot(&self.segment_manager, &collection_meta)?;
         Ok(())
     }
 
@@ -2824,7 +2827,11 @@ impl CollectionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{CollectionSchema, Document, VectorFieldSchema, VectorIndexSchema};
+    use crate::document::{
+        CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
+        VectorIndexSchema,
+    };
+    use crate::segment::load_payloads_arrow;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -2988,6 +2995,74 @@ mod tests {
         )
         .expect("insert documents");
         db
+    }
+
+    #[test]
+    fn pre_append_rollover_reloads_active_segment_sidecars() {
+        let tempdir = tempdir().expect("tempdir");
+        let mut db = HannsDb::open(tempdir.path()).expect("open db");
+        let schema = CollectionSchema::new(
+            "vector",
+            2,
+            "l2",
+            vec![ScalarFieldSchema::new("kind", FieldType::String)],
+        );
+        db.create_collection_with_schema("docs", &schema)
+            .expect("create collection");
+        db.insert_documents(
+            "docs",
+            &[
+                Document::new(
+                    1,
+                    [("kind".into(), FieldValue::String("old".into()))],
+                    vec![1.0, 0.0],
+                ),
+                Document::new(
+                    2,
+                    [("kind".into(), FieldValue::String("old".into()))],
+                    vec![0.8, 0.0],
+                ),
+                Document::new(
+                    3,
+                    [("kind".into(), FieldValue::String("old".into()))],
+                    vec![0.6, 0.0],
+                ),
+            ],
+        )
+        .expect("insert initial docs");
+        assert_eq!(
+            db.delete_by_filter("docs", "kind == \"old\"")
+                .expect("delete old docs"),
+            3
+        );
+
+        db.insert_documents(
+            "docs",
+            &[Document::new(
+                4,
+                [("kind".into(), FieldValue::String("new".into()))],
+                vec![0.0, 0.0],
+            )],
+        )
+        .expect("insert replacement doc");
+
+        let hits = db
+            .query_documents("docs", &[0.0, 0.0], 10, Some("kind == \"new\""))
+            .expect("query replacement doc");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 4);
+
+        let paths = collection_paths_for_root(tempdir.path(), "docs");
+        let active_segment = SegmentManager::new(paths.dir.clone())
+            .active_segment_path()
+            .expect("active segment path");
+        let payloads = load_payloads_arrow(&active_segment.payloads_arrow)
+            .expect("load active segment payloads");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "new active segment should only persist its own row"
+        );
     }
 
     #[test]

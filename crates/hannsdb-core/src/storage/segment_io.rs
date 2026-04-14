@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::convert::TryFrom;
 use std::io;
 use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
 use crate::document::{FieldValue, SparseVector};
+use crate::forward_store::{ChunkedFileWriter, ForwardFileFormat, ForwardRow, MemForwardStore};
 use crate::segment::index_runtime::{ann_blob_path, HNSW_INDEX_FILE};
 use crate::segment::{
     load_payloads_jsonl, load_payloads_with_fields, load_record_ids, load_records,
@@ -21,7 +23,13 @@ fn load_payloads_for_segment(
     match segment_meta.normalized_storage_format() {
         NormalizedStorageFormat::Arrow => {
             if segment.payloads_arrow.exists() {
-                return load_payloads_with_fields(&segment.payloads, fields);
+                match load_payloads_with_fields(&segment.payloads, fields) {
+                    Ok(payloads) => return Ok(payloads),
+                    Err(err) if segment.payloads.exists() => {
+                        let _ = err;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             load_payload_rows_jsonl(&segment.payloads, fields)
         }
@@ -129,6 +137,170 @@ pub(crate) fn materialize_active_segment_arrow_snapshots(
     Ok(())
 }
 
+pub(crate) fn materialize_forward_store_snapshot(
+    segment_paths: &SegmentPaths,
+    collection_meta: &CollectionMetadata,
+) -> io::Result<()> {
+    let segment_meta = SegmentMetadata::load_from_path(&segment_paths.metadata)?;
+    let stored_ids = load_record_ids_or_empty(&segment_paths.external_ids)?;
+    let records = load_records_or_empty(
+        &segment_paths.records,
+        collection_meta.dimension,
+        collection_meta.primary_is_fp16(),
+    )?;
+    let row_capacity = records.len() / collection_meta.dimension.max(1);
+    let row_limit = segment_meta
+        .record_count
+        .min(stored_ids.len())
+        .min(row_capacity);
+
+    if row_limit.saturating_mul(collection_meta.dimension) > records.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "forward_store snapshot record rows are misaligned",
+        ));
+    }
+
+    let payloads = load_payloads_or_empty(segment_paths, &segment_meta, row_limit)?;
+    let vectors = load_vectors_or_empty(segment_paths, &segment_meta, row_limit)?;
+    let tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
+    let mut store = MemForwardStore::new(collection_meta.schema());
+    let declared_fields = collection_meta
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    for row_idx in 0..row_limit {
+        let internal_id = u64::try_from(stored_ids[row_idx]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "forward_store snapshot cannot encode negative internal id {}",
+                    stored_ids[row_idx]
+                ),
+            )
+        })?;
+        let mut row_vectors = vectors[row_idx].clone();
+        let start = row_idx * collection_meta.dimension;
+        let end = start + collection_meta.dimension;
+        row_vectors.insert(
+            collection_meta.primary_vector.clone(),
+            records[start..end].to_vec(),
+        );
+        let forward_fields = payloads[row_idx]
+            .iter()
+            .filter(|(field_name, _)| declared_fields.contains(field_name.as_str()))
+            .map(|(field_name, value)| (field_name.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        store.append(ForwardRow {
+            internal_id,
+            op_seq: row_idx as u64 + 1,
+            is_deleted: tombstone.is_deleted(row_idx),
+            fields: forward_fields,
+            vectors: row_vectors,
+        })?;
+    }
+
+    let descriptor = ChunkedFileWriter::new(&segment_paths.dir).write(
+        "forward_store",
+        &store,
+        &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
+    )?;
+    crate::segment::atomic_write(
+        &segment_paths.forward_store_descriptor(),
+        &serde_json::to_vec_pretty(&descriptor).map_err(json_to_io_error)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn materialize_latest_live_forward_store_snapshot(
+    segment_manager: &SegmentManager,
+    collection_meta: &CollectionMetadata,
+) -> io::Result<()> {
+    let active_segment = segment_manager.active_segment_path()?;
+    let mut store = MemForwardStore::new(collection_meta.schema());
+    let mut seen_ids = HashSet::new();
+    let mut op_seq = 1_u64;
+
+    for segment in segment_manager.segment_paths()? {
+        let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
+        let records = load_records_or_empty(
+            &segment.records,
+            collection_meta.dimension,
+            collection_meta.primary_is_fp16(),
+        )?;
+        let stored_ids = load_record_ids_or_empty(&segment.external_ids)?;
+        let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
+        let vectors = load_vectors_or_empty(&segment, &segment_meta, stored_ids.len())?;
+        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
+
+        let row_limit = segment_meta
+            .record_count
+            .min(stored_ids.len())
+            .min(records.len() / collection_meta.dimension.max(1))
+            .min(payloads.len())
+            .min(vectors.len());
+
+        for row_idx in (0..row_limit).rev() {
+            let internal_id = stored_ids[row_idx];
+            if !seen_ids.insert(internal_id) || tombstone.is_deleted(row_idx) {
+                continue;
+            }
+            let internal_id = u64::try_from(internal_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "forward_store latest-live snapshot cannot encode negative internal id {}",
+                        stored_ids[row_idx]
+                    ),
+                )
+            })?;
+            let start = row_idx * collection_meta.dimension;
+            let end = start + collection_meta.dimension;
+            let mut row_vectors = vectors[row_idx].clone();
+            row_vectors.insert(
+                collection_meta.primary_vector.clone(),
+                records[start..end].to_vec(),
+            );
+            store.append(ForwardRow {
+                internal_id,
+                op_seq,
+                is_deleted: false,
+                fields: payloads[row_idx].clone(),
+                vectors: row_vectors,
+            })?;
+            op_seq += 1;
+        }
+    }
+
+    let descriptor = ChunkedFileWriter::new(&active_segment.dir).write(
+        "forward_store",
+        &store,
+        &[ForwardFileFormat::ArrowIpc, ForwardFileFormat::Parquet],
+    )?;
+    crate::segment::atomic_write(
+        &active_segment.forward_store_descriptor(),
+        &serde_json::to_vec_pretty(&descriptor).map_err(json_to_io_error)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn invalidate_forward_store_snapshot(segment_paths: &SegmentPaths) -> io::Result<()> {
+    for path in [
+        segment_paths.forward_store_descriptor(),
+        segment_paths.forward_store_artifact(ForwardFileFormat::ArrowIpc),
+        segment_paths.forward_store_artifact(ForwardFileFormat::Parquet),
+    ] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn load_vectors_or_empty(
     segment: &SegmentPaths,
     segment_meta: &SegmentMetadata,
@@ -164,7 +336,13 @@ fn load_vectors_for_segment(
     match segment_meta.normalized_storage_format() {
         NormalizedStorageFormat::Arrow => {
             if segment.vectors_arrow.exists() {
-                return load_vectors(&segment.vectors);
+                match load_vectors(&segment.vectors) {
+                    Ok(vectors) => return Ok(vectors),
+                    Err(err) if segment.vectors.exists() => {
+                        let _ = err;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             load_vectors_jsonl(&segment.vectors)
         }
@@ -368,4 +546,8 @@ pub(crate) fn next_compacted_segment_id<'a>(
         .max()
         .unwrap_or(0);
     format!("seg-{:06}", max_id.saturating_add(1))
+}
+
+fn json_to_io_error(err: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, err)
 }

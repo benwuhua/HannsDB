@@ -208,6 +208,65 @@ fn lifecycle_tombstone_ratio_rollover_creates_segment_set_structure() {
     assert_eq!(hit_ids, vec![21, 22, 23]);
 }
 
+#[test]
+fn lifecycle_reopen_preserves_flushed_active_segment_after_rollover_write() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+
+    let ids: Vec<i64> = (0..100).collect();
+    let vectors: Vec<f32> = ids.iter().flat_map(|&i| vec![i as f32, 0.0_f32]).collect();
+    db.insert("docs", &ids, &vectors).expect("insert 100 docs");
+    let to_delete: Vec<i64> = (0..21).collect();
+    db.delete("docs", &to_delete).expect("delete 21 docs");
+    db.insert("docs", &[200], &[99.0_f32, 99.0])
+        .expect("trigger rollover");
+    db.insert("docs", &[300], &[100.0_f32, 100.0])
+        .expect("insert into new active segment");
+    db.flush_collection("docs")
+        .expect("flush refreshed active segment");
+
+    let segment_set_before =
+        SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("load segment_set");
+    let active_segment_dir = segments_dir(root, "docs").join(&segment_set_before.active_segment_id);
+    let payloads_jsonl = active_segment_dir.join("payloads.jsonl");
+    let vectors_jsonl = active_segment_dir.join("vectors.jsonl");
+    let payloads_arrow = active_segment_dir.join("payloads.arrow");
+    let vectors_arrow = active_segment_dir.join("vectors.arrow");
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
+
+    let reopened = HannsDb::open(root).expect("reopen after rollover active flush");
+    let fetched = reopened
+        .fetch_documents("docs", &[200, 300])
+        .expect("fetch rollover active docs after reopen");
+    assert_eq!(
+        fetched.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        vec![200, 300]
+    );
+
+    let segment_set_after =
+        SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("reload segment_set");
+    assert_eq!(
+        segment_set_after.active_segment_id, segment_set_before.active_segment_id,
+        "reopen should preserve the active segment instead of rebuilding from WAL"
+    );
+    assert_eq!(
+        segment_set_after.immutable_segment_ids, segment_set_before.immutable_segment_ids,
+        "reopen should preserve rollover-produced immutable segments"
+    );
+    assert!(
+        !payloads_jsonl.exists() && !vectors_jsonl.exists(),
+        "reopen should preserve arrow-only active storage after later writes"
+    );
+    assert!(
+        payloads_arrow.exists() && vectors_arrow.exists(),
+        "reopen should keep flushed active arrow snapshots in the rolled-over layout"
+    );
+}
+
 /// Calling compact on a collection that has no `segment_set.json` (flat
 /// single-segment layout) is a no-op: it succeeds, does not create any
 /// segment-set files, and leaves search results intact.

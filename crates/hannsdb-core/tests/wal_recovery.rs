@@ -578,8 +578,8 @@ fn wal_recovery_open_skips_replay_when_arrow_snapshot_can_authoritatively_reopen
         collection_dir.join("vectors.arrow").exists(),
         "flush should create vectors.arrow before removing jsonl sidecars"
     );
-    fs::remove_file(&payloads_jsonl).expect("remove payloads jsonl");
-    fs::remove_file(&vectors_jsonl).expect("remove vectors jsonl");
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
 
     let reopened = HannsDb::open(temp.path()).expect("reopen from authoritative arrows");
     let fetched = reopened
@@ -594,6 +594,55 @@ fn wal_recovery_open_skips_replay_when_arrow_snapshot_can_authoritatively_reopen
     assert!(
         !vectors_jsonl.exists(),
         "reopen should not replay WAL and recreate vectors.jsonl when Arrow snapshots are authoritative"
+    );
+}
+
+#[test]
+fn wal_recovery_open_skips_replay_when_refreshed_active_arrow_snapshots_cover_later_write() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[10], &[0.0_f32, 0.0])
+        .expect("insert first vector");
+    db.flush_collection("docs").expect("flush first state");
+    db.insert("docs", &[20], &[1.0_f32, 1.0])
+        .expect("insert second vector");
+    db.flush_collection("docs")
+        .expect("flush refreshed active state");
+
+    let collection_dir = collection_dir(root, "docs");
+    let payloads_jsonl = collection_dir.join("payloads.jsonl");
+    let vectors_jsonl = collection_dir.join("vectors.jsonl");
+    let payloads_arrow = collection_dir.join("payloads.arrow");
+    let vectors_arrow = collection_dir.join("vectors.arrow");
+    assert!(
+        payloads_arrow.exists(),
+        "payloads.arrow should exist after refreshed flush"
+    );
+    assert!(
+        vectors_arrow.exists(),
+        "vectors.arrow should exist after refreshed flush"
+    );
+    let _ = fs::remove_file(&payloads_jsonl);
+    let _ = fs::remove_file(&vectors_jsonl);
+
+    let reopened = HannsDb::open(root).expect("reopen from refreshed arrow snapshots");
+    let fetched = reopened
+        .fetch_documents("docs", &[10, 20])
+        .expect("fetch should use refreshed active arrows");
+    assert_eq!(
+        fetched.iter().map(|doc| doc.id).collect::<Vec<_>>(),
+        vec![10, 20]
+    );
+    assert!(
+        !payloads_jsonl.exists() && !vectors_jsonl.exists(),
+        "reopen should not wipe the collection and recreate jsonl sidecars from WAL"
+    );
+    assert!(
+        payloads_arrow.exists() && vectors_arrow.exists(),
+        "reopen should preserve refreshed arrow snapshots for later active writes"
     );
 }
 

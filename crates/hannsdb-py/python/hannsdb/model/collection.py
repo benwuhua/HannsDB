@@ -144,6 +144,65 @@ def _coerce_docs_to_native(docs):
     return [_coerce_doc_to_native(doc) for doc in list(docs)]
 
 
+def _coerce_scalar_value_for_field_schema(value, field_schema):
+    data_type = str(field_schema.data_type)
+    if field_schema.array and isinstance(value, (list, tuple)):
+        return [_coerce_scalar_value_for_field_schema(item, field_schema._replace(array=False) if hasattr(field_schema, "_replace") else FieldSchema(name=field_schema.name, data_type=field_schema.data_type, nullable=field_schema.nullable, array=False)) for item in value]
+
+    if data_type == "int64":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return int(value)
+        return value
+
+    if data_type == "int32":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and -(2**31) <= int(value) < 2**31:
+            return int(value)
+        return value
+
+    if data_type == "uint32":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and 0 <= int(value) < 2**32:
+            return int(value)
+        return value
+
+    if data_type == "uint64":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and 0 <= int(value) < 2**64:
+            return int(value)
+        return value
+
+    if data_type in {"float", "float64"}:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        return value
+
+    return value
+
+
+def _coerce_doc_to_collection_schema(doc, schema: CollectionSchema | None):
+    if schema is None:
+        return _wrap_doc(doc)
+
+    doc = _wrap_doc(doc)
+    normalized_fields = {}
+    for name, value in doc.fields.items():
+        try:
+            field_schema = schema.field(name)
+        except KeyError:
+            normalized_fields[name] = value
+            continue
+        normalized_fields[name] = _coerce_scalar_value_for_field_schema(value, field_schema)
+    return doc._replace(fields=normalized_fields)
+
+
 def _coerce_docs_input(docs):
     native_doc_type = getattr(_native_module, "Doc", None)
     if isinstance(docs, Doc) or (
@@ -477,17 +536,26 @@ class Collection:
             return _wrap_doc_result(self._core.query_context(context))
 
     def insert(self, docs):
-        docs = _coerce_docs_input(docs)
+        docs = [
+            _coerce_doc_to_collection_schema(doc, self._schema)
+            for doc in _coerce_docs_input(docs)
+        ]
         with self._core_lock:
             return self._core.insert(_coerce_docs_to_native(docs))
 
     def upsert(self, docs):
-        docs = _coerce_docs_input(docs)
+        docs = [
+            _coerce_doc_to_collection_schema(doc, self._schema)
+            for doc in _coerce_docs_input(docs)
+        ]
         with self._core_lock:
             return self._core.upsert(_coerce_docs_to_native(docs))
 
     def update(self, docs):
-        patches = [_wrap_doc(doc) for doc in _coerce_docs_input(docs)]
+        patches = [
+            _coerce_doc_to_collection_schema(doc, self._schema)
+            for doc in _coerce_docs_input(docs)
+        ]
         ids = [doc.id for doc in patches]
         unique_ids = list(dict.fromkeys(ids))
         with self._core_lock:

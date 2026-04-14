@@ -638,6 +638,12 @@ fn core_documents_from_docs(
     collection: &mut Collection,
     docs: &[Doc],
 ) -> std::io::Result<Vec<(String, CoreDocument)>> {
+    let collection_metadata =
+        collection_metadata_from_root(std::path::Path::new(&collection.path), &collection.collection_name)?;
+    let docs = docs
+        .iter()
+        .map(|doc| normalize_doc_fields_for_collection(doc, &collection_metadata))
+        .collect::<std::io::Result<Vec<_>>>()?;
     let public_ids = docs.iter().map(|doc| doc.id.clone()).collect::<Vec<_>>();
     let internal_ids = collection
         .db
@@ -651,6 +657,157 @@ fn core_documents_from_docs(
                 .map(|document| (public_id, document))
         })
         .collect()
+}
+
+fn normalize_doc_fields_for_collection(
+    doc: &Doc,
+    metadata: &CollectionMetadata,
+) -> std::io::Result<Doc> {
+    Ok(Doc {
+        id: doc.id.clone(),
+        score: doc.score,
+        fields: normalize_fields_for_collection(&doc.fields, metadata)?,
+        vectors: doc.vectors.clone(),
+        field_name: doc.field_name.clone(),
+        group_key: doc.group_key.clone(),
+    })
+}
+
+fn normalize_fields_for_collection(
+    fields: &BTreeMap<String, FieldValue>,
+    metadata: &CollectionMetadata,
+) -> std::io::Result<BTreeMap<String, FieldValue>> {
+    fields
+        .iter()
+        .map(|(name, value)| {
+            let normalized = match metadata.fields.iter().find(|field| field.name == *name) {
+                Some(field_schema) => coerce_field_value_for_schema(name, value, field_schema)?,
+                None => value.clone(),
+            };
+            Ok((name.clone(), normalized))
+        })
+        .collect()
+}
+
+fn coerce_field_value_for_schema(
+    field_name: &str,
+    value: &FieldValue,
+    schema: &CoreScalarFieldSchema,
+) -> std::io::Result<FieldValue> {
+    if schema.array {
+        let FieldValue::Array(items) = value else {
+            return Err(schema_mismatch_error(field_name, &schema.data_type));
+        };
+        let element_schema =
+            CoreScalarFieldSchema::new(field_name.to_string(), schema.data_type.clone())
+                .with_flags(schema.nullable, false);
+        return items
+            .iter()
+            .map(|item| coerce_field_value_for_schema(field_name, item, &element_schema))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map(FieldValue::Array);
+    }
+
+    match schema.data_type {
+        CoreFieldType::String => match value {
+            FieldValue::String(v) => Ok(FieldValue::String(v.clone())),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::Int64 => match value {
+            FieldValue::Int64(v) => Ok(FieldValue::Int64(*v)),
+            FieldValue::Int32(v) => Ok(FieldValue::Int64((*v).into())),
+            FieldValue::UInt32(v) => Ok(FieldValue::Int64((*v).into())),
+            FieldValue::UInt64(v) => i64::try_from(*v)
+                .map(FieldValue::Int64)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::Int32 => match value {
+            FieldValue::Int32(v) => Ok(FieldValue::Int32(*v)),
+            FieldValue::Int64(v) => i32::try_from(*v)
+                .map(FieldValue::Int32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            FieldValue::UInt32(v) => i32::try_from(*v)
+                .map(FieldValue::Int32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            FieldValue::UInt64(v) => i32::try_from(*v)
+                .map(FieldValue::Int32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::UInt32 => match value {
+            FieldValue::UInt32(v) => Ok(FieldValue::UInt32(*v)),
+            FieldValue::Int32(v) => u32::try_from(*v)
+                .map(FieldValue::UInt32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            FieldValue::Int64(v) => u32::try_from(*v)
+                .map(FieldValue::UInt32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            FieldValue::UInt64(v) => u32::try_from(*v)
+                .map(FieldValue::UInt32)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::UInt64 => match value {
+            FieldValue::UInt64(v) => Ok(FieldValue::UInt64(*v)),
+            FieldValue::UInt32(v) => Ok(FieldValue::UInt64((*v).into())),
+            FieldValue::Int32(v) => u64::try_from(*v)
+                .map(FieldValue::UInt64)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            FieldValue::Int64(v) => u64::try_from(*v)
+                .map(FieldValue::UInt64)
+                .map_err(|_| schema_mismatch_error(field_name, &schema.data_type)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::Float => match value {
+            FieldValue::Float(v) => Ok(FieldValue::Float(*v)),
+            FieldValue::Float64(v) => Ok(FieldValue::Float(*v as f32)),
+            FieldValue::Int32(v) => Ok(FieldValue::Float(*v as f32)),
+            FieldValue::Int64(v) => Ok(FieldValue::Float(*v as f32)),
+            FieldValue::UInt32(v) => Ok(FieldValue::Float(*v as f32)),
+            FieldValue::UInt64(v) => Ok(FieldValue::Float(*v as f32)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::Float64 => match value {
+            FieldValue::Float64(v) => Ok(FieldValue::Float64(*v)),
+            FieldValue::Float(v) => Ok(FieldValue::Float64((*v).into())),
+            FieldValue::Int32(v) => Ok(FieldValue::Float64((*v).into())),
+            FieldValue::Int64(v) => Ok(FieldValue::Float64(*v as f64)),
+            FieldValue::UInt32(v) => Ok(FieldValue::Float64((*v).into())),
+            FieldValue::UInt64(v) => Ok(FieldValue::Float64(*v as f64)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::Bool => match value {
+            FieldValue::Bool(v) => Ok(FieldValue::Bool(*v)),
+            _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
+        },
+        CoreFieldType::VectorFp32
+        | CoreFieldType::VectorFp16
+        | CoreFieldType::VectorSparse => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("field {field_name} cannot use vector type in scalar schema"),
+        )),
+    }
+}
+
+fn schema_mismatch_error(field_name: &str, data_type: &CoreFieldType) -> std::io::Error {
+    let expected = match data_type {
+        CoreFieldType::String => "string",
+        CoreFieldType::Int64 => "int64",
+        CoreFieldType::Int32 => "int32",
+        CoreFieldType::UInt32 => "uint32",
+        CoreFieldType::UInt64 => "uint64",
+        CoreFieldType::Float => "float",
+        CoreFieldType::Float64 => "float64",
+        CoreFieldType::Bool => "bool",
+        CoreFieldType::VectorFp32 => "vector_fp32",
+        CoreFieldType::VectorFp16 => "vector_fp16",
+        CoreFieldType::VectorSparse => "vector_sparse",
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("field {field_name} had non-{expected} value"),
+    )
 }
 
 fn docs_from_core_documents(
@@ -1209,10 +1366,10 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
             FieldValue::Bool(value.extract::<bool>()?)
         } else if let Ok(value) = value.extract::<String>() {
             FieldValue::String(value)
-        } else if let Ok(value) = value.extract::<i64>() {
-            FieldValue::Int64(value)
         } else if let Ok(value) = value.extract::<i32>() {
             FieldValue::Int32(value)
+        } else if let Ok(value) = value.extract::<i64>() {
+            FieldValue::Int64(value)
         } else if let Ok(value) = value.extract::<u32>() {
             FieldValue::UInt32(value)
         } else if let Ok(value) = value.extract::<u64>() {
@@ -2442,16 +2599,22 @@ impl PyCollection {
     }
 
     fn update(&mut self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
-        let collection_name = self.inner_ref()?.collection_name.clone();
+        let inner = self.inner_ref()?;
+        let collection_name = inner.collection_name.clone();
+        let collection_metadata =
+            collection_metadata_from_root(std::path::Path::new(&inner.path), &collection_name)
+                .map_err(io_to_py_err)?;
         let mut updates = Vec::with_capacity(docs.len());
         for doc in docs {
             let doc = doc.borrow(py);
+            let normalized_fields =
+                normalize_fields_for_collection(&doc.inner.fields, &collection_metadata)
+                    .map_err(io_to_py_err)?;
             let mut fields = BTreeMap::new();
-            for (key, value) in &doc.inner.fields {
+            for (key, value) in &normalized_fields {
                 fields.insert(key.clone(), Some(value.clone()));
             }
-            let resolved_ids = self
-                .inner_ref()?
+            let resolved_ids = inner
                 .db
                 .resolve_query_ids_by_primary_keys(&collection_name, &[doc.inner.id.clone()])
                 .map_err(io_to_py_err)?;
