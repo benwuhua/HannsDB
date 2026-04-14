@@ -79,6 +79,7 @@ impl IvfUsqIndex {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_bytes(
         dim: usize,
         metric: &str,
@@ -244,9 +245,7 @@ impl VectorIndexBackend for IvfUsqIndex {
             .into_iter()
             .zip(result.distances)
             .filter_map(|(id, distance)| {
-                if id < 0 {
-                    None
-                } else if bitset.get(id as usize) {
+                if id < 0 || bitset.get(id as usize) {
                     None
                 } else {
                     Some(HnswSearchHit {

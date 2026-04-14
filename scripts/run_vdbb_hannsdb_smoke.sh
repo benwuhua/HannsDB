@@ -95,9 +95,23 @@ if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
   exit 1
 fi
 
+. "$VENV_PATH/bin/activate"
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    PYTHON_BIN="python"
+  fi
+fi
+
+echo "Using VectorDBBench repo: $VDBB_REPO"
+echo "Using HannsDB venv: $VENV_PATH"
+echo "Using Python binary: $PYTHON_BIN"
+
 if [[ "$REGENERATE" == "true" || ! -f "$DATASET_DIR/train.parquet" || ! -f "$DATASET_DIR/test.parquet" || ! -f "$DATASET_DIR/neighbors.parquet" ]]; then
-  . "$VENV_PATH/bin/activate"
-  python "$ROOT_DIR/python/generate_custom_vdbb_dataset.py" \
+  "$PYTHON_BIN" "$ROOT_DIR/python/generate_custom_vdbb_dataset.py" \
     --output-dir "$DATASET_DIR" \
     --dimension "$DATASET_DIM" \
     --train-size "$DATASET_SIZE" \
@@ -108,8 +122,7 @@ else
   echo "reusing dataset at $DATASET_DIR"
 fi
 
-. "$VENV_PATH/bin/activate"
-PYTHONPATH="$VDBB_REPO" python -m vectordb_bench.cli.vectordbbench hannsdb \
+PYTHONPATH="$VDBB_REPO" "$PYTHON_BIN" -m vectordb_bench.cli.vectordbbench hannsdb \
   --path "$DB_PATH" \
   --db-label "$DB_LABEL" \
   --task-label "$TASK_LABEL" \

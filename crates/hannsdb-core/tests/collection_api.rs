@@ -1004,6 +1004,22 @@ fn collection_api_get_collection_info_preserves_index_complete_after_reopen() {
     assert_eq!(info.index_completeness.get("vector"), Some(&1.0));
 }
 
+#[test]
+fn collection_api_get_collection_info_clears_index_complete_after_subsequent_write() {
+    let root = unique_temp_dir("hannsdb_collection_api_info_index_stale");
+    let mut db = HannsDb::open(&root).expect("open db");
+    db.create_collection("docs", 2, "l2")
+        .expect("create collection");
+    db.insert("docs", &[11, 22], &[0.0_f32, 0.0, 1.0, 1.0])
+        .expect("insert vectors");
+    db.optimize_collection("docs").expect("optimize");
+    db.insert("docs", &[33], &[2.0_f32, 2.0])
+        .expect("insert after optimize");
+
+    let info = db.get_collection_info("docs").expect("get collection info");
+    assert_eq!(info.index_completeness.get("vector"), Some(&0.0));
+}
+
 #[cfg(feature = "hanns-backend")]
 #[test]
 fn collection_api_list_segments_marks_ann_ready_after_optimize() {

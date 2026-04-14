@@ -67,6 +67,13 @@ impl SegmentManager {
         Self { collection_dir }
     }
 
+    pub fn collection_name(&self) -> &str {
+        self.collection_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unknown>")
+    }
+
     pub fn collection_dir(&self) -> &Path {
         &self.collection_dir
     }

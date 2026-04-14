@@ -5,20 +5,22 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor, VectorIndexKind};
-use hannsdb_index::factory::DefaultIndexFactory;
+use hannsdb_index::descriptor::{ScalarIndexDescriptor, VectorIndexDescriptor};
 use hannsdb_index::scalar::{InvertedScalarIndex, RangeOp, ScalarValue};
 use hannsdb_index::sparse::{SparseIndexBackend, SparseVectorData};
 
 use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
+    field_value_to_scalar, validate_documents, validate_schema_primary_vector_descriptor,
+    validate_schema_secondary_vector_descriptors, validate_vector_index_descriptor,
     CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
-    VectorFieldSchema, VectorIndexSchema,
+    VectorFieldSchema,
 };
 use crate::pk::{PrimaryKeyMode, PrimaryKeyRegistry};
 use crate::query::{
-    distance_by_metric, parse_filter, resolve_vector_descriptor_for_field, search_by_metric,
-    search_sparse_bruteforce, ComparisonOp, FilterExpr, QueryContext, QueryExecutor, QueryPlan,
+    compare_hits, distance_by_metric, parse_filter, project_hits_output_fields,
+    resolve_vector_descriptor_for_field, search_by_metric, search_sparse_bruteforce,
+    sort_hits_by_field, ComparisonOp, FilterExpr, QueryContext, QueryExecutor, QueryPlan,
     QueryPlanner, SearchHit,
 };
 #[cfg(feature = "hanns-backend")]
@@ -33,74 +35,47 @@ use crate::segment::index_runtime::{
 };
 use crate::segment::{
     append_payloads, append_record_ids, append_records, append_records_f16, append_sparse_vectors,
-    append_vectors, ensure_payload_rows, ensure_vector_rows, load_payloads, load_payloads_jsonl,
-    load_payloads_with_fields, load_record_ids, load_records, load_records_f16,
-    load_sparse_vectors, load_vectors, load_vectors_jsonl, write_payloads_arrow,
-    write_vectors_arrow, SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask,
-    VersionSet,
+    append_vectors, ensure_payload_rows, ensure_vector_rows, load_payloads_jsonl, load_record_ids,
+    load_records, load_records_f16, load_vectors_jsonl, write_payloads_arrow, write_vectors_arrow,
+    SegmentManager, SegmentMetadata, SegmentPaths, SegmentSet, TombstoneMask, VersionSet,
 };
-use crate::wal::{append_wal_record, load_wal_records, truncate_wal, WalRecord};
+use crate::storage::paths::{
+    collection_paths_for_dir, collection_paths_for_root, manifest_path, wal_path, CollectionPaths,
+};
+use crate::storage::primary_keys::{
+    assign_internal_ids_for_public_keys, display_key_for_internal_id, load_primary_key_registry,
+    register_public_keys_with_internal_ids, resolve_public_keys_to_internal_ids,
+};
+use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
+use crate::storage::segment_io::{
+    append_documents, has_live_id, latest_row_index_for_id, load_payloads_or_empty,
+    load_payloads_with_fields_or_empty, load_record_ids_or_empty, load_records_or_empty,
+    load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
+    load_vectors_or_empty, mark_live_id_deleted, materialize_active_segment_arrow_snapshots,
+    next_compacted_segment_id, persisted_ann_exists,
+};
+use crate::storage::wal::{
+    append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
+};
 
 const DEFAULT_EF_SEARCH: usize = 32;
 const DEFAULT_NPROBE: usize = 32;
-const INDEX_CATALOG_FILE: &str = "indexes.json";
-
 pub struct HannsDb {
     root: PathBuf,
     read_only: bool,
     collection_handles: RwLock<HashMap<String, Arc<CollectionHandle>>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectionInfo {
-    pub name: String,
-    pub dimension: usize,
-    pub metric: String,
-    pub record_count: usize,
-    pub deleted_count: usize,
-    pub live_count: usize,
-    /// For each vector field, the fraction of live data covered by an ANN index (0.0..=1.0).
-    /// A value of 1.0 means the field is fully indexed; 0.0 means no index exists.
-    pub index_completeness: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectionSegmentInfo {
-    pub id: String,
-    pub live_count: usize,
-    pub dead_count: usize,
-    pub ann_ready: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocumentHit {
-    pub id: i64,
-    pub distance: f32,
-    pub fields: BTreeMap<String, FieldValue>,
-    pub vectors: BTreeMap<String, Vec<f32>>,
-    pub sparse_vectors: BTreeMap<String, crate::document::SparseVector>,
-    /// Set when group_by is active: the value of the group_by field for this hit.
-    pub group_key: Option<FieldValue>,
-}
-
-#[derive(Clone)]
-struct CachedDocumentState {
-    documents: Arc<HashMap<i64, Document>>,
-}
-
-#[derive(Debug, Default)]
-struct IndexRegistry;
+pub use crate::db_types::{CollectionInfo, CollectionSegmentInfo};
+pub use crate::query::DocumentHit;
 
 pub struct CollectionHandle {
-    name: String,
-    root: PathBuf,
     segment_manager: SegmentManager,
     version_set: RwLock<VersionSet>,
-    index_registry: Arc<IndexRegistry>,
     search_cache: Mutex<HashMap<String, CachedSearchState>>,
     scalar_cache: Mutex<HashMap<String, InvertedScalarIndex>>,
     sparse_index_cache: Mutex<HashMap<String, Box<dyn SparseIndexBackend>>>,
-    document_cache: Mutex<Option<CachedDocumentState>>,
+    document_cache: Mutex<Option<Arc<HashMap<i64, Document>>>>,
 }
 
 impl HannsDb {
@@ -165,13 +140,7 @@ impl HannsDb {
         let _ = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let segment_manager = SegmentManager::new(paths.dir.clone());
         let version_set = segment_manager.version_set()?;
-        let handle = Arc::new(CollectionHandle::new(
-            name.to_string(),
-            self.root.clone(),
-            segment_manager,
-            version_set,
-            Arc::new(IndexRegistry),
-        ));
+        let handle = Arc::new(CollectionHandle::new(segment_manager, version_set));
         handles.insert(name.to_string(), Arc::clone(&handle));
         Ok(handle)
     }
@@ -1575,7 +1544,11 @@ impl HannsDb {
         }
 
         let plan = WalReplayPlan::build(&records);
-        if !plan.has_owned_collections() || !plan.requires_replay(self)? {
+        if !plan.has_owned_collections()
+            || !plan.requires_replay(&manifest_path(&self.root), |collection| {
+                self.collection_paths(collection)
+            })?
+        {
             return Ok(());
         }
 
@@ -1667,28 +1640,15 @@ impl HannsDb {
 }
 
 impl CollectionHandle {
-    fn new(
-        name: String,
-        root: PathBuf,
-        segment_manager: SegmentManager,
-        version_set: VersionSet,
-        index_registry: Arc<IndexRegistry>,
-    ) -> Self {
+    fn new(segment_manager: SegmentManager, version_set: VersionSet) -> Self {
         Self {
-            name,
-            root,
             segment_manager,
             version_set: RwLock::new(version_set),
-            index_registry,
             search_cache: Mutex::new(HashMap::new()),
             scalar_cache: Mutex::new(HashMap::new()),
             sparse_index_cache: Mutex::new(HashMap::new()),
             document_cache: Mutex::new(None),
         }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     pub fn search(&self, query: &[f32], top_k: usize) -> io::Result<Vec<SearchHit>> {
@@ -1865,7 +1825,7 @@ impl CollectionHandle {
                                 group_key: None,
                             })
                             .collect();
-                        project_document_hits(&mut doc_hits, plan.output_fields.as_deref());
+                        project_hits_output_fields(&mut doc_hits, plan.output_fields.as_deref());
                         return Ok(doc_hits);
                     }
                 }
@@ -1901,14 +1861,10 @@ impl CollectionHandle {
                 }
 
                 if let Some(order_by) = &plan.order_by {
-                    sort_document_hits_by_field(
-                        &mut hits,
-                        &order_by.field_name,
-                        order_by.descending,
-                    );
+                    sort_hits_by_field(&mut hits, &order_by.field_name, order_by.descending);
                 }
 
-                project_document_hits(&mut hits, plan.output_fields.as_deref());
+                project_hits_output_fields(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
             }
             QueryPlan::BruteForce(plan) => {
@@ -1917,15 +1873,15 @@ impl CollectionHandle {
                 if context.include_vector {
                     self.materialize_document_hit_vectors(&collection_meta, &mut hits)?;
                 }
-                project_document_hits(&mut hits, plan.output_fields.as_deref());
+                project_hits_output_fields(&mut hits, plan.output_fields.as_deref());
                 Ok(hits)
             }
         }
     }
 
     pub fn optimize(&self) -> io::Result<()> {
-        let _index_registry = Arc::clone(&self.index_registry);
         let paths = self.collection_paths();
+        let collection_name = self.segment_manager.collection_name().to_string();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
 
@@ -1963,7 +1919,7 @@ impl CollectionHandle {
                         "Persisted ANN index ({} bytes) for field '{}' in collection '{}'",
                         bytes.len(),
                         field_name,
-                        self.name
+                        collection_name
                     );
                     // Persist external IDs alongside the blob so the ANN can be
                     // loaded without the original records.bin / ids.bin files.
@@ -2030,7 +1986,7 @@ impl CollectionHandle {
                 log::info!(
                     "Built scalar index for field '{}' in collection '{}' ({} indexed IDs)",
                     field_name,
-                    self.name,
+                    collection_name,
                     index.all_indexed_ids().len(),
                 );
                 scalar_cache.insert(field_name.clone(), index);
@@ -2108,14 +2064,14 @@ impl CollectionHandle {
                         "Set BM25 params (k1={}, b={}, avgdl={}) on sparse index for field '{}' in collection '{}'",
                         bm25_params.k1, bm25_params.b, bm25_params.avgdl,
                         field_name,
-                        self.name,
+                        collection_name,
                     );
                 }
 
                 log::info!(
                     "Built sparse index for field '{}' in collection '{}' ({} vectors)",
                     field_name,
-                    self.name,
+                    collection_name,
                     index.len(),
                 );
 
@@ -2140,7 +2096,7 @@ impl CollectionHandle {
                             "Persisted sparse index ({} bytes) for field '{}' in collection '{}'",
                             bytes.len(),
                             field_name,
-                            self.name
+                            collection_name
                         );
                     }
                 }
@@ -2225,7 +2181,13 @@ impl CollectionHandle {
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let _ = SegmentMetadata::load_from_path(&paths.segment_meta)?;
         let _ = TombstoneMask::load_from_path(&paths.tombstones)?;
-        let _ = load_wal_records(&wal_path(&self.root))?;
+        let root = paths
+            .dir
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| paths.dir.clone());
+        let _ = load_wal_records(&wal_path(&root))?;
         materialize_active_segment_arrow_snapshots(&paths, &collection_meta)?;
         Ok(())
     }
@@ -2416,7 +2378,7 @@ impl CollectionHandle {
 
     fn fetch_documents(&self, external_ids: &[i64]) -> io::Result<Vec<Document>> {
         let state = self.cached_document_state()?;
-        let docs = &*state.documents;
+        let docs = &*state;
         Ok(external_ids
             .iter()
             .filter_map(|id| docs.get(id).cloned())
@@ -2455,6 +2417,32 @@ impl CollectionHandle {
         top_k: usize,
         filter: &str,
     ) -> io::Result<Vec<DocumentHit>> {
+        #[derive(Debug, Clone)]
+        struct RankedDocumentHit {
+            hit: DocumentHit,
+        }
+
+        impl PartialEq for RankedDocumentHit {
+            fn eq(&self, other: &Self) -> bool {
+                self.hit.id == other.hit.id
+                    && self.hit.distance.to_bits() == other.hit.distance.to_bits()
+            }
+        }
+
+        impl Eq for RankedDocumentHit {}
+
+        impl PartialOrd for RankedDocumentHit {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for RankedDocumentHit {
+            fn cmp(&self, other: &Self) -> Ordering {
+                compare_hits(&self.hit, &other.hit)
+            }
+        }
+
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -2542,11 +2530,7 @@ impl CollectionHandle {
         }
 
         let mut hits = heap.into_iter().map(|entry| entry.hit).collect::<Vec<_>>();
-        hits.sort_by(|a, b| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        hits.sort_by(compare_hits);
         Ok(hits)
     }
 
@@ -2621,7 +2605,7 @@ impl CollectionHandle {
     }
 
     fn collection_paths(&self) -> CollectionPaths {
-        collection_paths_for_root(&self.root, &self.name)
+        collection_paths_for_dir(self.segment_manager.collection_dir())
     }
 
     fn collection_primary_vector_name(&self) -> io::Result<String> {
@@ -2714,7 +2698,7 @@ impl CollectionHandle {
         Ok(state)
     }
 
-    fn cached_document_state(&self) -> io::Result<CachedDocumentState> {
+    fn cached_document_state(&self) -> io::Result<Arc<HashMap<i64, Document>>> {
         {
             let cache = self
                 .document_cache
@@ -2738,7 +2722,7 @@ impl CollectionHandle {
         Ok(state)
     }
 
-    fn build_document_cache(&self) -> io::Result<CachedDocumentState> {
+    fn build_document_cache(&self) -> io::Result<Arc<HashMap<i64, Document>>> {
         let paths = self.collection_paths();
         let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
         let segment_paths = self.segment_manager.segment_paths()?;
@@ -2792,9 +2776,7 @@ impl CollectionHandle {
             }
         }
 
-        Ok(CachedDocumentState {
-            documents: Arc::new(documents),
-        })
+        Ok(Arc::new(documents))
     }
 
     fn try_load_persisted_ann_state(
@@ -2810,6 +2792,7 @@ impl CollectionHandle {
         #[cfg(feature = "hanns-backend")]
         {
             let paths = self.collection_paths();
+            let collection_name = self.segment_manager.collection_name().to_string();
             let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
             let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
             let descriptor =
@@ -2851,7 +2834,7 @@ impl CollectionHandle {
                 .to_ascii_lowercase();
 
             match fs::read(&blob_path).and_then(|bytes| {
-                DefaultIndexFactory::default()
+                hannsdb_index::factory::DefaultIndexFactory::default()
                     .create_vector_index(vector_schema.dimension, &descriptor, Some(&bytes))
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
             }) {
@@ -2892,7 +2875,7 @@ impl CollectionHandle {
                     log::info!(
                         "Loaded persisted ANN index for field '{}' in '{}' from '{}'",
                         field_name,
-                        self.name,
+                        collection_name,
                         blob_path.display()
                     );
                     Ok(Some(state))
@@ -2901,7 +2884,7 @@ impl CollectionHandle {
                     log::warn!(
                         "Failed to load persisted ANN for field '{}' in '{}' from '{}': {e}",
                         field_name,
-                        self.name,
+                        collection_name,
                         blob_path.display()
                     );
                     Ok(None)
@@ -2937,1265 +2920,6 @@ impl CollectionHandle {
         *snapshot = version_set;
         Ok(())
     }
-}
-
-fn project_document_hits(hits: &mut [DocumentHit], output_fields: Option<&[String]>) {
-    let Some(output_fields) = output_fields else {
-        return;
-    };
-    let requested = output_fields.iter().cloned().collect::<BTreeSet<_>>();
-    for hit in hits {
-        hit.fields
-            .retain(|field_name, _| requested.contains(field_name));
-    }
-}
-
-fn sort_document_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bool) {
-    hits.sort_by(|a, b| {
-        let av = a.fields.get(field_name);
-        let bv = b.fields.get(field_name);
-        let ord = match (av, bv) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (Some(av), Some(bv)) => compare_field_values_for_sort(av, bv),
-        };
-        if descending { ord.reverse() } else { ord }.then_with(|| {
-            a.distance
-                .total_cmp(&b.distance)
-                .then_with(|| a.id.cmp(&b.id))
-        })
-    });
-}
-
-fn compare_field_values_for_sort(a: &FieldValue, b: &FieldValue) -> std::cmp::Ordering {
-    match (a, b) {
-        (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
-        (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
-        (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
-        (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
-        (FieldValue::UInt64(va), FieldValue::UInt64(vb)) => va.cmp(vb),
-        (FieldValue::Float(va), FieldValue::Float(vb)) => va.total_cmp(vb),
-        (FieldValue::Float64(va), FieldValue::Float64(vb)) => va.total_cmp(vb),
-        (FieldValue::Bool(va), FieldValue::Bool(vb)) => va.cmp(vb),
-        _ => format!("{a:?}").cmp(&format!("{b:?}")),
-    }
-}
-
-fn load_shadowed_live_records(
-    segment_manager: &SegmentManager,
-    dimension: usize,
-    fp16: bool,
-) -> io::Result<(Vec<f32>, Vec<i64>)> {
-    let mut records = Vec::new();
-    let mut external_ids = Vec::new();
-    let mut shadowed_ids = HashSet::new();
-
-    for segment in segment_manager.segment_paths()? {
-        let segment_records = load_records_or_empty(&segment.records, dimension, fp16)?;
-        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-        if segment_external_ids.len().saturating_mul(dimension) != segment_records.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "records and ids are not aligned",
-            ));
-        }
-
-        for row_idx in (0..segment_external_ids.len()).rev() {
-            let external_id = segment_external_ids[row_idx];
-            if !shadowed_ids.insert(external_id) {
-                continue;
-            }
-            if tombstone.is_deleted(row_idx) {
-                continue;
-            }
-            let start = row_idx * dimension;
-            let end = start + dimension;
-            records.extend_from_slice(&segment_records[start..end]);
-            external_ids.push(external_id);
-        }
-    }
-
-    Ok((records, external_ids))
-}
-
-fn load_shadowed_live_vector_records(
-    segment_manager: &SegmentManager,
-    dimension: usize,
-    field_name: &str,
-) -> io::Result<(Vec<f32>, Vec<i64>)> {
-    let mut records = Vec::new();
-    let mut external_ids = Vec::new();
-    let mut shadowed_ids = HashSet::new();
-
-    for segment in segment_manager.segment_paths()? {
-        let segment_external_ids = load_record_ids_or_empty(&segment.external_ids)?;
-        let segment_vectors = load_vectors_or_empty(&segment.vectors, segment_external_ids.len())?;
-        let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-        if segment_vectors.len() != segment_external_ids.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "vector rows and ids are not aligned",
-            ));
-        }
-
-        for row_idx in (0..segment_external_ids.len()).rev() {
-            let external_id = segment_external_ids[row_idx];
-            if !shadowed_ids.insert(external_id) {
-                continue;
-            }
-            if tombstone.is_deleted(row_idx) {
-                continue;
-            }
-            let Some(vector) = segment_vectors[row_idx].get(field_name) else {
-                continue;
-            };
-            if vector.len() != dimension {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "vector field '{}' dimension mismatch: expected {}, got {}",
-                        field_name,
-                        dimension,
-                        vector.len()
-                    ),
-                ));
-            }
-            records.extend_from_slice(vector);
-            external_ids.push(external_id);
-        }
-    }
-
-    Ok((records, external_ids))
-}
-
-fn manifest_path(root: &Path) -> PathBuf {
-    root.join("manifest.json")
-}
-
-fn persisted_ann_exists(collection_dir: &Path, field_name: &str, is_primary: bool) -> bool {
-    ann_blob_path(collection_dir, field_name).exists()
-        || (is_primary && collection_dir.join("hnsw_index.bin").exists())
-}
-
-fn wal_path(root: &Path) -> PathBuf {
-    root.join("wal.jsonl")
-}
-
-fn collection_paths_for_root(root: &Path, name: &str) -> CollectionPaths {
-    let dir = root.join("collections").join(name);
-    CollectionPaths {
-        dir: dir.clone(),
-        collection_meta: dir.join("collection.json"),
-        primary_keys: dir.join("primary_keys.json"),
-        index_catalog: dir.join(INDEX_CATALOG_FILE),
-        segment_set: dir.join("segment_set.json"),
-        segments_dir: dir.join("segments"),
-        segment_meta: dir.join("segment.json"),
-        records: dir.join("records.bin"),
-        external_ids: dir.join("ids.bin"),
-        payloads: dir.join("payloads.jsonl"),
-        vectors: dir.join("vectors.jsonl"),
-        sparse_vectors: dir.join("sparse_vectors.jsonl"),
-        tombstones: dir.join("tombstones.json"),
-    }
-}
-
-struct CollectionPaths {
-    dir: PathBuf,
-    collection_meta: PathBuf,
-    primary_keys: PathBuf,
-    index_catalog: PathBuf,
-    segment_set: PathBuf,
-    segments_dir: PathBuf,
-    segment_meta: PathBuf,
-    records: PathBuf,
-    external_ids: PathBuf,
-    payloads: PathBuf,
-    vectors: PathBuf,
-    sparse_vectors: PathBuf,
-    tombstones: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct RankedDocumentHit {
-    hit: DocumentHit,
-}
-
-impl PartialEq for RankedDocumentHit {
-    fn eq(&self, other: &Self) -> bool {
-        self.hit.id == other.hit.id && self.hit.distance.to_bits() == other.hit.distance.to_bits()
-    }
-}
-
-impl Eq for RankedDocumentHit {}
-
-impl PartialOrd for RankedDocumentHit {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for RankedDocumentHit {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.hit
-            .distance
-            .total_cmp(&other.hit.distance)
-            .then_with(|| self.hit.id.cmp(&other.hit.id))
-    }
-}
-
-#[derive(Debug, Default)]
-struct WalCollectionPlan {
-    requires_data_files: bool,
-    requires_vector_sidecar: bool,
-}
-
-#[derive(Debug, Default)]
-struct WalReplayPlan {
-    collections: HashMap<String, WalCollectionPlan>,
-    dropped_collections: HashSet<String>,
-}
-
-impl WalReplayPlan {
-    fn build(records: &[WalRecord]) -> Self {
-        let mut collections = HashMap::new();
-        let mut dropped_collections = HashSet::new();
-        for record in records {
-            match record {
-                WalRecord::CreateCollection { collection, .. } => {
-                    collections.insert(collection.clone(), WalCollectionPlan::default());
-                    dropped_collections.remove(collection);
-                }
-                WalRecord::DropCollection { collection } => {
-                    if collections.remove(collection).is_some() {
-                        dropped_collections.insert(collection.clone());
-                    }
-                }
-                WalRecord::Insert {
-                    collection, ids, ..
-                } if !ids.is_empty() => {
-                    if let Some(plan) = collections.get_mut(collection) {
-                        plan.requires_data_files = true;
-                        plan.requires_vector_sidecar = true;
-                    }
-                }
-                WalRecord::InsertDocuments {
-                    collection,
-                    documents,
-                } if !documents.is_empty() => {
-                    if let Some(plan) = collections.get_mut(collection) {
-                        plan.requires_data_files = true;
-                        plan.requires_vector_sidecar = true;
-                    }
-                }
-                WalRecord::UpsertDocuments {
-                    collection,
-                    documents,
-                } if !documents.is_empty() => {
-                    if let Some(plan) = collections.get_mut(collection) {
-                        plan.requires_data_files = true;
-                        plan.requires_vector_sidecar = true;
-                    }
-                }
-                WalRecord::Delete { collection, ids } if !ids.is_empty() => {
-                    if let Some(plan) = collections.get_mut(collection) {
-                        plan.requires_data_files = true;
-                    }
-                }
-                WalRecord::CompactCollection {
-                    collection_name, ..
-                } => {
-                    if let Some(plan) = collections.get_mut(collection_name) {
-                        plan.requires_data_files = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Self {
-            collections,
-            dropped_collections,
-        }
-    }
-
-    fn requires_replay(&self, db: &HannsDb) -> io::Result<bool> {
-        let manifest = ManifestMetadata::load_from_path(&manifest_path(&db.root))?;
-        for (collection, plan) in &self.collections {
-            let paths = db.collection_paths(collection);
-            let segment_meta = if paths.segment_meta.exists() {
-                Some(SegmentMetadata::load_from_path(&paths.segment_meta)?)
-            } else {
-                None
-            };
-            if !manifest.collections.iter().any(|entry| entry == collection) {
-                return Ok(true);
-            }
-            if !paths.collection_meta.exists()
-                || segment_meta.is_none()
-                || !paths.tombstones.exists()
-            {
-                return Ok(true);
-            }
-            if plan.requires_data_files
-                && (!paths.records.exists()
-                    || !paths.external_ids.exists()
-                    || !paths.payloads.exists())
-            {
-                return Ok(true);
-            }
-            if plan.requires_vector_sidecar {
-                match load_vectors(&paths.vectors) {
-                    Ok(vectors) => {
-                        if Some(vectors.len())
-                            != segment_meta.as_ref().map(|meta| meta.record_count)
-                        {
-                            return Ok(true);
-                        }
-                    }
-                    Err(_) => return Ok(true),
-                }
-            }
-        }
-        for collection in &self.dropped_collections {
-            let paths = db.collection_paths(collection);
-            if manifest.collections.iter().any(|entry| entry == collection) || paths.dir.exists() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn owned_collections(&self) -> impl Iterator<Item = &str> {
-        self.collections
-            .keys()
-            .chain(self.dropped_collections.iter())
-            .map(String::as_str)
-    }
-
-    fn has_owned_collections(&self) -> bool {
-        !(self.collections.is_empty() && self.dropped_collections.is_empty())
-    }
-
-    fn owns(&self, collection: &str) -> bool {
-        self.collections.contains_key(collection) || self.dropped_collections.contains(collection)
-    }
-}
-
-fn collection_name_for_wal_record(record: &WalRecord) -> &str {
-    match record {
-        WalRecord::CreateCollection { collection, .. }
-        | WalRecord::DropCollection { collection }
-        | WalRecord::Insert { collection, .. }
-        | WalRecord::InsertDocuments { collection, .. }
-        | WalRecord::UpsertDocuments { collection, .. }
-        | WalRecord::Delete { collection, .. }
-        | WalRecord::UpdateDocuments { collection, .. }
-        | WalRecord::AddColumn { collection, .. }
-        | WalRecord::DropColumn { collection, .. }
-        | WalRecord::AlterColumn { collection, .. }
-        | WalRecord::AddVectorField { collection, .. }
-        | WalRecord::DropVectorField { collection, .. } => collection,
-        WalRecord::CompactCollection {
-            collection_name, ..
-        } => collection_name,
-    }
-}
-
-/// Convert a core `FieldValue` into the index crate's `ScalarValue`.
-fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
-    match value {
-        FieldValue::String(s) => ScalarValue::String(s.clone()),
-        FieldValue::Int64(v) => ScalarValue::Int64(*v),
-        FieldValue::Int32(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::UInt32(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::UInt64(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::Float(v) => ScalarValue::Float64(*v as f64),
-        FieldValue::Float64(v) => ScalarValue::Float64(*v),
-        FieldValue::Bool(b) => ScalarValue::Bool(*b),
-        FieldValue::Array(items) => {
-            // Flatten: use first element's scalar value if available.
-            // Array fields are not directly indexable as scalar indexes.
-            match items.first() {
-                Some(first) => field_value_to_scalar(first),
-                None => ScalarValue::String("[]".to_string()),
-            }
-        }
-    }
-}
-
-fn next_compacted_segment_id<'a>(segment_ids: impl Iterator<Item = &'a String>) -> String {
-    let max_id = segment_ids
-        .filter_map(|segment_id| {
-            segment_id
-                .strip_prefix("seg-")
-                .and_then(|suffix| suffix.parse::<u64>().ok())
-        })
-        .max()
-        .unwrap_or(0);
-    format!("seg-{:06}", max_id.saturating_add(1))
-}
-
-fn load_records_or_empty(path: &Path, dimension: usize, fp16: bool) -> io::Result<Vec<f32>> {
-    let result = if fp16 {
-        load_records_f16(path, dimension)
-    } else {
-        load_records(path, dimension)
-    };
-    match result {
-        Ok(records) => Ok(records),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn load_wal_records_or_empty(path: &Path) -> io::Result<Vec<WalRecord>> {
-    match load_wal_records(path) {
-        Ok(records) => Ok(records),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn load_record_ids_or_empty(path: &Path) -> io::Result<Vec<i64>> {
-    match load_record_ids(path) {
-        Ok(ids) => Ok(ids),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn load_primary_key_registry(
-    paths: &CollectionPaths,
-    collection_meta: &CollectionMetadata,
-) -> io::Result<PrimaryKeyRegistry> {
-    if paths.primary_keys.exists() {
-        let registry = PrimaryKeyRegistry::load_from_path(&paths.primary_keys)?;
-        if registry.mode != collection_meta.primary_key_mode {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "primary key registry mode does not match collection metadata",
-            ));
-        }
-        return Ok(registry);
-    }
-
-    let next_internal_id = collection_max_internal_id(paths)?.saturating_add(1).max(1);
-    let mut registry =
-        PrimaryKeyRegistry::new(collection_meta.primary_key_mode.clone(), next_internal_id);
-    if registry.mode == PrimaryKeyMode::String {
-        populate_numeric_keys_into_registry(paths, &mut registry)?;
-    }
-    Ok(registry)
-}
-
-fn save_primary_key_registry(
-    paths: &CollectionPaths,
-    collection_meta: &CollectionMetadata,
-    registry: &PrimaryKeyRegistry,
-) -> io::Result<()> {
-    if registry.mode != collection_meta.primary_key_mode {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "primary key registry mode does not match collection metadata",
-        ));
-    }
-    registry.save_to_path(&paths.primary_keys)
-}
-
-fn assign_internal_ids_for_public_keys(
-    paths: &CollectionPaths,
-    collection_meta: &mut CollectionMetadata,
-    public_keys: &[String],
-) -> io::Result<Vec<i64>> {
-    if public_keys.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if collection_meta.primary_key_mode == PrimaryKeyMode::Numeric
-        && public_keys.iter().all(|key| key.parse::<i64>().is_ok())
-    {
-        return public_keys
-            .iter()
-            .map(|key| parse_numeric_public_key(key))
-            .collect();
-    }
-
-    let mut registry = ensure_string_primary_key_mode(paths, collection_meta)?;
-    let mut ids = Vec::with_capacity(public_keys.len());
-    for public_key in public_keys {
-        if let Some(existing) = registry.key_to_id.get(public_key).copied() {
-            ids.push(existing);
-            continue;
-        }
-
-        let internal_id = registry.next_internal_id;
-        registry.next_internal_id = registry.next_internal_id.saturating_add(1).max(1);
-        registry.key_to_id.insert(public_key.clone(), internal_id);
-        registry.id_to_key.insert(internal_id, public_key.clone());
-        ids.push(internal_id);
-    }
-
-    save_primary_key_registry(paths, collection_meta, &registry)?;
-    Ok(ids)
-}
-
-fn resolve_public_keys_to_internal_ids(
-    paths: &CollectionPaths,
-    collection_meta: &CollectionMetadata,
-    public_keys: &[String],
-) -> io::Result<Vec<i64>> {
-    match collection_meta.primary_key_mode {
-        PrimaryKeyMode::Numeric => public_keys
-            .iter()
-            .map(|key| parse_numeric_public_key(key))
-            .collect(),
-        PrimaryKeyMode::String => {
-            let registry = load_primary_key_registry(paths, collection_meta)?;
-            Ok(public_keys
-                .iter()
-                .filter_map(|public_key| registry.key_to_id.get(public_key).copied())
-                .collect())
-        }
-    }
-}
-
-fn register_public_keys_with_internal_ids(
-    paths: &CollectionPaths,
-    collection_meta: &mut CollectionMetadata,
-    public_keys: &[String],
-    internal_ids: &[i64],
-) -> io::Result<()> {
-    if public_keys.len() != internal_ids.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "public key count must match internal id count",
-        ));
-    }
-
-    let mut batch_keys = HashSet::with_capacity(public_keys.len());
-    let mut batch_ids = HashSet::with_capacity(internal_ids.len());
-    for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
-        if !batch_keys.insert(public_key.clone()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate public key in batch: {public_key}"),
-            ));
-        }
-        if !batch_ids.insert(*internal_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate internal id in batch: {internal_id}"),
-            ));
-        }
-    }
-
-    if collection_meta.primary_key_mode == PrimaryKeyMode::Numeric
-        && public_keys.iter().all(|key| key.parse::<i64>().is_ok())
-    {
-        for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
-            let parsed = parse_numeric_public_key(public_key)?;
-            if parsed != *internal_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "numeric public key '{public_key}' must match document id {internal_id}"
-                    ),
-                ));
-            }
-        }
-        return Ok(());
-    }
-
-    let mut registry = ensure_string_primary_key_mode(paths, collection_meta)?;
-    for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
-        if let Some(existing_id) = registry.key_to_id.get(public_key).copied() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("public key already exists: {public_key} -> {existing_id}"),
-            ));
-        }
-        if let Some(existing_key) = registry.id_to_key.get(internal_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("internal id already registered: {internal_id} -> {existing_key}"),
-            ));
-        }
-        registry.key_to_id.insert(public_key.clone(), *internal_id);
-        registry.id_to_key.insert(*internal_id, public_key.clone());
-        registry.next_internal_id = registry.next_internal_id.max(internal_id.saturating_add(1));
-    }
-
-    save_primary_key_registry(paths, collection_meta, &registry)
-}
-
-fn ensure_string_primary_key_mode(
-    paths: &CollectionPaths,
-    collection_meta: &mut CollectionMetadata,
-) -> io::Result<PrimaryKeyRegistry> {
-    let mut registry = load_primary_key_registry(paths, collection_meta)?;
-    if collection_meta.primary_key_mode == PrimaryKeyMode::String {
-        return Ok(registry);
-    }
-
-    collection_meta.primary_key_mode = PrimaryKeyMode::String;
-    collection_meta.save_to_path(&paths.collection_meta)?;
-
-    registry.mode = PrimaryKeyMode::String;
-    populate_numeric_keys_into_registry(paths, &mut registry)?;
-    save_primary_key_registry(paths, collection_meta, &registry)?;
-    Ok(registry)
-}
-
-fn populate_numeric_keys_into_registry(
-    paths: &CollectionPaths,
-    registry: &mut PrimaryKeyRegistry,
-) -> io::Result<()> {
-    for internal_id in load_all_collection_ids(paths)? {
-        let public_key = internal_id.to_string();
-        registry.key_to_id.insert(public_key.clone(), internal_id);
-        registry.id_to_key.insert(internal_id, public_key);
-        registry.next_internal_id = registry.next_internal_id.max(internal_id.saturating_add(1));
-    }
-    Ok(())
-}
-
-fn display_key_for_internal_id(registry: &PrimaryKeyRegistry, internal_id: i64) -> String {
-    match registry.mode {
-        PrimaryKeyMode::Numeric => internal_id.to_string(),
-        PrimaryKeyMode::String => registry
-            .id_to_key
-            .get(&internal_id)
-            .cloned()
-            .unwrap_or_else(|| internal_id.to_string()),
-    }
-}
-
-fn parse_numeric_public_key(key: &str) -> io::Result<i64> {
-    key.parse::<i64>().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("public key must parse to i64 in numeric mode: {key}"),
-        )
-    })
-}
-
-fn collection_max_internal_id(paths: &CollectionPaths) -> io::Result<i64> {
-    let mut max_internal_id = 0i64;
-    for internal_id in load_all_collection_ids(paths)? {
-        max_internal_id = max_internal_id.max(internal_id);
-    }
-    Ok(max_internal_id)
-}
-
-fn load_all_collection_ids(paths: &CollectionPaths) -> io::Result<Vec<i64>> {
-    let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
-    let mut all_ids = Vec::new();
-    for segment in segment_paths {
-        all_ids.extend(load_record_ids_or_empty(&segment.external_ids)?);
-    }
-    Ok(all_ids)
-}
-
-fn load_payloads_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    match load_payloads(path) {
-        Ok(mut payloads) => {
-            if payloads.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload row count exceeds record row count",
-                ));
-            }
-            if payloads.len() < expected_rows {
-                payloads.resize_with(expected_rows, BTreeMap::new);
-            }
-            Ok(payloads)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn materialize_active_segment_arrow_snapshots(
-    paths: &CollectionPaths,
-    collection_meta: &CollectionMetadata,
-) -> io::Result<()> {
-    if paths.payloads.exists() {
-        let payloads = load_payloads_jsonl(&paths.payloads)?;
-        write_payloads_arrow(
-            &paths.payloads.with_extension("arrow"),
-            &payloads,
-            &collection_meta.fields,
-        )?;
-    }
-
-    if paths.vectors.exists() {
-        let vectors = load_vectors_jsonl(&paths.vectors)?;
-        write_vectors_arrow(
-            &paths.vectors.with_extension("arrow"),
-            &vectors,
-            &collection_meta.vectors,
-            &collection_meta.primary_vector,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn load_vectors_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, Vec<f32>>>> {
-    match load_vectors(path) {
-        Ok(vectors) => {
-            if vectors.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vector row count exceeds record row count",
-                ));
-            }
-            if vectors.len() < expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "vector row count is shorter than record row count",
-                ));
-            }
-            Ok(vectors)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn load_payloads_with_fields_or_empty(
-    path: &Path,
-    expected_rows: usize,
-    fields: Option<&[String]>,
-) -> io::Result<Vec<BTreeMap<String, FieldValue>>> {
-    match load_payloads_with_fields(path, fields) {
-        Ok(mut payloads) => {
-            if payloads.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload row count exceeds record row count",
-                ));
-            }
-            if payloads.len() < expected_rows {
-                payloads.resize_with(expected_rows, BTreeMap::new);
-            }
-            Ok(payloads)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn load_sparse_vectors_or_empty(
-    path: &Path,
-    expected_rows: usize,
-) -> io::Result<Vec<BTreeMap<String, crate::document::SparseVector>>> {
-    match load_sparse_vectors(path) {
-        Ok(vectors) => {
-            if vectors.len() > expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "sparse vector row count exceeds record row count",
-                ));
-            }
-            if vectors.len() < expected_rows {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "sparse vector row count is shorter than record row count",
-                ));
-            }
-            Ok(vectors)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(vec![BTreeMap::new(); expected_rows])
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn validate_documents(
-    documents: &[Document],
-    collection_meta: &CollectionMetadata,
-) -> io::Result<()> {
-    if collection_meta.dimension == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "collection dimension must be > 0",
-        ));
-    }
-
-    let vector_schemas = collection_meta
-        .vectors
-        .iter()
-        .map(|vector| (vector.name.as_str(), vector))
-        .collect::<HashMap<_, _>>();
-    let mut ids = HashSet::with_capacity(documents.len());
-    for document in documents {
-        if !ids.insert(document.id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate external id in batch: {}", document.id),
-            ));
-        }
-        let primary_vector = document
-            .vectors
-            .get(collection_meta.primary_vector.as_str())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "document is missing primary vector '{}'",
-                        collection_meta.primary_vector
-                    ),
-                )
-            })?;
-        if primary_vector.len() != collection_meta.dimension {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "document vector dimension mismatch: expected {}, got {}",
-                    collection_meta.dimension,
-                    primary_vector.len()
-                ),
-            ));
-        }
-        for (name, vector) in &document.vectors {
-            let schema = vector_schemas.get(name.as_str()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "document vector '{}' is not defined in collection schema",
-                        name
-                    ),
-                )
-            })?;
-            if vector.len() != schema.dimension {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "document vector '{}' dimension mismatch: expected {}, got {}",
-                        name,
-                        schema.dimension,
-                        vector.len()
-                    ),
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn append_documents(
-    paths: &CollectionPaths,
-    dimension: usize,
-    existing_rows: usize,
-    primary_vector_name: &str,
-    documents: &[Document],
-    fp16: bool,
-) -> io::Result<usize> {
-    ensure_vector_rows(&paths.vectors, existing_rows)?;
-    let mut ids = Vec::with_capacity(documents.len());
-    let mut records = Vec::with_capacity(documents.len().saturating_mul(dimension));
-    let mut payloads = Vec::with_capacity(documents.len());
-    let mut vectors = Vec::with_capacity(documents.len());
-    let mut sparse_vecs = Vec::with_capacity(documents.len());
-    for document in documents {
-        ids.push(document.id);
-        let primary = document.vectors.get(primary_vector_name).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "document {} is missing primary vector '{}'",
-                    document.id, primary_vector_name
-                ),
-            )
-        })?;
-        records.extend_from_slice(primary);
-        payloads.push(document.fields.clone());
-        let mut secondary = document.vectors.clone();
-        secondary.remove(primary_vector_name);
-        vectors.push(secondary);
-        sparse_vecs.push(document.sparse_vectors.clone());
-    }
-
-    let inserted = if fp16 {
-        append_records_f16(&paths.records, dimension, &records)?
-    } else {
-        append_records(&paths.records, dimension, &records)?
-    };
-    let _ = append_record_ids(&paths.external_ids, &ids)?;
-    let _ = append_payloads(&paths.payloads, &payloads)?;
-    let _ = append_vectors(&paths.vectors, &vectors)?;
-    let _ = append_sparse_vectors(&paths.sparse_vectors, &sparse_vecs)?;
-    Ok(inserted)
-}
-
-fn has_live_id(stored_ids: &[i64], tombstone: &TombstoneMask, external_id: i64) -> bool {
-    latest_live_row_index(stored_ids, tombstone, external_id).is_some()
-}
-
-fn latest_live_row_index(
-    stored_ids: &[i64],
-    tombstone: &TombstoneMask,
-    external_id: i64,
-) -> Option<usize> {
-    latest_row_index_for_id(stored_ids, external_id)
-        .filter(|row_idx| !tombstone.is_deleted(*row_idx))
-}
-
-fn latest_row_index_for_id(stored_ids: &[i64], external_id: i64) -> Option<usize> {
-    stored_ids
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(row_idx, stored_id)| (*stored_id == external_id).then_some(row_idx))
-}
-
-fn mark_live_id_deleted(
-    stored_ids: &[i64],
-    tombstone: &mut TombstoneMask,
-    external_id: i64,
-    row_limit: usize,
-) {
-    for (row_idx, stored_id) in stored_ids.iter().enumerate().take(row_limit) {
-        if *stored_id == external_id {
-            let _ = tombstone.mark_deleted(row_idx);
-        }
-    }
-}
-
-fn validate_vector_index_descriptor(
-    dimension: usize,
-    descriptor: &VectorIndexDescriptor,
-) -> io::Result<()> {
-    if dimension == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "vector dimension must be > 0",
-        ));
-    }
-
-    let params = descriptor.params.as_object().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "vector index params must be a JSON object",
-        )
-    })?;
-
-    match descriptor.kind {
-        VectorIndexKind::Flat => {
-            if !params.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "flat index does not accept params",
-                ));
-            }
-        }
-        VectorIndexKind::Ivf => {
-            for key in params.keys() {
-                if key != "nlist" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unsupported ivf param: {key}"),
-                    ));
-                }
-            }
-            if let Some(nlist) = params.get("nlist") {
-                let nlist = nlist.as_u64().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "ivf nlist must be an unsigned integer",
-                    )
-                })?;
-                if nlist == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "ivf nlist must be > 0",
-                    ));
-                }
-            }
-        }
-        VectorIndexKind::IvfUsq => {
-            for key in params.keys() {
-                if key != "nlist"
-                    && key != "bits_per_dim"
-                    && key != "rotation_seed"
-                    && key != "rerank_k"
-                    && key != "use_high_accuracy_scan"
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unsupported ivf_usq param: {key}"),
-                    ));
-                }
-            }
-            for key in ["nlist", "bits_per_dim", "rotation_seed", "rerank_k"] {
-                if let Some(value) = params.get(key) {
-                    let value = value.as_u64().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("ivf_usq {key} must be an unsigned integer"),
-                        )
-                    })?;
-                    if value == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("ivf_usq {key} must be > 0"),
-                        ));
-                    }
-                }
-            }
-            if let Some(value) = params.get("use_high_accuracy_scan") {
-                value.as_bool().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "ivf_usq use_high_accuracy_scan must be a boolean",
-                    )
-                })?;
-            }
-        }
-        VectorIndexKind::HnswHvq => {
-            for key in params.keys() {
-                if key != "m"
-                    && key != "m_max0"
-                    && key != "ef_construction"
-                    && key != "ef_search"
-                    && key != "nbits"
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unsupported hnsw_hvq param: {key}"),
-                    ));
-                }
-            }
-            for key in ["m", "m_max0", "ef_construction", "ef_search", "nbits"] {
-                if let Some(value) = params.get(key) {
-                    let value = value.as_u64().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("hnsw_hvq {key} must be an unsigned integer"),
-                        )
-                    })?;
-                    if value == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("hnsw_hvq {key} must be > 0"),
-                        ));
-                    }
-                }
-            }
-            if descriptor.metric.as_deref() != Some("ip") {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "hnsw_hvq currently supports only ip in HannsDB",
-                ));
-            }
-        }
-        VectorIndexKind::Hnsw => {
-            for key in params.keys() {
-                if key != "m" && key != "ef_construction" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("unsupported hnsw param: {key}"),
-                    ));
-                }
-            }
-            for key in ["m", "ef_construction"] {
-                if let Some(value) = params.get(key) {
-                    let value = value.as_u64().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("hnsw {key} must be an unsigned integer"),
-                        )
-                    })?;
-                    if value == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("hnsw {key} must be > 0"),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    DefaultIndexFactory::default()
-        .create_vector_index(dimension, descriptor, None)
-        .map(|_| ())
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
-}
-
-fn validate_schema_primary_vector_descriptor(schema: &CollectionSchema) -> io::Result<()> {
-    let primary_vector = schema.primary_vector().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "collection primary vector '{}' is not defined in schema vectors",
-                schema.primary_vector_name()
-            ),
-        )
-    })?;
-    let descriptor = match primary_vector.index_param.as_ref() {
-        Some(VectorIndexSchema::Ivf { metric, nlist }) => VectorIndexDescriptor {
-            field_name: primary_vector.name.clone(),
-            kind: VectorIndexKind::Ivf,
-            metric: metric.clone(),
-            params: serde_json::json!({ "nlist": nlist }),
-        },
-        Some(VectorIndexSchema::IvfUsq {
-            metric,
-            nlist,
-            bits_per_dim,
-            rotation_seed,
-            rerank_k,
-            use_high_accuracy_scan,
-        }) => VectorIndexDescriptor {
-            field_name: primary_vector.name.clone(),
-            kind: VectorIndexKind::IvfUsq,
-            metric: metric.clone(),
-            params: serde_json::json!({
-                "nlist": nlist,
-                "bits_per_dim": bits_per_dim,
-                "rotation_seed": rotation_seed,
-                "rerank_k": rerank_k,
-                "use_high_accuracy_scan": use_high_accuracy_scan
-            }),
-        },
-        Some(VectorIndexSchema::HnswHvq {
-            metric,
-            m,
-            m_max0,
-            ef_construction,
-            ef_search,
-            nbits,
-        }) => VectorIndexDescriptor {
-            field_name: primary_vector.name.clone(),
-            kind: VectorIndexKind::HnswHvq,
-            metric: metric.clone(),
-            params: serde_json::json!({
-                "m": m,
-                "m_max0": m_max0,
-                "ef_construction": ef_construction,
-                "ef_search": ef_search,
-                "nbits": nbits
-            }),
-        },
-        Some(VectorIndexSchema::Hnsw {
-            metric,
-            m,
-            ef_construction,
-            ..
-        }) => VectorIndexDescriptor {
-            field_name: primary_vector.name.clone(),
-            kind: VectorIndexKind::Hnsw,
-            metric: metric.clone(),
-            params: serde_json::json!({
-                "m": m,
-                "ef_construction": ef_construction
-            }),
-        },
-        None => VectorIndexDescriptor {
-            field_name: primary_vector.name.clone(),
-            kind: VectorIndexKind::Hnsw,
-            metric: Some(schema.metric().to_string()),
-            params: serde_json::json!({
-                "m": schema.hnsw_m(),
-                "ef_construction": schema.hnsw_ef_construction()
-            }),
-        },
-    };
-    validate_vector_index_descriptor(primary_vector.dimension, &descriptor)
-}
-
-fn validate_schema_secondary_vector_descriptors(schema: &CollectionSchema) -> io::Result<()> {
-    let primary_vector_name = schema.primary_vector_name();
-    for vector in schema
-        .vectors
-        .iter()
-        .filter(|vector| vector.name != primary_vector_name)
-    {
-        let Some(index_param) = vector.index_param.as_ref() else {
-            continue;
-        };
-        let descriptor = match index_param {
-            VectorIndexSchema::Ivf { metric, nlist } => VectorIndexDescriptor {
-                field_name: vector.name.clone(),
-                kind: VectorIndexKind::Ivf,
-                metric: metric.clone(),
-                params: serde_json::json!({ "nlist": nlist }),
-            },
-            VectorIndexSchema::IvfUsq {
-                metric,
-                nlist,
-                bits_per_dim,
-                rotation_seed,
-                rerank_k,
-                use_high_accuracy_scan,
-            } => VectorIndexDescriptor {
-                field_name: vector.name.clone(),
-                kind: VectorIndexKind::IvfUsq,
-                metric: metric.clone(),
-                params: serde_json::json!({
-                    "nlist": nlist,
-                    "bits_per_dim": bits_per_dim,
-                    "rotation_seed": rotation_seed,
-                    "rerank_k": rerank_k,
-                    "use_high_accuracy_scan": use_high_accuracy_scan
-                }),
-            },
-            VectorIndexSchema::HnswHvq {
-                metric,
-                m,
-                m_max0,
-                ef_construction,
-                ef_search,
-                nbits,
-            } => VectorIndexDescriptor {
-                field_name: vector.name.clone(),
-                kind: VectorIndexKind::HnswHvq,
-                metric: metric.clone(),
-                params: serde_json::json!({
-                    "m": m,
-                    "m_max0": m_max0,
-                    "ef_construction": ef_construction,
-                    "ef_search": ef_search,
-                    "nbits": nbits
-                }),
-            },
-            VectorIndexSchema::Hnsw {
-                metric,
-                m,
-                ef_construction,
-                ..
-            } => VectorIndexDescriptor {
-                field_name: vector.name.clone(),
-                kind: VectorIndexKind::Hnsw,
-                metric: metric.clone(),
-                params: serde_json::json!({
-                    "m": m,
-                    "ef_construction": ef_construction
-                }),
-            },
-        };
-        validate_vector_index_descriptor(vector.dimension, &descriptor)?;
-    }
-    Ok(())
 }
 
 #[cfg(feature = "hanns-backend")]

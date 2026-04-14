@@ -1696,3 +1696,14 @@ Observed metrics:
 Interpretation:
 - this confirms the new first-class remote watchdog entrypoint can drive the full standard benchmark successfully
 - it is distinct from the earlier `hannsdb-hk-x86-20260413` run, but lands in the same performance/quality band
+
+Fresh fast-path rerun using the same entrypoint:
+- run label: `hannsdb-remote-watchdog-fastpath`
+- result file: `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-remote-watchdog-fastpath_hannsdb.json`
+- metrics:
+  - `insert_duration=22.1823`
+  - `optimize_duration=79.0168`
+  - `load_duration=101.1991`
+  - `serial_latency_p99=0.0005`
+  - `recall=0.9442`
+- this rerun reused the already-prepared remote environment via the `Remote VectorDBBench environment already ready` fast path, confirming the new wrapper is not only bootstrappable but also repeatable.

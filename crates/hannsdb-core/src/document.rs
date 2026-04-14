@@ -1,6 +1,13 @@
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
 
+use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
+use hannsdb_index::factory::DefaultIndexFactory;
+use hannsdb_index::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
+
+use crate::catalog::CollectionMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
@@ -484,5 +491,456 @@ impl Document {
             vectors,
             sparse_vectors: sparse_vectors.into_iter().collect(),
         }
+    }
+}
+
+pub(crate) fn validate_documents(
+    documents: &[Document],
+    collection_meta: &CollectionMetadata,
+) -> io::Result<()> {
+    if collection_meta.dimension == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "collection dimension must be > 0",
+        ));
+    }
+
+    let vector_schemas = collection_meta
+        .vectors
+        .iter()
+        .map(|vector| (vector.name.as_str(), vector))
+        .collect::<HashMap<_, _>>();
+    let mut ids = HashSet::with_capacity(documents.len());
+    for document in documents {
+        if !ids.insert(document.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate external id in batch: {}", document.id),
+            ));
+        }
+        let primary_vector = document
+            .vectors
+            .get(collection_meta.primary_vector.as_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document is missing primary vector '{}'",
+                        collection_meta.primary_vector
+                    ),
+                )
+            })?;
+        if primary_vector.len() != collection_meta.dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "document vector dimension mismatch: expected {}, got {}",
+                    collection_meta.dimension,
+                    primary_vector.len()
+                ),
+            ));
+        }
+        for (name, vector) in &document.vectors {
+            let schema = vector_schemas.get(name.as_str()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document vector '{}' is not defined in collection schema",
+                        name
+                    ),
+                )
+            })?;
+            if vector.len() != schema.dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "document vector '{}' dimension mismatch: expected {}, got {}",
+                        name,
+                        schema.dimension,
+                        vector.len()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_vector_index_descriptor(
+    dimension: usize,
+    descriptor: &VectorIndexDescriptor,
+) -> io::Result<()> {
+    if dimension == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector dimension must be > 0",
+        ));
+    }
+
+    let params = descriptor.params.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "vector index params must be a JSON object",
+        )
+    })?;
+
+    match descriptor.kind {
+        VectorIndexKind::Flat => {
+            if !params.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "flat index does not accept params",
+                ));
+            }
+        }
+        VectorIndexKind::Ivf => {
+            for key in params.keys() {
+                if key != "nlist" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported ivf param: {key}"),
+                    ));
+                }
+            }
+            if let Some(nlist) = params.get("nlist") {
+                let nlist = nlist.as_u64().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf nlist must be an unsigned integer",
+                    )
+                })?;
+                if nlist == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf nlist must be > 0",
+                    ));
+                }
+            }
+        }
+        VectorIndexKind::IvfUsq => {
+            for key in params.keys() {
+                if key != "nlist"
+                    && key != "bits_per_dim"
+                    && key != "rotation_seed"
+                    && key != "rerank_k"
+                    && key != "use_high_accuracy_scan"
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported ivf_usq param: {key}"),
+                    ));
+                }
+            }
+            for key in ["nlist", "bits_per_dim", "rotation_seed", "rerank_k"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("ivf_usq {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("ivf_usq {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+            if let Some(value) = params.get("use_high_accuracy_scan") {
+                value.as_bool().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ivf_usq use_high_accuracy_scan must be a boolean",
+                    )
+                })?;
+            }
+        }
+        VectorIndexKind::HnswHvq => {
+            for key in params.keys() {
+                if key != "m"
+                    && key != "m_max0"
+                    && key != "ef_construction"
+                    && key != "ef_search"
+                    && key != "nbits"
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported hnsw_hvq param: {key}"),
+                    ));
+                }
+            }
+            for key in ["m", "m_max0", "ef_construction", "ef_search", "nbits"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_hvq {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_hvq {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+            if descriptor.metric.as_deref() != Some("ip") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hnsw_hvq currently supports only ip in HannsDB",
+                ));
+            }
+        }
+        VectorIndexKind::Hnsw => {
+            for key in params.keys() {
+                if key != "m" && key != "ef_construction" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported hnsw param: {key}"),
+                    ));
+                }
+            }
+            for key in ["m", "ef_construction"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    DefaultIndexFactory::default()
+        .create_vector_index(dimension, descriptor, None)
+        .map(|_| ())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
+}
+
+pub(crate) fn validate_schema_primary_vector_descriptor(
+    schema: &CollectionSchema,
+) -> io::Result<()> {
+    let primary_vector = schema.primary_vector().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "collection primary vector '{}' is not defined in schema vectors",
+                schema.primary_vector_name()
+            ),
+        )
+    })?;
+    let descriptor = match primary_vector.index_param.as_ref() {
+        Some(VectorIndexSchema::Ivf { metric, nlist }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Ivf,
+            metric: metric.clone(),
+            params: serde_json::json!({ "nlist": nlist }),
+        },
+        Some(VectorIndexSchema::IvfUsq {
+            metric,
+            nlist,
+            bits_per_dim,
+            rotation_seed,
+            rerank_k,
+            use_high_accuracy_scan,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::IvfUsq,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "nlist": nlist,
+                "bits_per_dim": bits_per_dim,
+                "rotation_seed": rotation_seed,
+                "rerank_k": rerank_k,
+                "use_high_accuracy_scan": use_high_accuracy_scan
+            }),
+        },
+        Some(VectorIndexSchema::HnswHvq {
+            metric,
+            m,
+            m_max0,
+            ef_construction,
+            ef_search,
+            nbits,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::HnswHvq,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "m": m,
+                "m_max0": m_max0,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
+                "nbits": nbits
+            }),
+        },
+        Some(VectorIndexSchema::Hnsw {
+            metric,
+            m,
+            ef_construction,
+            ..
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Hnsw,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction
+            }),
+        },
+        None => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::Hnsw,
+            metric: Some(schema.metric().to_string()),
+            params: serde_json::json!({
+                "m": schema.hnsw_m(),
+                "ef_construction": schema.hnsw_ef_construction()
+            }),
+        },
+    };
+    validate_vector_index_descriptor(primary_vector.dimension, &descriptor)
+}
+
+pub(crate) fn validate_schema_secondary_vector_descriptors(
+    schema: &CollectionSchema,
+) -> io::Result<()> {
+    let primary_vector_name = schema.primary_vector_name();
+    for vector in schema
+        .vectors
+        .iter()
+        .filter(|vector| vector.name != primary_vector_name)
+    {
+        let Some(index_param) = vector.index_param.as_ref() else {
+            continue;
+        };
+        let descriptor = match index_param {
+            VectorIndexSchema::Ivf { metric, nlist } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::Ivf,
+                metric: metric.clone(),
+                params: serde_json::json!({ "nlist": nlist }),
+            },
+            VectorIndexSchema::IvfUsq {
+                metric,
+                nlist,
+                bits_per_dim,
+                rotation_seed,
+                rerank_k,
+                use_high_accuracy_scan,
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::IvfUsq,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "nlist": nlist,
+                    "bits_per_dim": bits_per_dim,
+                    "rotation_seed": rotation_seed,
+                    "rerank_k": rerank_k,
+                    "use_high_accuracy_scan": use_high_accuracy_scan
+                }),
+            },
+            VectorIndexSchema::HnswHvq {
+                metric,
+                m,
+                m_max0,
+                ef_construction,
+                ef_search,
+                nbits,
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::HnswHvq,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "m": m,
+                    "m_max0": m_max0,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search,
+                    "nbits": nbits
+                }),
+            },
+            VectorIndexSchema::Hnsw {
+                metric,
+                m,
+                ef_construction,
+                ..
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::Hnsw,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "m": m,
+                    "ef_construction": ef_construction
+                }),
+            },
+        };
+        validate_vector_index_descriptor(vector.dimension, &descriptor)?;
+    }
+    Ok(())
+}
+
+/// Convert a core `FieldValue` into the index crate's `ScalarValue`.
+pub(crate) fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
+    match value {
+        FieldValue::String(s) => ScalarValue::String(s.clone()),
+        FieldValue::Int64(v) => ScalarValue::Int64(*v),
+        FieldValue::Int32(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::UInt32(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::UInt64(v) => ScalarValue::Int64(*v as i64),
+        FieldValue::Float(v) => ScalarValue::Float64(*v as f64),
+        FieldValue::Float64(v) => ScalarValue::Float64(*v),
+        FieldValue::Bool(b) => ScalarValue::Bool(*b),
+        FieldValue::Array(items) => match items.first() {
+            Some(first) => field_value_to_scalar(first),
+            None => ScalarValue::String("[]".to_string()),
+        },
+    }
+}
+
+pub(crate) fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Ordering {
+    match (a, b) {
+        (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
+        (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
+        (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
+        (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
+        (FieldValue::UInt64(va), FieldValue::UInt64(vb)) => va.cmp(vb),
+        (FieldValue::Float(va), FieldValue::Float(vb)) => va.total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Float64(vb)) => va.total_cmp(vb),
+        (FieldValue::Bool(va), FieldValue::Bool(vb)) => va.cmp(vb),
+        (FieldValue::Int64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Int64(vb)) => va.total_cmp(&(*vb as f64)),
+        (FieldValue::Int32(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::Int32(vb)) => va.total_cmp(&(*vb as f64)),
+        (FieldValue::UInt64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
+        (FieldValue::Float64(va), FieldValue::UInt64(vb)) => va.total_cmp(&(*vb as f64)),
+        (FieldValue::Int64(va), FieldValue::Int32(vb)) => va.cmp(&(*vb as i64)),
+        (FieldValue::Int32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
+        (FieldValue::Int64(va), FieldValue::UInt32(vb)) => va.cmp(&(*vb as i64)),
+        (FieldValue::UInt32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
+        (FieldValue::Int64(va), FieldValue::UInt64(vb)) => {
+            if *va < 0 {
+                Ordering::Less
+            } else {
+                (*va as u64).cmp(vb)
+            }
+        }
+        (FieldValue::UInt64(va), FieldValue::Int64(vb)) => {
+            if *vb < 0 {
+                Ordering::Greater
+            } else {
+                va.cmp(&(*vb as u64))
+            }
+        }
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }
 }

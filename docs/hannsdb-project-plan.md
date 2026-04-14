@@ -56,11 +56,19 @@
   - 2026-04-13 fresh clean rerun: `result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
   - 2026-04-13 remote hk-x86 full rerun: `result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
 - [ ] Convert current prototype durability into a real storage story
+  - 2026-04-13: first explicit `storage` module slice landed (`storage::paths`, `storage::wal`, `storage::recovery`) without behavior regression; this is the new landing zone for further durability cleanup
+  - 2026-04-13: segment read-path helpers are now starting to move under `storage::segment_io`, shrinking `db.rs` while keeping `wal_recovery` and `collection_api` green
+  - 2026-04-13: primary-key registry persistence helpers are now starting to move under `storage::primary_keys`, keeping string-PK mode conversion/storage logic out of `db.rs`
+  - 2026-04-13: row/tombstone live-view helpers also moved under `storage::segment_io`; `db.rs` is now materially less responsible for raw storage/file-layout mechanics than at the start of the day
+  - 2026-04-13: document/schema/value validation helpers were moved out of `db.rs`, and query hit ordering/projection now reuses shared executor helpers instead of duplicating sort/project logic
+  - 2026-04-13: `CollectionHandle` shed duplicated derived state (`root`, `name`) and several placeholder/wrapper layers, so the remaining work is increasingly about durable semantics instead of code-organization debt
+- [ ] Multi-segment management
+  - 2026-04-13: no longer truly "not started" — rollover rules, segment-set layout, multi-segment reads, and segment-aware reopen/search coverage are already green; remaining work is broader operational hardening and story completion
+- [ ] Compaction/rebuild workflow
+  - 2026-04-13: no longer truly "not started" — compaction merge behavior, tombstone filtering, reopen coverage, and daemon/admin hooks exist; remaining work is turning the implemented path into a more complete production workflow story
 
 ### Not started
 
-- [ ] Multi-segment management
-- [ ] Compaction/rebuild workflow
 - [ ] Richer agent-oriented data model beyond the current v1 single-primary-vector slice
 - [ ] Full crash-style recovery semantics and durable flush guarantees
 
@@ -185,6 +193,7 @@
     - optimize marks ANN ready
     - subsequent writes invalidate persisted ANN state
     - reopen preserves completeness when a persisted ANN blob still exists
+    - `collection_info` and daemon routes now agree on both the `ready` and `stale-after-write` states
 - [x] Expose minimal admin controls through the daemon if needed.
 
 **Exit criteria:**

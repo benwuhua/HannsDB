@@ -61,7 +61,7 @@ impl IndexFactory for DefaultIndexFactory {
                     if let Some(bytes) = serialized {
                         return Ok(Box::new(HnswHvqIndex::from_bytes(dim, bytes)?));
                     }
-                    return Ok(Box::new(HnswHvqIndex::new(
+                    Ok(Box::new(HnswHvqIndex::new(
                         dim,
                         metric,
                         m,
@@ -69,7 +69,7 @@ impl IndexFactory for DefaultIndexFactory {
                         ef_construction,
                         ef_search,
                         nbits,
-                    )?));
+                    )?))
                 }
                 #[cfg(not(feature = "hanns-backend"))]
                 {
@@ -86,7 +86,7 @@ impl IndexFactory for DefaultIndexFactory {
                     if let Some(bytes) = serialized {
                         return Ok(Box::new(IvfIndex::from_bytes(dim, metric, nlist, bytes)?));
                     }
-                    return Ok(Box::new(IvfIndex::new(dim, metric, nlist)?));
+                    Ok(Box::new(IvfIndex::new(dim, metric, nlist)?))
                 }
                 #[cfg(not(feature = "hanns-backend"))]
                 {
@@ -120,7 +120,7 @@ impl IndexFactory for DefaultIndexFactory {
                             bytes,
                         )?));
                     }
-                    return Ok(Box::new(IvfUsqIndex::new(
+                    Ok(Box::new(IvfUsqIndex::new(
                         dim,
                         metric,
                         nlist,
@@ -128,7 +128,7 @@ impl IndexFactory for DefaultIndexFactory {
                         rotation_seed,
                         rerank_k,
                         use_high_accuracy_scan,
-                    )?));
+                    )?))
                 }
                 #[cfg(not(feature = "hanns-backend"))]
                 {
@@ -144,12 +144,12 @@ impl IndexFactory for DefaultIndexFactory {
                     if let Some(bytes) = serialized {
                         return Ok(Box::new(KnowhereHnswIndex::from_bytes(dim, bytes)?));
                     }
-                    return Ok(Box::new(KnowhereHnswIndex::new(
+                    Ok(Box::new(KnowhereHnswIndex::new(
                         dim,
                         metric,
                         read_usize_param(&descriptor.params, "m").unwrap_or(16),
                         read_usize_param(&descriptor.params, "ef_construction").unwrap_or(128),
-                    )?));
+                    )?))
                 }
 
                 #[cfg(not(feature = "hanns-backend"))]
@@ -185,9 +185,9 @@ impl DefaultIndexFactory {
                             crate::sparse::HannsSparseInvertedIndex::from_bytes(bytes)?,
                         ));
                     }
-                    return Ok(Box::new(crate::sparse::HannsSparseInvertedIndex::new(
+                    Ok(Box::new(crate::sparse::HannsSparseInvertedIndex::new(
                         metric,
-                    )?));
+                    )?))
                 }
                 #[cfg(not(feature = "hanns-backend"))]
                 {
@@ -203,7 +203,7 @@ impl DefaultIndexFactory {
                             bytes,
                         )?));
                     }
-                    return Ok(Box::new(crate::sparse::HannsSparseWandIndex::new(metric)?));
+                    Ok(Box::new(crate::sparse::HannsSparseWandIndex::new(metric)?))
                 }
                 #[cfg(not(feature = "hanns-backend"))]
                 {

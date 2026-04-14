@@ -47,7 +47,7 @@ fn rrf_fusion(per_field: &PerFieldResults, rank_constant: u64, top_k: usize) -> 
     }
 
     let mut results: Vec<(i64, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.total_cmp(&a.1));
+    results.sort_by(compare_fused_results);
     results.truncate(top_k);
     results
 }
@@ -77,9 +77,13 @@ fn weighted_fusion(
     }
 
     let mut results: Vec<(i64, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.total_cmp(&a.1));
+    results.sort_by(compare_fused_results);
     results.truncate(top_k);
     results
+}
+
+fn compare_fused_results(left: &(i64, f64), right: &(i64, f64)) -> std::cmp::Ordering {
+    right.1.total_cmp(&left.1)
 }
 
 fn normalize_distance(distance: f32, metric: &str) -> f64 {

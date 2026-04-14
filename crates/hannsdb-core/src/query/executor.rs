@@ -1,22 +1,36 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
-use crate::db::DocumentHit;
-use crate::document::FieldValue;
+use crate::document::{compare_field_value_for_sort, FieldValue};
 use crate::segment::{
     load_payloads, load_record_ids, load_records, load_sparse_vectors, load_vectors,
     SegmentManager, TombstoneMask,
 };
 
+use super::hits::{compare_hits, DocumentHit};
 use super::planner::{BruteForceExecutionMode, BruteForceQueryPlan};
 use super::rerank::{fuse, PerFieldResults};
 use super::search::{distance_by_metric, sparse_inner_product};
 use super::QueryVector;
 
 pub(crate) struct QueryExecutor;
+
+pub(crate) fn project_hits_output_fields(
+    hits: &mut [DocumentHit],
+    output_fields: Option<&[String]>,
+) {
+    let Some(output_fields) = output_fields else {
+        return;
+    };
+    let requested = output_fields.iter().cloned().collect::<BTreeSet<_>>();
+    for hit in hits {
+        hit.fields
+            .retain(|field_name, _| requested.contains(field_name));
+    }
+}
 
 /// Per-document per-field distances collected for reranking.
 struct CollectedDoc {
@@ -298,12 +312,6 @@ fn candidate_vector_for_field<'a>(
     }
 }
 
-fn compare_hits(left: &DocumentHit, right: &DocumentHit) -> Ordering {
-    left.distance
-        .total_cmp(&right.distance)
-        .then_with(|| left.id.cmp(&right.id))
-}
-
 fn collapse_hits_by_group(
     hits: Vec<DocumentHit>,
     field_name: &str,
@@ -486,7 +494,7 @@ fn load_sparse_vectors_or_empty(
 }
 
 /// Sort hits by a scalar field value. Missing values sort last (ascending) or first (descending).
-fn sort_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bool) {
+pub(crate) fn sort_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bool) {
     hits.sort_by(|a, b| {
         let av = a.fields.get(field_name);
         let bv = b.fields.get(field_name);
@@ -498,46 +506,4 @@ fn sort_hits_by_field(hits: &mut [DocumentHit], field_name: &str, descending: bo
         };
         if descending { ord.reverse() } else { ord }.then_with(|| compare_hits(a, b))
     });
-}
-
-/// Compare two FieldValue instances for sorting purposes.
-fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Ordering {
-    match (a, b) {
-        (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
-        (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
-        (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
-        (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
-        (FieldValue::UInt64(va), FieldValue::UInt64(vb)) => va.cmp(vb),
-        (FieldValue::Float(va), FieldValue::Float(vb)) => va.total_cmp(vb),
-        (FieldValue::Float64(va), FieldValue::Float64(vb)) => va.total_cmp(vb),
-        (FieldValue::Bool(va), FieldValue::Bool(vb)) => va.cmp(vb),
-        // Cross-type numeric comparison: promote to f64
-        (FieldValue::Int64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
-        (FieldValue::Float64(va), FieldValue::Int64(vb)) => va.total_cmp(&(*vb as f64)),
-        (FieldValue::Int32(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
-        (FieldValue::Float64(va), FieldValue::Int32(vb)) => va.total_cmp(&(*vb as f64)),
-        (FieldValue::UInt64(va), FieldValue::Float64(vb)) => (*va as f64).total_cmp(vb),
-        (FieldValue::Float64(va), FieldValue::UInt64(vb)) => va.total_cmp(&(*vb as f64)),
-        // Int-to-Int cross-type
-        (FieldValue::Int64(va), FieldValue::Int32(vb)) => va.cmp(&(*vb as i64)),
-        (FieldValue::Int32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
-        (FieldValue::Int64(va), FieldValue::UInt32(vb)) => va.cmp(&(*vb as i64)),
-        (FieldValue::UInt32(va), FieldValue::Int64(vb)) => (*va as i64).cmp(vb),
-        (FieldValue::Int64(va), FieldValue::UInt64(vb)) => {
-            if *va < 0 {
-                Ordering::Less
-            } else {
-                (*va as u64).cmp(vb)
-            }
-        }
-        (FieldValue::UInt64(va), FieldValue::Int64(vb)) => {
-            if *vb < 0 {
-                Ordering::Greater
-            } else {
-                va.cmp(&(*vb as u64))
-            }
-        }
-        // Fallback: stringify
-        _ => format!("{a:?}").cmp(&format!("{b:?}")),
-    }
 }

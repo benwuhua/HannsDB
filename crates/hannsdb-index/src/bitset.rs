@@ -26,7 +26,7 @@ where
     if total == 0 {
         return BitsetView::new(0);
     }
-    let word_count = (total + 63) / 64;
+    let word_count = total.div_ceil(64);
     let mut data = vec![0u64; word_count];
     for i in 0..total {
         if !passes(i) {
@@ -53,7 +53,7 @@ where
     if total == 0 {
         return Vec::new();
     }
-    let word_count = (total + 63) / 64;
+    let word_count = total.div_ceil(64);
     let mut data = vec![0u64; word_count];
     for i in 0..total {
         if !passes(i) {

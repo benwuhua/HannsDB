@@ -1,26 +1,19 @@
 pub mod catalog;
 pub mod db;
+mod db_types;
 pub mod document;
 pub mod pk;
 pub mod query;
 pub mod segment;
+pub mod storage;
 pub mod wal;
 
 pub use catalog::CollectionMetadata;
+pub use db::HannsDb;
+pub use db_types::{CollectionInfo, CollectionSegmentInfo};
 pub use document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
     VectorIndexSchema,
 };
 pub use pk::{PrimaryKeyMode, PrimaryKeyRegistry};
-
-pub fn core_bootstrap_marker() -> &'static str {
-    "hannsdb-core-bootstrap"
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn exports_core_bootstrap_symbol() {
-        let _ = super::core_bootstrap_marker();
-    }
-}
+pub use query::{DocumentHit, SearchHit};

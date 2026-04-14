@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     Document, FieldType, FieldValue, ScalarFieldSchema, SparseVector, VectorFieldSchema,
     VectorIndexSchema,
@@ -18,6 +17,7 @@ use hannsdb_core::document::{
 use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, QueryVector, VectorQuery, VectorQueryParam,
 };
+use hannsdb_core::HannsDb;
 
 use crate::api::{
     AddColumnRequest, AddColumnResponse, AddVectorFieldRequest, AddVectorFieldResponse,
@@ -250,7 +250,7 @@ async fn get_collection_stats(
     collection_info_response(result)
 }
 
-fn collection_info_response(result: io::Result<hannsdb_core::db::CollectionInfo>) -> Response {
+fn collection_info_response(result: io::Result<hannsdb_core::CollectionInfo>) -> Response {
     match result {
         Ok(info) => (
             StatusCode::OK,

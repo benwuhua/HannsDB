@@ -51,6 +51,11 @@ pub trait SparseIndexBackend: Send + Sync {
     /// Number of indexed vectors.
     fn len(&self) -> usize;
 
+    /// Whether the backend currently holds zero indexed vectors.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Set BM25 scoring parameters on the underlying index.
     ///
     /// Default implementation is a no-op so that brute-force backends

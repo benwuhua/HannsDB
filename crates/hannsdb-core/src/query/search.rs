@@ -1,13 +1,8 @@
 use std::io;
 
+use super::hits::{compare_search_hits, SearchHit};
 use crate::document::SparseVector;
 use crate::segment::TombstoneMask;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchHit {
-    pub id: i64,
-    pub distance: f32,
-}
 
 pub fn search_by_metric(
     records: &[f32],
@@ -55,11 +50,7 @@ pub fn search_by_metric(
         });
     }
 
-    hits.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    hits.sort_by(compare_search_hits);
     if hits.len() > top_k {
         hits.truncate(top_k);
     }
@@ -96,11 +87,7 @@ pub fn search_sparse_bruteforce(
         });
     }
 
-    hits.sort_by(|a, b| {
-        a.distance
-            .total_cmp(&b.distance)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    hits.sort_by(compare_search_hits);
     if hits.len() > top_k {
         hits.truncate(top_k);
     }

@@ -975,6 +975,49 @@ fn wal_truncate_optimize_truncates_wal() {
     );
 }
 
+#[cfg(feature = "hanns-backend")]
+#[test]
+fn wal_truncate_optimize_preserves_ann_completeness_after_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+
+    {
+        let mut db = HannsDb::open(root).expect("open db");
+        db.create_collection_with_schema("docs", &sample_schema())
+            .expect("create collection");
+        db.insert_documents(
+            "docs",
+            &[
+                custom_document(11, "s1", 1, true, vec![0.1, 0.2]),
+                custom_document(22, "s2", 2, true, vec![0.9, 0.8]),
+            ],
+        )
+        .expect("insert documents");
+        db.optimize_collection("docs").expect("optimize collection");
+    }
+
+    let wal_records = load_wal_records(&root.join("wal.jsonl")).expect("load wal");
+    assert!(
+        wal_records.is_empty(),
+        "optimize should truncate wal before reopen"
+    );
+
+    let reopened = HannsDb::open(root).expect("reopen after optimize");
+    let info = reopened
+        .get_collection_info("docs")
+        .expect("collection info after reopen");
+    assert_eq!(info.record_count, 2);
+    assert_eq!(info.deleted_count, 0);
+    assert_eq!(info.live_count, 2);
+    assert_eq!(info.index_completeness.get("dense"), Some(&1.0));
+
+    let hits = reopened
+        .search("docs", &[0.1_f32, 0.2], 1)
+        .expect("search should use persisted ann after reopen");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 11);
+}
+
 #[test]
 fn wal_truncate_flush_then_reopen_then_insert_search_works() {
     let temp = tempfile::tempdir().expect("tempdir");

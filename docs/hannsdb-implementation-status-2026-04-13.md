@@ -80,6 +80,63 @@
 - daemon 包已增加 `hanns-backend` feature forwarding，`http_smoke` 可直接验证：
   - optimize 后 `ann_ready=true`
   - 后续写入后 `ann_ready=false`
+- `collection_info` 也已补齐对应状态合同：
+  - optimize 后 `index_completeness=1.0`
+  - 重启后若 persisted ANN 仍存在，则保持 `1.0`
+  - 后续写入后重新回到 `0.0`
+
+### 11. storage 模块切片起步
+- 新增显式 `crates/hannsdb-core/src/storage/`
+- 当前先把现有 WAL / recovery helper 收编到：
+  - `storage::wal`
+  - `storage::recovery`
+- 这一步暂时不改行为，目的是给后续 durability/storage story 整理提供稳定落脚点
+- 后续又把 `WalReplayPlan` 与 `collection_name_for_wal_record` 也移入 `storage::recovery`
+- active / immutable segment 的一批读盘 helper 也开始从 `db.rs` 收拢到：
+  - `storage::segment_io`
+  - 当前已包含 `load_records_or_empty / load_record_ids_or_empty / append_documents`
+  - 以及 `load_shadowed_live_records / load_shadowed_live_vector_records / load_all_collection_ids / persisted_ann_exists`
+  - 以及 `has_live_id / latest_live_row_index / latest_row_index_for_id / mark_live_id_deleted`
+- primary-key registry 的文件读写与 numeric-key 扫描也开始收拢到：
+  - `storage::primary_keys`
+  - 当前已包含 `load_primary_key_registry / save_primary_key_registry / ensure_string_primary_key_mode`
+  - 以及 `parse_numeric_public_key / display_key_for_internal_id`
+  - 以及 `assign_internal_ids_for_public_keys / resolve_public_keys_to_internal_ids / register_public_keys_with_internal_ids`
+- 到这一轮为止，`db.rs` 里原先那批 storage / primary-key 辅助函数已经基本抽空，剩余更多是 orchestration 与业务合同，而不是文件布局细节
+- 文档层也同步确认：`validate_documents` 已移到 `document.rs`，进一步减少 `db.rs` 的输入校验细节
+- schema/index descriptor 的输入校验也已移到 `document.rs`：
+  - `validate_vector_index_descriptor`
+  - `validate_schema_primary_vector_descriptor`
+  - `validate_schema_secondary_vector_descriptors`
+- `field_value_to_scalar` 也已移到 `document.rs`，进一步减少 `db.rs` 对 payload/value 细节转换的直接承担
+- `next_compacted_segment_id` 也已移到 `storage::segment_io`，继续把 segment layout/命名细节从 `db.rs` 剥离
+- `sort_document_hits_by_field` / `compare_field_values_for_sort` 已删除，`db.rs` 现在复用 `query::executor` 的排序 helper，减少重复排序语义
+- `project_document_hits` 也已删掉，`db.rs` 现在复用 `query::executor::project_hits_output_fields`
+- `RankedDocumentHit` 现在也复用 `query::executor::compare_hits`，继续消除命中排序语义的重复定义
+- `RankedDocumentHit` 本身也已收回到局部作用域，不再作为 `db.rs` 的顶层辅助类型长期悬挂
+- 到当前这一步，`db.rs` 文件级顶层私有辅助定义已经明显缩到只剩少数状态字段与 handle/container 定义，不再堆着大量 storage/query helper
+- filtered segment-aware query 路径里最后一处手写 `distance/id` 排序也已改为复用 `compare_hits`
+- 占位性质的 `IndexRegistry` 也已删除，`CollectionHandle` 不再额外挂一个未实际承载状态的 registry 壳
+- `CachedDocumentState` 这个单字段 wrapper 也已删除，document cache 现在直接缓存 `Arc<HashMap<i64, Document>>`
+- 未被使用的 `CollectionHandle::name()` accessor 也已删掉，避免再保留无调用的薄包装 API
+- `FieldValue` 排序比较逻辑也已收拢到 `document.rs`，`query::executor` 不再内联维护那段 match 细节
+- `CollectionHandle` 不再单独保存 `root`; collection path / wal path 现在直接从 `segment_manager.collection_dir()` 推导，减少一份重复状态
+- `CollectionHandle` 也不再保存单独的 `name`; 日志里的 collection 名称现在直接从 `segment_manager.collection_dir()` 推导
+- `CollectionHandle::collection_name()` 这个局部 helper 也已删掉，直接复用 `segment_manager.collection_name()`
+- optimize / persisted-ANN load 路径里的 collection-name 日志也已做局部缓存，避免同一函数里反复重复取值
+- `storage::paths::root_for_collection_dir()` 这个单点 helper 也已内联回 `wal_path_for_collection_dir()`，继续压缩路径工具表面
+- `wal_path_for_collection_dir()` 也已继续收口；当前 flush 路径直接在使用点推导 collection-root 的 WAL 路径，不再额外挂一个单点 wrapper
+- `load_wal_records_or_empty()` 也已从 `storage::recovery` 收回到 `storage::wal`，让 WAL 相关 helper 更集中在同一个落脚点
+- `SearchHit` 的默认排序也开始统一复用，`query/search.rs` 不再在 dense/sparse 两条 brute-force 路径各自重复写一份相同排序闭包
+- `hannsdb-core` 里的 `core_bootstrap_marker()` 占位导出与其自测也已删除，避免继续保留无外部引用的 bootstrap 噪音
+- `DocumentHit` 也已从 `db.rs` 顶层移到 `query` 模块承接，`db.rs` 仅保留兼容 re-export，进一步消除 query 对 db 的反向耦合
+- `SearchHit` 也已与 `DocumentHit` 一起集中到 `query::hits`，`query::search` 只保留搜索实现而不再自带结果类型定义
+- `compare_search_hits` 也已跟着 `SearchHit` 一起落到 `query::hits`，让结果类型与其默认比较规则放在同一落脚点
+- `CollectionInfo / CollectionSegmentInfo` 也已移到独立 `db_types` 模块承接，`db.rs` 只保留兼容 re-export，继续缩小 `db.rs` 顶层类型面
+- `hannsdb-core` crate 顶层也开始直接 re-export `CollectionInfo / CollectionSegmentInfo / DocumentHit / SearchHit`，daemon 已改用更短的顶层类型路径
+- `HannsDb` 本体也已开始从 crate 顶层 re-export，daemon 侧已改用 `hannsdb_core::HannsDb`，继续减弱对 `db` 子模块路径的耦合
+- reranker 里重复的 fused-score 排序也已统一成单一 helper，`rrf` / `weighted` 不再各自维护一份相同 `sort_by`
+- `cargo check -p hannsdb-core --features hanns-backend` 与 `wal_recovery` 全套仍保持绿色
 
 ## 最新验证证据
 
@@ -255,3 +312,20 @@ N=200 DIM=64 METRIC=cosine TOPK=10 INDEX_KIND=hnsw QUERY_EF_SEARCH=48 REPEATS=1 
 说明：
 - 这是 `scripts/sync-remote.sh vdbb-watchdog` 新统一入口的成功验证结果
 - 说明远端 bootstrap + 统一 watchdog 路线已经可以完整复现标准 benchmark
+
+### 远端统一 watchdog fast-path 复跑（2026-04-13）
+结果文件：
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260413_hannsdb-remote-watchdog-fastpath_hannsdb.json`
+
+关键指标：
+- `insert_duration=22.1823`
+- `optimize_duration=79.0168`
+- `load_duration=101.1991`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+说明：
+- 这是同一统一入口在远端环境已准备好的前提下的 fast-path 复跑
+- 证明 `sync-remote.sh vdbb-watchdog` 现在既能负责首次 bootstrap，也能复用现成环境稳定重复执行

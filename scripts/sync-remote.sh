@@ -20,6 +20,9 @@ sync_hannsdb() {
     --exclude '.git' \
     --exclude '.venv-hannsdb' \
     --exclude '.venv-hannsdb-remote' \
+    --exclude '*.so' \
+    --exclude '*.dylib' \
+    --exclude '*.pyd' \
     -e "$SSH_RSYNC_CMD" \
     "$(dirname "$(dirname "$0")")"/ \
     "$REMOTE_HOST:$REMOTE_DIR/"
@@ -42,9 +45,21 @@ remote_ssh() {
     "$REMOTE_HOST" "$@"
 }
 
+remote_vdbb_ready() {
+  remote_ssh "set -euo pipefail && \
+    test -x $REMOTE_VENV_DIR/bin/python && \
+    test -x $REMOTE_VENV_DIR/bin/maturin && \
+    VIRTUAL_ENV=$REMOTE_VENV_DIR PATH=$REMOTE_VENV_DIR/bin:\$PATH PYTHONPATH=$REMOTE_VDBB_REPO \
+      $REMOTE_VENV_DIR/bin/python -c \"import hannsdb, environs, vectordb_bench; print(hannsdb.__name__)\" >/dev/null"
+}
+
 bootstrap_remote_vdbb() {
   sync_hannsdb
   sync_knowhere
+  if remote_vdbb_ready; then
+    echo "Remote VectorDBBench environment already ready at $REMOTE_VENV_DIR"
+    return 0
+  fi
   remote_ssh "set -euo pipefail && \
     python3 -m venv $REMOTE_VENV_DIR && \
     $REMOTE_VENV_DIR/bin/python -m pip install --upgrade pip wheel setuptools maturin && \
