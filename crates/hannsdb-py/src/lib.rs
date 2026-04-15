@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "python-binding")]
 use numpy::PyReadonlyArray1;
 #[cfg(feature = "python-binding")]
-use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyNotImplementedError, PyRuntimeError, PyValueError};
 #[cfg(feature = "python-binding")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-binding")]
@@ -22,6 +22,7 @@ use hannsdb_core::query::{
     QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
     VectorQueryParam as CoreVectorQueryParam,
 };
+use hannsdb_core::wal::{AddColumnBackfill, AlterColumnMigration};
 
 pub fn bootstrap_symbol() -> &'static str {
     "hannsdb_py_bootstrap"
@@ -122,6 +123,14 @@ pub struct HnswHvqIndexParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HnswSqIndexParam {
+    pub metric_type: Option<MetricType>,
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IvfIndexParam {
     pub metric_type: Option<MetricType>,
     pub nlist: usize,
@@ -143,10 +152,17 @@ pub struct FlatIndexParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvertIndexParam {
+    pub enable_range_optimization: bool,
+    pub enable_extended_wildcard: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexParam {
     Flat(FlatIndexParam),
     Hnsw(HnswIndexParam),
     HnswHvq(HnswHvqIndexParam),
+    HnswSq(HnswSqIndexParam),
     Ivf(IvfIndexParam),
     IvfUsq(IvfUsqIndexParam),
 }
@@ -341,6 +357,12 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
                     params.ef_construction,
                     params.ef_search,
                     params.nbits,
+                )),
+                Some(IndexParam::HnswSq(params)) => Some(CoreVectorIndexSchema::hnsw_sq(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.ef_construction,
+                    params.ef_search,
                 )),
                 Some(IndexParam::Ivf(params)) => Some(CoreVectorIndexSchema::ivf(
                     params.metric_type.map(metric_type_name),
@@ -638,8 +660,10 @@ fn core_documents_from_docs(
     collection: &mut Collection,
     docs: &[Doc],
 ) -> std::io::Result<Vec<(String, CoreDocument)>> {
-    let collection_metadata =
-        collection_metadata_from_root(std::path::Path::new(&collection.path), &collection.collection_name)?;
+    let collection_metadata = collection_metadata_from_root(
+        std::path::Path::new(&collection.path),
+        &collection.collection_name,
+    )?;
     let docs = docs
         .iter()
         .map(|doc| normalize_doc_fields_for_collection(doc, &collection_metadata))
@@ -781,12 +805,12 @@ fn coerce_field_value_for_schema(
             FieldValue::Bool(v) => Ok(FieldValue::Bool(*v)),
             _ => Err(schema_mismatch_error(field_name, &schema.data_type)),
         },
-        CoreFieldType::VectorFp32
-        | CoreFieldType::VectorFp16
-        | CoreFieldType::VectorSparse => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("field {field_name} cannot use vector type in scalar schema"),
-        )),
+        CoreFieldType::VectorFp32 | CoreFieldType::VectorFp16 | CoreFieldType::VectorSparse => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("field {field_name} cannot use vector type in scalar schema"),
+            ))
+        }
     }
 }
 
@@ -894,6 +918,14 @@ fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>)
                 params.m, params.m_max0, params.ef_construction, params.ef_search, params.nbits
             ),
         ),
+        Some(IndexParam::HnswSq(params)) => (
+            "hnsw_sq",
+            metric_json(params.metric_type),
+            format!(
+                r#"{{"m":{},"ef_construction":{},"ef_search":{}}}"#,
+                params.m, params.ef_construction, params.ef_search
+            ),
+        ),
         Some(IndexParam::Ivf(params)) => (
             "ivf",
             metric_json(params.metric_type),
@@ -923,10 +955,18 @@ fn vector_index_catalog_json(field_name: &str, index_param: Option<&IndexParam>)
     )
 }
 
-fn scalar_index_catalog_json(field_name: &str) -> String {
+fn scalar_index_catalog_json(field_name: &str, index_param: Option<&InvertIndexParam>) -> String {
+    let params = match index_param {
+        Some(p) => format!(
+            r#"{{"enable_range_optimization":{},"enable_extended_wildcard":{}}}"#,
+            p.enable_range_optimization, p.enable_extended_wildcard
+        ),
+        None => "{}".to_string(),
+    };
     format!(
-        r#"{{"vector_indexes":[],"scalar_indexes":[{{"field_name":{},"kind":"inverted","params":{{}}}}]}}"#,
-        json_string(field_name)
+        r#"{{"vector_indexes":[],"scalar_indexes":[{{"field_name":{},"kind":"inverted","params":{}}}]}}"#,
+        json_string(field_name),
+        params,
     )
 }
 
@@ -1039,21 +1079,15 @@ impl Collection {
     }
 
     pub fn insert(&mut self, docs: &[Doc]) -> std::io::Result<usize> {
-        let documents = core_documents_from_docs(self, docs)?;
-        let documents = documents
-            .into_iter()
-            .map(|(_, document)| document)
-            .collect::<Vec<_>>();
-        self.db.insert_documents(&self.collection_name, &documents)
+        let keyed_documents = core_documents_from_docs(self, docs)?;
+        self.db
+            .insert_documents_with_primary_keys(&self.collection_name, &keyed_documents)
     }
 
     pub fn upsert(&mut self, docs: &[Doc]) -> std::io::Result<usize> {
-        let documents = core_documents_from_docs(self, docs)?;
-        let documents = documents
-            .into_iter()
-            .map(|(_, document)| document)
-            .collect::<Vec<_>>();
-        self.db.upsert_documents(&self.collection_name, &documents)
+        let keyed_documents = core_documents_from_docs(self, docs)?;
+        self.db
+            .upsert_documents_with_primary_keys(&self.collection_name, &keyed_documents)
     }
 
     pub fn fetch(&self, ids: &[String]) -> std::io::Result<Vec<Doc>> {
@@ -1117,7 +1151,16 @@ impl Collection {
     }
 
     pub fn create_scalar_index(&self, field_name: &str) -> std::io::Result<()> {
-        let mut catalog = load_catalog_from_json(scalar_index_catalog_json(field_name))?;
+        self.create_scalar_index_with_param(field_name, None)
+    }
+
+    pub fn create_scalar_index_with_param(
+        &self,
+        field_name: &str,
+        index_param: Option<&InvertIndexParam>,
+    ) -> std::io::Result<()> {
+        let catalog_json = scalar_index_catalog_json(field_name, index_param);
+        let mut catalog = load_catalog_from_json(catalog_json)?;
         let descriptor = catalog.scalar_indexes.pop().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1179,6 +1222,14 @@ impl Collection {
                     params.ef_construction,
                     params.ef_search,
                     params.nbits,
+                ))
+            }
+            Some(IndexParam::HnswSq(params)) => {
+                Some(hannsdb_core::document::VectorIndexSchema::hnsw_sq(
+                    params.metric_type.map(metric_type_name),
+                    params.m,
+                    params.ef_construction,
+                    params.ef_search,
                 ))
             }
             Some(IndexParam::Ivf(params)) => Some(hannsdb_core::document::VectorIndexSchema::ivf(
@@ -1516,6 +1567,244 @@ fn parse_data_type(value: &str) -> PyResult<DataType> {
 }
 
 #[cfg(feature = "python-binding")]
+fn unsupported_add_column_constant_literal() -> PyErr {
+    PyNotImplementedError::new_err("add_column expression supports only constant literals")
+}
+
+#[cfg(feature = "python-binding")]
+fn constant_add_column_backfill(value: FieldValue) -> Option<AddColumnBackfill> {
+    Some(AddColumnBackfill::Constant { value: Some(value) })
+}
+
+#[cfg(feature = "python-binding")]
+fn is_canonical_digits(value: &str) -> bool {
+    value == "0"
+        || (!value.is_empty()
+            && !value.starts_with('0')
+            && value.chars().all(|c| c.is_ascii_digit()))
+}
+
+#[cfg(feature = "python-binding")]
+fn is_supported_int_literal(expr: &str) -> bool {
+    let digits = expr.strip_prefix('-').unwrap_or(expr);
+    is_canonical_digits(digits)
+}
+
+#[cfg(feature = "python-binding")]
+fn is_supported_float_literal(expr: &str) -> bool {
+    let Some((whole, frac)) = expr.split_once('.') else {
+        return false;
+    };
+    let whole_digits = whole.strip_prefix('-').unwrap_or(whole);
+    is_canonical_digits(whole_digits)
+        && !frac.is_empty()
+        && frac.chars().all(|c| c.is_ascii_digit())
+}
+
+#[cfg(feature = "python-binding")]
+fn parse_add_column_backfill(
+    expression: &str,
+    field: &CoreScalarFieldSchema,
+) -> PyResult<Option<AddColumnBackfill>> {
+    let expr = expression.trim();
+    if expr.is_empty() {
+        return Ok(None);
+    }
+    if field.array {
+        return Err(PyNotImplementedError::new_err(
+            "add_column expression does not support array fields yet",
+        ));
+    }
+
+    if expr == "null" {
+        if !field.nullable {
+            return Err(PyValueError::new_err(
+                "null expression requires a nullable field",
+            ));
+        }
+        return Ok(Some(AddColumnBackfill::Constant { value: None }));
+    }
+
+    if expr == "true" || expr == "false" {
+        if field.data_type != CoreFieldType::Bool {
+            return Err(PyValueError::new_err(
+                "boolean constant requires a bool destination field",
+            ));
+        }
+        return Ok(Some(AddColumnBackfill::Constant {
+            value: Some(FieldValue::Bool(expr == "true")),
+        }));
+    }
+
+    if expr.starts_with('"') {
+        if !expr.ends_with('"') || expr.len() < 2 {
+            return Err(PyValueError::new_err("invalid string literal"));
+        }
+        let inner = &expr[1..expr.len() - 1];
+        if inner.contains('\\') || inner.contains('"') {
+            return Err(PyNotImplementedError::new_err(
+                "add_column expression does not support string escapes or embedded quotes yet",
+            ));
+        }
+        if field.data_type != CoreFieldType::String {
+            return Err(PyValueError::new_err(
+                "string constant requires a string destination field",
+            ));
+        }
+        return Ok(constant_add_column_backfill(FieldValue::String(
+            inner.to_string(),
+        )));
+    }
+
+    if expr.starts_with('+') {
+        return Err(unsupported_add_column_constant_literal());
+    }
+    if expr.contains('e') || expr.contains('E') {
+        return Err(PyNotImplementedError::new_err(
+            "add_column expression does not support scientific notation",
+        ));
+    }
+
+    if expr.contains('.') {
+        if !is_supported_float_literal(expr) {
+            return Err(unsupported_add_column_constant_literal());
+        }
+        let value = expr
+            .parse::<f64>()
+            .map_err(|_| PyValueError::new_err("invalid float literal"))?;
+        let field_value = match field.data_type {
+            CoreFieldType::Float => FieldValue::Float(value as f32),
+            CoreFieldType::Float64 => FieldValue::Float64(value),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "float constant requires a float destination field",
+                ))
+            }
+        };
+        return Ok(constant_add_column_backfill(field_value));
+    }
+
+    if expr.starts_with('-') || expr.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        if !is_supported_int_literal(expr) {
+            return Err(unsupported_add_column_constant_literal());
+        }
+        let value = expr
+            .parse::<i128>()
+            .map_err(|_| PyValueError::new_err("invalid integer literal"))?;
+        let field_value = match field.data_type {
+            CoreFieldType::Int64 => FieldValue::Int64(
+                i64::try_from(value)
+                    .map_err(|_| PyValueError::new_err("int64 constant is out of range"))?,
+            ),
+            CoreFieldType::Int32 => FieldValue::Int32(
+                i32::try_from(value)
+                    .map_err(|_| PyValueError::new_err("int32 constant is out of range"))?,
+            ),
+            CoreFieldType::UInt32 => FieldValue::UInt32(
+                u32::try_from(value)
+                    .map_err(|_| PyValueError::new_err("uint32 constant is out of range"))?,
+            ),
+            CoreFieldType::UInt64 => FieldValue::UInt64(
+                u64::try_from(value)
+                    .map_err(|_| PyValueError::new_err("uint64 constant is out of range"))?,
+            ),
+            CoreFieldType::Float => FieldValue::Float(value as f32),
+            CoreFieldType::Float64 => FieldValue::Float64(value as f64),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "numeric constant requires a numeric destination field",
+                ))
+            }
+        };
+        return Ok(constant_add_column_backfill(field_value));
+    }
+
+    Err(unsupported_add_column_constant_literal())
+}
+
+#[cfg(feature = "python-binding")]
+fn py_field_schema_to_core(field_schema: &FieldSchema) -> PyResult<CoreScalarFieldSchema> {
+    let core_type = match field_schema.data_type {
+        DataType::String => hannsdb_core::document::FieldType::String,
+        DataType::Int64 => hannsdb_core::document::FieldType::Int64,
+        DataType::Int32 => hannsdb_core::document::FieldType::Int32,
+        DataType::UInt32 => hannsdb_core::document::FieldType::UInt32,
+        DataType::UInt64 => hannsdb_core::document::FieldType::UInt64,
+        DataType::Float => hannsdb_core::document::FieldType::Float,
+        DataType::Float64 => hannsdb_core::document::FieldType::Float64,
+        DataType::Bool => hannsdb_core::document::FieldType::Bool,
+        DataType::VectorFp32 => {
+            return Err(PyNotImplementedError::new_err(
+                "alter_column field_schema migration does not support vector fields yet",
+            ))
+        }
+    };
+    Ok(
+        hannsdb_core::document::ScalarFieldSchema::new(field_schema.name.clone(), core_type)
+            .with_flags(field_schema.nullable, field_schema.array),
+    )
+}
+
+#[cfg(feature = "python-binding")]
+fn classify_alter_column_migration(
+    root: &std::path::Path,
+    collection_name: &str,
+    old_name: &str,
+    new_name: &str,
+    target_field: &FieldSchema,
+) -> PyResult<AlterColumnMigration> {
+    let metadata = collection_metadata_from_root(root, collection_name).map_err(io_to_py_err)?;
+    let current_field = metadata
+        .fields
+        .iter()
+        .find(|field| field.name == old_name)
+        .ok_or_else(|| PyValueError::new_err(format!("field not found: {old_name}")))?;
+
+    if !new_name.is_empty() && new_name != target_field.name {
+        return Err(PyValueError::new_err(
+            "alter_column new_name must match field_schema.name",
+        ));
+    }
+    let is_rename = target_field.name != old_name;
+    if target_field.name.is_empty() {
+        return Err(PyNotImplementedError::new_err(
+            "alter_column field_schema migration requires a non-empty target field name",
+        ));
+    }
+    if target_field.nullable != current_field.nullable {
+        return Err(PyNotImplementedError::new_err(
+            "alter_column field_schema migration does not support nullable changes yet",
+        ));
+    }
+    if target_field.array != current_field.array {
+        return Err(PyNotImplementedError::new_err(
+            "alter_column field_schema migration does not support array changes yet",
+        ));
+    }
+
+    match (&current_field.data_type, &target_field.data_type) {
+        (CoreFieldType::Int32, DataType::Int64) => Ok(if is_rename {
+            AlterColumnMigration::RenameAndInt32ToInt64
+        } else {
+            AlterColumnMigration::Int32ToInt64
+        }),
+        (CoreFieldType::UInt32, DataType::UInt64) => Ok(if is_rename {
+            AlterColumnMigration::RenameAndUInt32ToUInt64
+        } else {
+            AlterColumnMigration::UInt32ToUInt64
+        }),
+        (CoreFieldType::Float, DataType::Float64) => Ok(if is_rename {
+            AlterColumnMigration::RenameAndFloatToFloat64
+        } else {
+            AlterColumnMigration::FloatToFloat64
+        }),
+        _ => Err(PyNotImplementedError::new_err(
+            "alter_column field_schema migration supports only widening scalar conversions",
+        )),
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "MetricType", module = "hannsdb")]
 struct PyMetricType;
 
@@ -1766,6 +2055,36 @@ impl PyHnswHvqIndexParam {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "HnswSqIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyHnswSqIndexParam {
+    inner: HnswSqIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyHnswSqIndexParam {
+    #[new]
+    #[pyo3(signature = (metric_type=None, m=16, ef_construction=200, ef_search=50))]
+    fn new(
+        metric_type: Option<String>,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    ) -> PyResult<Self> {
+        let parsed_metric = metric_type.as_deref().map(parse_metric_type).transpose()?;
+        Ok(Self {
+            inner: HnswSqIndexParam {
+                metric_type: parsed_metric,
+                m,
+                ef_construction,
+                ef_search,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "FlatIndexParam", module = "hannsdb")]
 #[derive(Clone)]
 struct PyFlatIndexParam {
@@ -1788,6 +2107,38 @@ impl PyFlatIndexParam {
     #[getter]
     fn metric_type(&self) -> Option<&'static str> {
         self.inner.metric_type.map(metric_type_name)
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "InvertIndexParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyInvertIndexParam {
+    inner: InvertIndexParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyInvertIndexParam {
+    #[new]
+    #[pyo3(signature = (enable_range_optimization=false, enable_extended_wildcard=false))]
+    fn new(enable_range_optimization: bool, enable_extended_wildcard: bool) -> PyResult<Self> {
+        Ok(Self {
+            inner: InvertIndexParam {
+                enable_range_optimization,
+                enable_extended_wildcard,
+            },
+        })
+    }
+
+    #[getter]
+    fn enable_range_optimization(&self) -> bool {
+        self.inner.enable_range_optimization
+    }
+
+    #[getter]
+    fn enable_extended_wildcard(&self) -> bool {
+        self.inner.enable_extended_wildcard
     }
 }
 
@@ -2059,6 +2410,13 @@ impl PyVectorSchema {
                             .inner
                             .clone(),
                     ))
+                } else if bound.is_instance_of::<PyHnswSqIndexParam>() {
+                    Some(IndexParam::HnswSq(
+                        bound
+                            .extract::<PyRef<'_, PyHnswSqIndexParam>>()?
+                            .inner
+                            .clone(),
+                    ))
                 } else if bound.is_instance_of::<PyIVFIndexParam>() {
                     Some(IndexParam::Ivf(
                         bound.extract::<PyRef<'_, PyIVFIndexParam>>()?.inner.clone(),
@@ -2072,7 +2430,7 @@ impl PyVectorSchema {
                     ))
                 } else {
                     return Err(PyValueError::new_err(
-                        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, or IvfUsqIndexParam",
+                        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, HnswSqIndexParam, IVFIndexParam, or IvfUsqIndexParam",
                     ));
                 }
             }
@@ -2647,13 +3005,15 @@ impl PyCollection {
             })
     }
 
-    #[pyo3(signature = (field_name, data_type, nullable=false, array=false))]
+    #[pyo3(signature = (field_name, data_type, nullable=false, array=false, expression="", _option=None))]
     fn add_column(
         &mut self,
         field_name: String,
         data_type: String,
         nullable: bool,
         array: bool,
+        expression: &str,
+        _option: Option<Py<PyAddColumnOption>>,
     ) -> PyResult<()> {
         let collection_name = self.inner_ref()?.collection_name.clone();
         let dt = parse_data_type(&data_type)?;
@@ -2674,9 +3034,10 @@ impl PyCollection {
         };
         let field = hannsdb_core::document::ScalarFieldSchema::new(field_name, core_type)
             .with_flags(nullable, array);
+        let backfill = parse_add_column_backfill(expression, &field)?;
         self.inner_mut()?
             .db
-            .add_column(&collection_name, field)
+            .add_column_with_backfill(&collection_name, field, backfill)
             .map_err(io_to_py_err)
     }
 
@@ -2688,12 +3049,42 @@ impl PyCollection {
             .map_err(io_to_py_err)
     }
 
-    fn alter_column(&mut self, field_name: String, new_name: String) -> PyResult<()> {
+    #[pyo3(signature = (field_name, new_name="", field_schema=None, _option=None))]
+    fn alter_column(
+        &mut self,
+        py: Python<'_>,
+        field_name: String,
+        new_name: &str,
+        field_schema: Option<Py<PyFieldSchema>>,
+        _option: Option<Py<PyAlterColumnOption>>,
+    ) -> PyResult<()> {
         let collection_name = self.inner_ref()?.collection_name.clone();
-        self.inner_mut()?
-            .db
-            .alter_column(&collection_name, &field_name, &new_name)
-            .map_err(io_to_py_err)
+        if let Some(field_schema) = field_schema {
+            let target_field = field_schema.borrow(py).inner.clone();
+            let migration = classify_alter_column_migration(
+                std::path::Path::new(&self.inner_ref()?.path),
+                &collection_name,
+                &field_name,
+                new_name,
+                &target_field,
+            )?;
+            let target_field = py_field_schema_to_core(&target_field)?;
+            self.inner_mut()?
+                .db
+                .alter_column_with_field_schema(
+                    &collection_name,
+                    &field_name,
+                    new_name,
+                    target_field,
+                    migration,
+                )
+                .map_err(io_to_py_err)
+        } else {
+            self.inner_mut()?
+                .db
+                .alter_column(&collection_name, &field_name, new_name)
+                .map_err(io_to_py_err)
+        }
     }
 
     #[pyo3(signature = (vectors, output_fields=None, topk=100, filter=None))]
@@ -2872,9 +3263,33 @@ impl PyCollection {
             .map_err(io_to_py_err)
     }
 
-    fn create_scalar_index(&self, field_name: String) -> PyResult<()> {
+    #[pyo3(signature = (field_name, index_param=None))]
+    fn create_scalar_index(
+        &self,
+        py: Python<'_>,
+        field_name: String,
+        index_param: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let index_param = match index_param {
+            Some(param) => {
+                let bound = param.bind(py);
+                if bound.is_instance_of::<PyInvertIndexParam>() {
+                    Some(
+                        bound
+                            .extract::<PyRef<'_, PyInvertIndexParam>>()?
+                            .inner
+                            .clone(),
+                    )
+                } else {
+                    return Err(PyValueError::new_err(
+                        "scalar index param must be InvertIndexParam",
+                    ));
+                }
+            }
+            None => None,
+        };
         self.inner_ref()?
-            .create_scalar_index(&field_name)
+            .create_scalar_index_with_param(&field_name, index_param.as_ref())
             .map_err(io_to_py_err)
     }
 
@@ -3006,6 +3421,7 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyCollectionOption>()?;
     module.add_class::<PyAddColumnOption>()?;
     module.add_class::<PyAlterColumnOption>()?;
+    module.add_class::<PyInvertIndexParam>()?;
     module.add_class::<PyFlatIndexParam>()?;
     module.add_class::<PyHnswIndexParam>()?;
     module.add_class::<PyHnswHvqIndexParam>()?;

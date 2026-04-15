@@ -175,7 +175,7 @@ def test_native_collection_delete_by_filter_invalid_filter_propagates(tmp_path):
     [
         ("add_column", ("session_id",), TypeError, "data_type"),
         ("drop_column", ("session_id",), FileNotFoundError, "field not found"),
-        ("alter_column", ("session_id",), TypeError, "new_name"),
+        ("alter_column", ("session_id",), FileNotFoundError, "field not found"),
     ],
 )
 def test_native_collection_column_mutation_surface_requires_current_contract(

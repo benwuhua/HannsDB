@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from ..model.param import (
     CollectionOption,
     HnswHvqIndexParam,
     HnswIndexParam,
+    InvertIndexParam,
     IvfUsqIndexParam,
     IVFIndexParam,
 )
@@ -23,6 +25,9 @@ from ..model.schema.field_schema import (
 )
 
 __all__ = ["Collection", "create_and_open", "open"]
+
+_INT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)$")
+_FLOAT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)\.[0-9]+$")
 
 
 def _build_query_executor(schema: CollectionSchema):
@@ -66,6 +71,16 @@ def _native_value(value):
     if native_getter is not None:
         return native_getter()
     return value
+
+
+def _normalize_scalar_index_param(index_param):
+    if index_param is None:
+        return None
+    if type(index_param) is not InvertIndexParam:
+        raise NotImplementedError(
+            f"unsupported scalar index param type: {index_param.__class__.__name__}"
+        )
+    return _native_value(index_param)
 
 
 def _wrap_collection_option(option):
@@ -114,23 +129,110 @@ def _normalize_add_column_input(
             array=array,
         )
 
-    if expression != "":
-        raise NotImplementedError("add_column expression is not supported yet")
+    expression = _normalize_add_column_expression(expression, field_schema)
 
     return field_schema, expression, option
 
 
+def _normalize_add_column_expression(expression: str, field_schema: FieldSchema) -> str:
+    if expression == "":
+        return ""
+
+    expr = expression.strip()
+    if expr == "":
+        return ""
+    if field_schema.array:
+        raise NotImplementedError("add_column expression does not support array fields yet")
+
+    data_type = str(field_schema.data_type)
+
+    if expr == "null":
+        if not field_schema.nullable:
+            raise ValueError("null expression requires a nullable field")
+        return expr
+
+    if expr in {"true", "false"}:
+        if data_type != "bool":
+            raise ValueError("boolean constant requires a bool destination field")
+        return expr
+
+    if expr.startswith('"'):
+        if not expr.endswith('"') or len(expr) < 2:
+            raise ValueError("invalid string literal")
+        inner = expr[1:-1]
+        if "\\" in inner or '"' in inner:
+            raise NotImplementedError(
+                "add_column expression does not support string escapes or embedded quotes yet"
+            )
+        if data_type != "string":
+            raise ValueError("string constant requires a string destination field")
+        return expr
+
+    if expr.startswith("+"):
+        raise NotImplementedError("add_column expression supports only constant literals")
+
+    if "e" in expr.lower():
+        raise NotImplementedError("add_column expression does not support scientific notation")
+
+    if _FLOAT_LITERAL_RE.fullmatch(expr):
+        if data_type not in {"float", "float64"}:
+            raise ValueError("float constant requires a float destination field")
+        return expr
+
+    if _INT_LITERAL_RE.fullmatch(expr):
+        value = int(expr)
+        if data_type == "int32" and not (-(2**31) <= value < 2**31):
+            raise ValueError("int32 constant is out of range")
+        if data_type == "uint32":
+            if value < 0:
+                raise ValueError("uint32 constant must be >= 0")
+            if value >= 2**32:
+                raise ValueError("uint32 constant is out of range")
+        if data_type == "uint64":
+            if value < 0:
+                raise ValueError("uint64 constant must be >= 0")
+            if value >= 2**64:
+                raise ValueError("uint64 constant is out of range")
+        if data_type not in {"int64", "int32", "uint32", "uint64", "float", "float64"}:
+            raise ValueError("numeric constant requires a numeric destination field")
+        return expr
+
+    raise NotImplementedError("add_column expression supports only constant literals")
+
+
 def _normalize_alter_column_input(
+    schema: CollectionSchema | None,
     field_name,
     new_name=None,
     field_schema=None,
     option=None,
-) -> tuple[str, str | None, Any]:
+) -> tuple[str, str | None, FieldSchema | None, Any]:
+    old_name = str(field_name)
     if field_schema is not None:
-        raise NotImplementedError("alter_column field_schema migration is not supported yet")
+        if schema is None:
+            raise RuntimeError("collection schema is required for alter_column migration")
+        target_field = _coerce_field_schema(field_schema)
+        current_field = schema.field(old_name)
+
+        if new_name not in (None, "") and str(new_name) != target_field.name:
+                raise ValueError("alter_column new_name must match field_schema.name")
+        if target_field.nullable != current_field.nullable:
+            raise NotImplementedError("alter_column field_schema migration does not support nullable changes yet")
+        if target_field.array != current_field.array:
+            raise NotImplementedError("alter_column field_schema migration does not support array changes yet")
+
+        supported_widening = {
+            ("int32", "int64"),
+            ("uint32", "uint64"),
+            ("float", "float64"),
+        }
+        if (current_field.data_type, target_field.data_type) not in supported_widening:
+            raise NotImplementedError("alter_column field_schema migration supports only widening scalar conversions")
+        return old_name, target_field.name, target_field, option
+
     if new_name in (None, ""):
         raise ValueError("alter_column rename requires new_name")
-    return str(field_name), str(new_name), option
+    return old_name, str(new_name), None, option
 
 
 def _coerce_doc_to_native(doc):
@@ -618,6 +720,8 @@ class Collection:
             field_schema.data_type,
             field_schema.nullable,
             field_schema.array,
+            expression,
+            _native_value(option),
         )
         if self._schema is not None:
             fields = [*self._schema.fields, field_schema]
@@ -632,25 +736,44 @@ class Collection:
         return result
 
     def alter_column(self, field_name, new_name=None, *, field_schema=None, option=None):
-        old_name, normalized_new_name, option = _normalize_alter_column_input(
+        old_name, normalized_new_name, normalized_field_schema, option = _normalize_alter_column_input(
+            self._schema,
             field_name,
             new_name=new_name,
             field_schema=field_schema,
             option=option,
         )
-        result = self._core.alter_column(old_name, normalized_new_name)
+        list_scalar_indexes = getattr(self._core, "list_scalar_indexes", None)
+        if (
+            normalized_field_schema is not None
+            and callable(list_scalar_indexes)
+            and old_name in list_scalar_indexes()
+        ):
+            raise NotImplementedError(
+                "alter_column field_schema migration is not supported for fields with scalar index descriptors"
+            )
+        result = self._core.alter_column(
+            old_name,
+            normalized_new_name or "",
+            _native_value(normalized_field_schema),
+            _native_value(option),
+        )
         if self._schema is not None:
-            fields = [
-                FieldSchema(
-                    name=normalized_new_name,
-                    data_type=field.data_type,
-                    nullable=field.nullable,
-                    array=field.array,
-                )
-                if field.name == old_name
-                else field
-                for field in self._schema.fields
-            ]
+            fields = []
+            for field in self._schema.fields:
+                if field.name != old_name:
+                    fields.append(field)
+                elif normalized_field_schema is not None:
+                    fields.append(normalized_field_schema)
+                else:
+                    fields.append(
+                        FieldSchema(
+                            name=normalized_new_name,
+                            data_type=field.data_type,
+                            nullable=field.nullable,
+                            array=field.array,
+                        )
+                    )
             self._set_schema(_replace_collection_schema(self._schema, fields=fields))
         return result
 
@@ -671,9 +794,7 @@ class Collection:
         kind, _ = _resolve_index_target(self._schema, field_name)
         if kind == "vector":
             return self.create_vector_index(field_name, index_param)
-        if index_param is not None:
-            raise NotImplementedError("scalar index params are not supported")
-        return self.create_scalar_index(field_name)
+        return self.create_scalar_index(field_name, index_param)
 
     def drop_index(self, field_name):
         if self._schema is None:
@@ -689,8 +810,11 @@ class Collection:
     def drop_vector_index(self, field_name):
         return self._core.drop_vector_index(field_name)
 
-    def create_scalar_index(self, field_name):
-        return self._core.create_scalar_index(field_name)
+    def create_scalar_index(self, field_name, index_param=None):
+        index_param = _normalize_scalar_index_param(index_param)
+        if index_param is None:
+            return self._core.create_scalar_index(field_name)
+        return self._core.create_scalar_index(field_name, index_param)
 
     def drop_scalar_index(self, field_name):
         return self._core.drop_scalar_index(field_name)

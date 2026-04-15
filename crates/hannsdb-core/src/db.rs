@@ -43,7 +43,7 @@ use crate::storage::paths::{
 };
 use crate::storage::primary_keys::{
     assign_internal_ids_for_public_keys, display_key_for_internal_id, load_primary_key_registry,
-    register_public_keys_with_internal_ids, resolve_public_keys_to_internal_ids,
+    resolve_public_keys_to_internal_ids, upsert_public_keys_with_internal_ids,
 };
 use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
 use crate::storage::segment_io::{
@@ -57,9 +57,103 @@ use crate::storage::segment_io::{
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
 };
+use crate::wal::{AddColumnBackfill, AlterColumnMigration};
 
 const DEFAULT_EF_SEARCH: usize = 32;
 const DEFAULT_NPROBE: usize = 32;
+
+fn validate_add_column_backfill(
+    field: &ScalarFieldSchema,
+    backfill: Option<&AddColumnBackfill>,
+) -> io::Result<()> {
+    let Some(backfill) = backfill else {
+        return Ok(());
+    };
+
+    if field.array {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "add_column constant backfill does not support array fields yet",
+        ));
+    }
+
+    match backfill {
+        AddColumnBackfill::Constant { value: None } => {
+            if !field.nullable {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "null constant backfill requires a nullable field",
+                ));
+            }
+        }
+        AddColumnBackfill::Constant { value: Some(value) } => match (&field.data_type, value) {
+            (crate::document::FieldType::String, FieldValue::String(_))
+            | (crate::document::FieldType::Int64, FieldValue::Int64(_))
+            | (crate::document::FieldType::Int32, FieldValue::Int32(_))
+            | (crate::document::FieldType::UInt32, FieldValue::UInt32(_))
+            | (crate::document::FieldType::UInt64, FieldValue::UInt64(_))
+            | (crate::document::FieldType::Float, FieldValue::Float(_))
+            | (crate::document::FieldType::Float64, FieldValue::Float64(_))
+            | (crate::document::FieldType::Bool, FieldValue::Bool(_)) => {}
+            (crate::document::FieldType::VectorFp32, _)
+            | (crate::document::FieldType::VectorFp16, _)
+            | (crate::document::FieldType::VectorSparse, _)
+            | (_, FieldValue::Array(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "add_column constant backfill only supports scalar field types",
+                ));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "constant backfill value does not match the destination field type",
+                ));
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn widen_field_value(
+    value: &FieldValue,
+    migration: AlterColumnMigration,
+) -> io::Result<FieldValue> {
+    match migration {
+        AlterColumnMigration::Int32ToInt64 | AlterColumnMigration::RenameAndInt32ToInt64 => {
+            match value {
+                FieldValue::Int32(v) => Ok(FieldValue::Int64(*v as i64)),
+                FieldValue::Int64(v) => Ok(FieldValue::Int64(*v)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "existing field value does not match int32 -> int64 widening",
+                )),
+            }
+        }
+        AlterColumnMigration::UInt32ToUInt64 | AlterColumnMigration::RenameAndUInt32ToUInt64 => {
+            match value {
+                FieldValue::UInt32(v) => Ok(FieldValue::UInt64(*v as u64)),
+                FieldValue::UInt64(v) => Ok(FieldValue::UInt64(*v)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "existing field value does not match uint32 -> uint64 widening",
+                )),
+            }
+        }
+        AlterColumnMigration::FloatToFloat64 | AlterColumnMigration::RenameAndFloatToFloat64 => {
+            match value {
+                FieldValue::Float(v) => Ok(FieldValue::Float64(*v as f64)),
+                FieldValue::Float64(v) => Ok(FieldValue::Float64(*v)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "existing field value does not match float -> float64 widening",
+                )),
+            }
+        }
+    }
+}
+
 pub struct HannsDb {
     root: PathBuf,
     read_only: bool,
@@ -233,32 +327,83 @@ impl HannsDb {
 
     pub fn add_column(&mut self, collection: &str, field: ScalarFieldSchema) -> io::Result<()> {
         self.require_write()?;
-        self.add_column_internal(collection, field, true)
+        self.add_column_internal(collection, field, None, true)
+    }
+
+    pub fn add_column_with_backfill(
+        &mut self,
+        collection: &str,
+        field: ScalarFieldSchema,
+        backfill: Option<AddColumnBackfill>,
+    ) -> io::Result<()> {
+        self.require_write()?;
+        self.add_column_internal(collection, field, backfill, true)
     }
 
     fn add_column_internal(
         &mut self,
         collection: &str,
         field: ScalarFieldSchema,
+        backfill: Option<AddColumnBackfill>,
         log_wal: bool,
     ) -> io::Result<()> {
         let paths = self.collection_paths(collection);
         let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
 
         crate::catalog::schema_mutation::add_field_to_schema(&mut meta.fields, field.clone())?;
+        validate_add_column_backfill(&field, backfill.as_ref())?;
 
         if log_wal {
             append_wal_record(
                 &wal_path(&self.root),
                 &WalRecord::AddColumn {
                     collection: collection.to_string(),
-                    field,
+                    field: field.clone(),
+                    backfill: backfill.clone(),
                 },
             )?;
         }
 
         meta.save_to_path(&paths.collection_meta)?;
         self.invalidate_search_cache(collection);
+        if let Some(backfill) = backfill.as_ref() {
+            self.apply_add_column_backfill(collection, &field, backfill)?;
+        }
+        Ok(())
+    }
+
+    fn apply_add_column_backfill(
+        &mut self,
+        collection: &str,
+        field: &ScalarFieldSchema,
+        backfill: &AddColumnBackfill,
+    ) -> io::Result<()> {
+        let state = self
+            .open_collection_handle(collection)?
+            .cached_document_state()?;
+        if state.is_empty() {
+            return Ok(());
+        }
+
+        let mut ids: Vec<i64> = state.keys().copied().collect();
+        ids.sort_unstable();
+
+        let updates = match backfill {
+            AddColumnBackfill::Constant { value: Some(value) } => ids
+                .into_iter()
+                .map(|id| DocumentUpdate {
+                    id,
+                    fields: [(field.name.clone(), Some::<FieldValue>(value.clone()))]
+                        .into_iter()
+                        .collect(),
+                    vectors: BTreeMap::new(),
+                    sparse_vectors: BTreeMap::new(),
+                })
+                .collect::<Vec<_>>(),
+            AddColumnBackfill::Constant { value: None } => return Ok(()),
+        };
+
+        self.update_documents_internal(collection, &updates, false)?;
         Ok(())
     }
 
@@ -299,7 +444,26 @@ impl HannsDb {
         new_name: &str,
     ) -> io::Result<()> {
         self.require_write()?;
-        self.alter_column_internal(collection, old_name, new_name, true)
+        self.alter_column_internal(collection, old_name, new_name, None, None, true)
+    }
+
+    pub fn alter_column_with_field_schema(
+        &mut self,
+        collection: &str,
+        old_name: &str,
+        new_name: &str,
+        field: ScalarFieldSchema,
+        migration: AlterColumnMigration,
+    ) -> io::Result<()> {
+        self.require_write()?;
+        self.alter_column_internal(
+            collection,
+            old_name,
+            new_name,
+            Some(field),
+            Some(migration),
+            true,
+        )
     }
 
     fn alter_column_internal(
@@ -307,10 +471,16 @@ impl HannsDb {
         collection: &str,
         old_name: &str,
         new_name: &str,
+        field: Option<ScalarFieldSchema>,
+        migration: Option<AlterColumnMigration>,
         log_wal: bool,
     ) -> io::Result<()> {
         let paths = self.collection_paths(collection);
         let mut meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+
+        if let (Some(field), Some(migration)) = (&field, migration) {
+            self.validate_alter_column_migration(collection, &meta, old_name, field, migration)?;
+        }
 
         if log_wal {
             append_wal_record(
@@ -319,17 +489,199 @@ impl HannsDb {
                     collection: collection.to_string(),
                     old_name: old_name.to_string(),
                     new_name: new_name.to_string(),
+                    field: field.clone(),
+                    migration,
                 },
             )?;
         }
 
-        crate::catalog::schema_mutation::rename_field_in_schema(
-            &mut meta.fields,
-            old_name,
-            new_name,
-        )?;
+        if let (Some(field), Some(migration)) = (&field, migration) {
+            self.apply_alter_column_migration(collection, &mut meta, old_name, field, migration)?;
+        } else {
+            crate::catalog::schema_mutation::rename_field_in_schema(
+                &mut meta.fields,
+                old_name,
+                new_name,
+            )?;
+        }
         meta.save_to_path(&paths.collection_meta)?;
         self.invalidate_search_cache(collection);
+        Ok(())
+    }
+
+    fn validate_alter_column_migration(
+        &self,
+        collection: &str,
+        meta: &CollectionMetadata,
+        old_name: &str,
+        target_field: &ScalarFieldSchema,
+        migration: AlterColumnMigration,
+    ) -> io::Result<()> {
+        let current_field = meta
+            .fields
+            .iter()
+            .find(|field| field.name == old_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("field not found: {old_name}"),
+                )
+            })?;
+
+        let is_rename = target_field.name != old_name;
+        if target_field.name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "field_schema migration requires a non-empty target field name",
+            ));
+        }
+        if is_rename
+            && meta
+                .fields
+                .iter()
+                .any(|field| field.name == target_field.name && field.name != old_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("field already exists: {}", target_field.name),
+            ));
+        }
+        if target_field.nullable != current_field.nullable {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "nullable changes are not supported in this lane",
+            ));
+        }
+        if target_field.array != current_field.array {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "array changes are not supported in this lane",
+            ));
+        }
+
+        let indexed = self
+            .list_scalar_indexes(collection)?
+            .into_iter()
+            .any(|descriptor| descriptor.field_name == old_name);
+        if indexed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "field_schema migration is not supported for fields with scalar index descriptors",
+            ));
+        }
+
+        let valid_pair = match migration {
+            AlterColumnMigration::Int32ToInt64 => {
+                !is_rename
+                    && current_field.data_type == crate::document::FieldType::Int32
+                    && target_field.data_type == crate::document::FieldType::Int64
+            }
+            AlterColumnMigration::UInt32ToUInt64 => {
+                !is_rename
+                    && current_field.data_type == crate::document::FieldType::UInt32
+                    && target_field.data_type == crate::document::FieldType::UInt64
+            }
+            AlterColumnMigration::FloatToFloat64 => {
+                !is_rename
+                    && current_field.data_type == crate::document::FieldType::Float
+                    && target_field.data_type == crate::document::FieldType::Float64
+            }
+            AlterColumnMigration::RenameAndInt32ToInt64 => {
+                is_rename
+                    && current_field.data_type == crate::document::FieldType::Int32
+                    && target_field.data_type == crate::document::FieldType::Int64
+            }
+            AlterColumnMigration::RenameAndUInt32ToUInt64 => {
+                is_rename
+                    && current_field.data_type == crate::document::FieldType::UInt32
+                    && target_field.data_type == crate::document::FieldType::UInt64
+            }
+            AlterColumnMigration::RenameAndFloatToFloat64 => {
+                is_rename
+                    && current_field.data_type == crate::document::FieldType::Float
+                    && target_field.data_type == crate::document::FieldType::Float64
+            }
+        };
+
+        if !valid_pair {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "field_schema migration supports only the widening subset in this lane",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn apply_alter_column_migration(
+        &mut self,
+        collection: &str,
+        meta: &mut CollectionMetadata,
+        old_name: &str,
+        target_field: &ScalarFieldSchema,
+        migration: AlterColumnMigration,
+    ) -> io::Result<()> {
+        let state = self
+            .open_collection_handle(collection)?
+            .cached_document_state()?;
+        let mut ids: Vec<i64> = state.keys().copied().collect();
+        ids.sort_unstable();
+        let mut updates = Vec::new();
+
+        for id in ids {
+            let Some(document) = state.get(&id) else {
+                continue;
+            };
+            let source_name = if document.fields.contains_key(old_name) {
+                old_name
+            } else if document.fields.contains_key(target_field.name.as_str()) {
+                target_field.name.as_str()
+            } else {
+                continue;
+            };
+            let value = document
+                .fields
+                .get(source_name)
+                .expect("checked source field presence");
+            let widened = widen_field_value(value, migration)?;
+            let already_final = source_name == target_field.name.as_str() && &widened == value;
+            if already_final {
+                continue;
+            }
+            let mut fields = BTreeMap::new();
+            if source_name == old_name && target_field.name != old_name {
+                fields.insert(old_name.to_string(), None);
+            }
+            fields.insert(target_field.name.clone(), Some::<FieldValue>(widened));
+            updates.push(DocumentUpdate {
+                id,
+                fields,
+                vectors: BTreeMap::new(),
+                sparse_vectors: BTreeMap::new(),
+            });
+        }
+
+        let field = meta
+            .fields
+            .iter_mut()
+            .find(|field| field.name == old_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("field not found: {old_name}"),
+                )
+            })?;
+        field.name = target_field.name.clone();
+        field.data_type = target_field.data_type.clone();
+        field.nullable = target_field.nullable;
+        field.array = target_field.array;
+
+        if !updates.is_empty() {
+            let paths = self.collection_paths(collection);
+            meta.save_to_path(&paths.collection_meta)?;
+            self.update_documents_internal(collection, &updates, false)?;
+        }
+
         Ok(())
     }
 
@@ -892,7 +1244,7 @@ impl HannsDb {
             .map(|(_, document)| document.id)
             .collect::<Vec<_>>();
 
-        register_public_keys_with_internal_ids(
+        upsert_public_keys_with_internal_ids(
             &paths,
             &mut collection_meta,
             &public_keys,
@@ -958,6 +1310,41 @@ impl HannsDb {
     ) -> io::Result<usize> {
         self.require_write()?;
         self.upsert_documents_internal(collection, documents, true)
+    }
+
+    pub fn upsert_documents_with_primary_keys(
+        &mut self,
+        collection: &str,
+        keyed_documents: &[(String, Document)],
+    ) -> io::Result<usize> {
+        self.require_write()?;
+        if keyed_documents.is_empty() {
+            return Ok(0);
+        }
+
+        let paths = self.collection_paths(collection);
+        let mut collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
+        let public_keys = keyed_documents
+            .iter()
+            .map(|(public_key, _)| public_key.clone())
+            .collect::<Vec<_>>();
+        let internal_ids = keyed_documents
+            .iter()
+            .map(|(_, document)| document.id)
+            .collect::<Vec<_>>();
+
+        upsert_public_keys_with_internal_ids(
+            &paths,
+            &mut collection_meta,
+            &public_keys,
+            &internal_ids,
+        )?;
+
+        let documents = keyed_documents
+            .iter()
+            .map(|(_, document)| document.clone())
+            .collect::<Vec<_>>();
+        self.upsert_documents_internal(collection, &documents, true)
     }
 
     fn upsert_documents_internal(
@@ -1513,9 +1900,11 @@ impl HannsDb {
             } => self
                 .update_documents_internal(collection, updates, false)
                 .map(|_| ()),
-            WalRecord::AddColumn { collection, field } => {
-                self.add_column_internal(collection, field.clone(), false)
-            }
+            WalRecord::AddColumn {
+                collection,
+                field,
+                backfill,
+            } => self.add_column_internal(collection, field.clone(), backfill.clone(), false),
             WalRecord::DropColumn {
                 collection,
                 field_name,
@@ -1524,7 +1913,16 @@ impl HannsDb {
                 collection,
                 old_name,
                 new_name,
-            } => self.alter_column_internal(collection, old_name, new_name, false),
+                field,
+                migration,
+            } => self.alter_column_internal(
+                collection,
+                old_name,
+                new_name,
+                field.clone(),
+                *migration,
+                false,
+            ),
             WalRecord::AddVectorField { collection, field } => {
                 self.add_vector_field_internal(collection, field.clone(), false)
             }
@@ -2510,6 +2908,32 @@ impl CollectionHandle {
                     }
                 }
                 result
+            }
+            FilterExpr::HasPrefix {
+                field,
+                pattern,
+                negated,
+            } => {
+                let index = scalar_cache.get(field)?;
+                let ids = index.lookup_prefix(pattern)?;
+                if *negated {
+                    None
+                } else {
+                    Some(ids)
+                }
+            }
+            FilterExpr::HasSuffix {
+                field,
+                pattern,
+                negated,
+            } => {
+                let index = scalar_cache.get(field)?;
+                let ids = index.lookup_suffix(pattern)?;
+                if *negated {
+                    None
+                } else {
+                    Some(ids)
+                }
             }
             // NOT and NullCheck are harder to accelerate; fall back.
             _ => None,

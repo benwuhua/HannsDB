@@ -6,8 +6,23 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
-    CollectionSchema, Document, DocumentUpdate, ScalarFieldSchema, VectorFieldSchema,
+    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, VectorFieldSchema,
 };
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AddColumnBackfill {
+    Constant { value: Option<FieldValue> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlterColumnMigration {
+    Int32ToInt64,
+    UInt32ToUInt64,
+    FloatToFloat64,
+    RenameAndInt32ToInt64,
+    RenameAndUInt32ToUInt64,
+    RenameAndFloatToFloat64,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WalRecord {
@@ -46,6 +61,8 @@ pub enum WalRecord {
     AddColumn {
         collection: String,
         field: ScalarFieldSchema,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backfill: Option<AddColumnBackfill>,
     },
     DropColumn {
         collection: String,
@@ -55,6 +72,10 @@ pub enum WalRecord {
         collection: String,
         old_name: String,
         new_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<ScalarFieldSchema>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        migration: Option<AlterColumnMigration>,
     },
     AddVectorField {
         collection: String,

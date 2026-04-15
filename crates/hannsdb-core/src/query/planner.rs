@@ -392,6 +392,7 @@ pub(crate) fn resolve_vector_descriptor_for_field(
                 crate::document::VectorIndexSchema::Ivf { .. } => VectorIndexKind::Ivf,
                 crate::document::VectorIndexSchema::IvfUsq { .. } => VectorIndexKind::IvfUsq,
                 crate::document::VectorIndexSchema::HnswHvq { .. } => VectorIndexKind::HnswHvq,
+                crate::document::VectorIndexSchema::HnswSq { .. } => VectorIndexKind::HnswSq,
                 crate::document::VectorIndexSchema::Hnsw { .. } => VectorIndexKind::Hnsw,
             },
             metric: index_param.metric().map(str::to_string),
@@ -426,6 +427,16 @@ pub(crate) fn resolve_vector_descriptor_for_field(
                     "ef_construction": ef_construction,
                     "ef_search": ef_search,
                     "nbits": nbits,
+                }),
+                crate::document::VectorIndexSchema::HnswSq {
+                    m,
+                    ef_construction,
+                    ef_search,
+                    ..
+                } => serde_json::json!({
+                    "m": m,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search,
                 }),
                 crate::document::VectorIndexSchema::Hnsw {
                     m, ef_construction, ..
@@ -503,6 +514,20 @@ fn resolve_primary_vector_descriptor_for_planner(
                 "ef_construction": ef_construction,
                 "ef_search": ef_search,
                 "nbits": nbits,
+            }),
+        ),
+        Some(crate::document::VectorIndexSchema::HnswSq {
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+        }) => (
+            VectorIndexKind::HnswSq,
+            metric.clone(),
+            serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
             }),
         ),
         Some(crate::document::VectorIndexSchema::Hnsw {

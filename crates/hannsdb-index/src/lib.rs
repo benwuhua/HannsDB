@@ -5,6 +5,7 @@ pub mod factory;
 pub mod flat;
 pub mod hnsw;
 pub mod hnsw_hvq;
+pub mod hnsw_sq;
 pub mod ivf;
 pub mod ivf_usq;
 pub mod scalar;

@@ -7,6 +7,7 @@ pub enum VectorIndexKind {
     Flat,
     Hnsw,
     HnswHvq,
+    HnswSq,
     Ivf,
     IvfUsq,
 }

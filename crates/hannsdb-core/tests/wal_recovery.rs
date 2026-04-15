@@ -9,7 +9,9 @@ use hannsdb_core::document::{
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
-use hannsdb_core::wal::{append_wal_record, load_wal_records, WalRecord};
+use hannsdb_core::wal::{
+    append_wal_record, load_wal_records, AddColumnBackfill, AlterColumnMigration, WalRecord,
+};
 
 fn sample_schema() -> CollectionSchema {
     CollectionSchema::new(
@@ -207,6 +209,13 @@ fn wal_recovery_record_roundtrip_preserves_all_operation_payloads() {
             collection: "docs".to_string(),
             ids: vec![11, 22],
         },
+        WalRecord::AddColumn {
+            collection: "docs".to_string(),
+            field: ScalarFieldSchema::new("tag", FieldType::String),
+            backfill: Some(AddColumnBackfill::Constant {
+                value: Some(FieldValue::String("x".into())),
+            }),
+        },
         WalRecord::DropCollection {
             collection: "docs".to_string(),
         },
@@ -218,6 +227,125 @@ fn wal_recovery_record_roundtrip_preserves_all_operation_payloads() {
 
     let loaded = load_wal_records(&wal_path).expect("load wal records");
     assert_eq!(loaded, records);
+}
+
+#[test]
+fn wal_recovery_add_column_constant_backfill_survives_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema(
+        "docs",
+        &CollectionSchema::new("dense", 2, "cosine", Vec::new()),
+    )
+    .expect("create");
+    db.insert_documents(
+        "docs",
+        &[Document::with_primary_vector_name(
+            11,
+            std::iter::empty::<(String, FieldValue)>(),
+            "dense",
+            vec![0.1, 0.2],
+        )],
+    )
+    .expect("insert");
+    db.add_column_with_backfill(
+        "docs",
+        ScalarFieldSchema::new("tag", FieldType::String),
+        Some(AddColumnBackfill::Constant {
+            value: Some(FieldValue::String("x".into())),
+        }),
+    )
+    .expect("add column with backfill");
+    drop(db);
+
+    let reopened = HannsDb::open(root).expect("reopen should preserve backfill");
+    let fetched = reopened.fetch_documents("docs", &[11]).expect("fetch");
+    assert_eq!(
+        fetched[0].fields.get("tag"),
+        Some(&FieldValue::String("x".into()))
+    );
+}
+
+#[test]
+fn wal_recovery_alter_column_widening_survives_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema(
+        "docs",
+        &CollectionSchema::new(
+            "dense",
+            2,
+            "cosine",
+            vec![ScalarFieldSchema::new("turn", FieldType::Int32)],
+        ),
+    )
+    .expect("create");
+    db.insert_documents(
+        "docs",
+        &[Document::with_primary_vector_name(
+            11,
+            [("turn".to_string(), FieldValue::Int32(7))],
+            "dense",
+            vec![0.1, 0.2],
+        )],
+    )
+    .expect("insert");
+    db.alter_column_with_field_schema(
+        "docs",
+        "turn",
+        "turn",
+        ScalarFieldSchema::new("turn", FieldType::Int64),
+        AlterColumnMigration::Int32ToInt64,
+    )
+    .expect("widen");
+    drop(db);
+
+    let reopened = HannsDb::open(root).expect("reopen should preserve widening migration");
+    let fetched = reopened.fetch_documents("docs", &[11]).expect("fetch");
+    assert_eq!(fetched[0].fields.get("turn"), Some(&FieldValue::Int64(7)));
+}
+
+#[test]
+fn wal_recovery_alter_column_rename_widening_survives_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+    db.create_collection_with_schema(
+        "docs",
+        &CollectionSchema::new(
+            "dense",
+            2,
+            "cosine",
+            vec![ScalarFieldSchema::new("turn", FieldType::Int32)],
+        ),
+    )
+    .expect("create");
+    db.insert_documents(
+        "docs",
+        &[Document::with_primary_vector_name(
+            11,
+            [("turn".to_string(), FieldValue::Int32(7))],
+            "dense",
+            vec![0.1, 0.2],
+        )],
+    )
+    .expect("insert");
+    db.alter_column_with_field_schema(
+        "docs",
+        "turn",
+        "turn64",
+        ScalarFieldSchema::new("turn64", FieldType::Int64),
+        AlterColumnMigration::RenameAndInt32ToInt64,
+    )
+    .expect("rename + widen");
+    drop(db);
+
+    let reopened = HannsDb::open(root).expect("reopen should preserve rename+widen migration");
+    let fetched = reopened.fetch_documents("docs", &[11]).expect("fetch");
+    assert_eq!(fetched[0].fields.get("turn"), None);
+    assert_eq!(fetched[0].fields.get("turn64"), Some(&FieldValue::Int64(7)));
 }
 
 #[test]
@@ -1612,4 +1740,78 @@ fn wal_truncate_flush_then_reopen_then_insert_search_works() {
 
     let fetched = db.fetch_documents("docs", &[1, 2, 3]).expect("fetch all");
     assert_eq!(fetched.len(), 3);
+}
+
+#[test]
+fn test_string_pk_survives_recovery() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("hannsdb_string_pk_recovery_{}", nanos));
+
+    let schema = CollectionSchema::new(
+        "dense",
+        2,
+        "l2",
+        vec![ScalarFieldSchema::new("tag", FieldType::String)],
+    );
+
+    // Phase 1: insert string-keyed docs WITHOUT flush (relies on WAL for recovery)
+    {
+        let mut db = HannsDb::open(&root).expect("open db");
+        db.create_collection_with_schema("docs", &schema)
+            .expect("create collection");
+
+        db.insert_documents_with_primary_keys(
+            "docs",
+            &[
+                (
+                    "pk-alpha".to_string(),
+                    Document::with_primary_vector_name(
+                        1,
+                        [("tag".to_string(), FieldValue::String("first".to_string()))],
+                        "dense",
+                        vec![1.0, 0.0],
+                    ),
+                ),
+                (
+                    "pk-beta".to_string(),
+                    Document::with_primary_vector_name(
+                        2,
+                        [("tag".to_string(), FieldValue::String("second".to_string()))],
+                        "dense",
+                        vec![0.0, 1.0],
+                    ),
+                ),
+            ],
+        )
+        .expect("insert with string PKs");
+        // Drop without flush — registry is already persisted, WAL has insert records.
+    }
+
+    // Phase 2: reopen and fetch by the original string PKs
+    {
+        let db = HannsDb::open(&root).expect("reopen db after crash");
+
+        let fetched = db
+            .fetch_documents_by_primary_keys(
+                "docs",
+                &["pk-alpha".to_string(), "pk-beta".to_string()],
+            )
+            .expect("fetch by string PKs after recovery");
+        assert_eq!(
+            fetched.len(),
+            2,
+            "both string-keyed docs should survive recovery"
+        );
+
+        let tags: Vec<_> = fetched
+            .iter()
+            .filter_map(|doc| doc.fields.get("tag").cloned())
+            .collect();
+        assert!(tags.contains(&FieldValue::String("first".to_string())));
+        assert!(tags.contains(&FieldValue::String("second".to_string())));
+    }
 }

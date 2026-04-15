@@ -472,6 +472,7 @@ fn build_typed_column(
             for row in payloads {
                 match row.get(name) {
                     Some(FieldValue::Int64(v)) => b.append_value(*v),
+                    Some(FieldValue::Int32(v)) => b.append_value(*v as i64),
                     _ => b.append_null(),
                 }
             }
@@ -502,6 +503,7 @@ fn build_typed_column(
             for row in payloads {
                 match row.get(name) {
                     Some(FieldValue::UInt64(v)) => b.append_value(*v),
+                    Some(FieldValue::UInt32(v)) => b.append_value(*v as u64),
                     _ => b.append_null(),
                 }
             }
@@ -522,6 +524,7 @@ fn build_typed_column(
             for row in payloads {
                 match row.get(name) {
                     Some(FieldValue::Float64(v)) => b.append_value(*v),
+                    Some(FieldValue::Float(v)) => b.append_value(*v as f64),
                     _ => b.append_null(),
                 }
             }

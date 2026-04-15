@@ -2286,6 +2286,49 @@ def test_real_collection_query_context_supports_query_by_id_with_reranker(tmp_pa
         collection.destroy()
 
 
+def test_real_collection_query_context_supports_query_by_id_with_custom_reranker(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(id="1", vector=[0.0, 0.0], field_name="dense", fields={"group": 1}, score=0.0),
+            hannsdb.Doc(id="2", vector=[0.1, 0.0], field_name="dense", fields={"group": 1}, score=0.0),
+            hannsdb.Doc(id="3", vector=[0.2, 0.0], field_name="dense", fields={"group": 2}, score=0.0),
+        ]
+    )
+
+    class RecordingReranker(hannsdb.ReRanker):
+        def __init__(self):
+            super().__init__(topn=2)
+
+        def rerank(self, query_results):
+            return list(next(iter(query_results.values())))[: self.topn]
+
+    context = hannsdb.QueryContext(
+        top_k=2,
+        queries=[hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)],
+        query_by_id=["1"],
+        reranker=RecordingReranker(),
+    )
+
+    try:
+        result = collection.query(context)
+        assert [doc.id for doc in result] == ["1", "2"]
+    finally:
+        collection.destroy()
+
+
 def test_real_collection_query_supports_query_by_id_with_reranker_legacy_kwargs(tmp_path):
     schema = hannsdb.CollectionSchema(
         name="docs",
@@ -2341,6 +2384,49 @@ def test_real_collection_query_supports_query_by_id_with_reranker_legacy_kwargs(
         )
         assert [doc.id for doc in result] == ["1", "2"]
         assert [doc.field("group") for doc in result] == [1, 1]
+    finally:
+        collection.destroy()
+
+
+def test_real_collection_query_context_supports_group_by_with_custom_reranker(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="group", data_type="int64")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+    collection = hannsdb.create_and_open(str(tmp_path), schema)
+    collection.insert(
+        [
+            hannsdb.Doc(id="1", vector=[0.0, 0.0], field_name="dense", fields={"group": 1}, score=0.0),
+            hannsdb.Doc(id="2", vector=[0.1, 0.0], field_name="dense", fields={"group": 1}, score=0.0),
+            hannsdb.Doc(id="3", vector=[0.2, 0.0], field_name="dense", fields={"group": 2}, score=0.0),
+        ]
+    )
+
+    class RecordingReranker(hannsdb.ReRanker):
+        def __init__(self):
+            super().__init__(topn=2)
+
+        def rerank(self, query_results):
+            return list(next(iter(query_results.values())))[: self.topn]
+
+    context = hannsdb.QueryContext(
+        top_k=3,
+        queries=[hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None)],
+        group_by=hannsdb.QueryGroupBy(field_name="group"),
+        reranker=RecordingReranker(),
+    )
+
+    try:
+        result = collection.query(context)
+        assert [doc.field("group") for doc in result] == [1, 2]
     finally:
         collection.destroy()
 
@@ -2758,6 +2844,20 @@ def build_schema():
             ),
         ],
     )
+
+
+def collection_from_fake_core(monkeypatch, core, *, schema=None):
+    class FakeFactory:
+        def build(self):
+            return object()
+
+    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda _: FakeFactory())
+    return hannsdb.Collection._from_core(core, schema=schema or build_schema())
+
+
+def assert_single_core_call(calls, expected_name):
+    assert len(calls) == 1
+    assert calls[0][0] == expected_name
 
 
 def test_create_and_open_returns_python_facade_and_keeps_schema(tmp_path):
@@ -3230,7 +3330,6 @@ def test_collection_delete_by_filter_delegates_to_core(monkeypatch):
 
 
 def test_collection_add_column_delegates_canonical_contract_to_core(monkeypatch):
-    schema = build_schema()
     calls = []
 
     class FakeCore:
@@ -3240,13 +3339,7 @@ def test_collection_add_column_delegates_canonical_contract_to_core(monkeypatch)
         def add_column(self, *args, **kwargs):
             calls.append(("add_column", args, kwargs))
 
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = collection_from_fake_core(monkeypatch, FakeCore())
 
     collection.add_column(
         hannsdb.FieldSchema(name="group", data_type="int64", nullable=True),
@@ -3254,12 +3347,11 @@ def test_collection_add_column_delegates_canonical_contract_to_core(monkeypatch)
         option=hannsdb.AddColumnOption(concurrency=2),
     )
 
-    assert len(calls) == 1
-    assert calls[0][0] == "add_column"
+    assert_single_core_call(calls, "add_column")
+    assert calls[0][1][4] == ""
 
 
 def test_collection_alter_column_delegates_canonical_rename_to_core(monkeypatch):
-    schema = build_schema()
     calls = []
 
     class FakeCore:
@@ -3269,13 +3361,7 @@ def test_collection_alter_column_delegates_canonical_rename_to_core(monkeypatch)
         def alter_column(self, *args, **kwargs):
             calls.append(("alter_column", args, kwargs))
 
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = collection_from_fake_core(monkeypatch, FakeCore())
 
     collection.alter_column(
         "session_id",
@@ -3283,13 +3369,10 @@ def test_collection_alter_column_delegates_canonical_rename_to_core(monkeypatch)
         option=hannsdb.AlterColumnOption(concurrency=4),
     )
 
-    assert len(calls) == 1
-    assert calls[0][0] == "alter_column"
+    assert_single_core_call(calls, "alter_column")
 
 
 def test_collection_add_column_rejects_unsupported_expression_before_core(monkeypatch):
-    schema = build_schema()
-
     class FakeCore:
         path = "/tmp/hannsdb"
         collection_name = "docs"
@@ -3297,25 +3380,17 @@ def test_collection_add_column_rejects_unsupported_expression_before_core(monkey
         def add_column(self, *args, **kwargs):
             raise AssertionError("core add_column should not be called")
 
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = collection_from_fake_core(monkeypatch, FakeCore())
 
     with pytest.raises(NotImplementedError, match="expression"):
         collection.add_column(
             hannsdb.FieldSchema(name="group", data_type="int64"),
-            expression="1",
+            expression="1e6",
             option=hannsdb.AddColumnOption(concurrency=1),
         )
 
 
 def test_collection_alter_column_rejects_field_schema_migration_before_core(monkeypatch):
-    schema = build_schema()
-
     class FakeCore:
         path = "/tmp/hannsdb"
         collection_name = "docs"
@@ -3323,13 +3398,7 @@ def test_collection_alter_column_rejects_field_schema_migration_before_core(monk
         def alter_column(self, *args, **kwargs):
             raise AssertionError("core alter_column should not be called")
 
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = collection_from_fake_core(monkeypatch, FakeCore())
 
     with pytest.raises(NotImplementedError, match="field_schema"):
         collection.alter_column(
@@ -3343,8 +3412,76 @@ def test_collection_alter_column_rejects_field_schema_migration_before_core(monk
         )
 
 
-def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monkeypatch):
-    schema = build_schema()
+def test_collection_alter_column_delegates_supported_widening_migration_to_core(monkeypatch):
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def alter_column(self, *args, **kwargs):
+            calls.append(("alter_column", args, kwargs))
+
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="score", data_type="int32")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=384,
+            )
+        ],
+    )
+    collection = collection_from_fake_core(monkeypatch, FakeCore(), schema=schema)
+
+    collection.alter_column(
+        "score",
+        field_schema=hannsdb.FieldSchema(name="score", data_type="int64"),
+        option=hannsdb.AlterColumnOption(concurrency=1),
+    )
+
+    assert_single_core_call(calls, "alter_column")
+
+
+def test_collection_alter_column_delegates_supported_rename_widen_migration_to_core(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeCore:
+        path = "/tmp/hannsdb"
+        collection_name = "docs"
+
+        def alter_column(self, *args, **kwargs):
+            calls.append(("alter_column", args, kwargs))
+
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="score", data_type="int32")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=384,
+            )
+        ],
+    )
+    collection = collection_from_fake_core(monkeypatch, FakeCore(), schema=schema)
+
+    collection.alter_column(
+        "score",
+        new_name="total_score",
+        field_schema=hannsdb.FieldSchema(name="total_score", data_type="int64"),
+        option=hannsdb.AlterColumnOption(concurrency=1),
+    )
+
+    assert_single_core_call(calls, "alter_column")
+
+
+def test_collection_create_index_routes_by_schema_and_accepts_invert_scalar_param(monkeypatch):
     calls = []
 
     class FakeCore:
@@ -3354,27 +3491,29 @@ def test_collection_create_index_routes_by_schema_and_rejects_scalar_params(monk
         def create_vector_index(self, field_name, index_param=None):
             calls.append(("create_vector_index", field_name, index_param))
 
-        def create_scalar_index(self, field_name):
-            calls.append(("create_scalar_index", field_name))
+        def create_scalar_index(self, field_name, index_param=None):
+            calls.append(("create_scalar_index", field_name, index_param))
 
-    class FakeFactory:
-        def build(self):
-            return object()
-
-    monkeypatch.setattr(hannsdb.QueryExecutorFactory, "create", lambda schema: FakeFactory())
-
-    collection = hannsdb.Collection._from_core(FakeCore(), schema=schema)
+    collection = collection_from_fake_core(monkeypatch, FakeCore())
 
     collection.create_index("dense", hannsdb.IVFIndexParam(metric_type="l2", nlist=8))
     collection.create_index("session_id")
+    collection.create_index("session_id", hannsdb.InvertIndexParam())
 
     assert calls[0][0] == "create_vector_index"
     assert calls[0][1] == "dense"
     assert calls[0][2].__class__ is hannsdb._native.IVFIndexParam
-    assert calls[1] == ("create_scalar_index", "session_id")
+    assert calls[1] == ("create_scalar_index", "session_id", None)
+    assert calls[2][0] == "create_scalar_index"
+    assert calls[2][1] == "session_id"
+    assert calls[2][2].__class__ is hannsdb._native.InvertIndexParam
 
-    with pytest.raises(NotImplementedError, match="scalar index params are not supported"):
-        collection.create_index("session_id", hannsdb.OptimizeOption())
+    for invalid_param in (
+        hannsdb.OptimizeOption(),
+        hannsdb._native.InvertIndexParam(),
+    ):
+        with pytest.raises(NotImplementedError, match="unsupported scalar index param type"):
+            collection.create_index("session_id", invalid_param)
 
 
 def test_collection_create_and_drop_index_reject_unknown_fields(monkeypatch):

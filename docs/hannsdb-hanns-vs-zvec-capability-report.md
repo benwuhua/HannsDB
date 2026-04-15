@@ -71,10 +71,10 @@ Legend:
 
 | Dimension | Capability | Hanns | HannsDB | zvec | Judgment | Evidence | Notes |
 |---|---|---|---|---|---|---|---|
-| 接口 | Python/public param family breadth | N/A | Exposes `Flat/Hnsw/IVF/IVFQuery/IvfUsq` plus schema/query/reranker surfaces | Exposes richer public family including `AddColumnOption`, `AlterColumnOption`, `Flat`, `Hnsw`, `HnswRabitq`, `IVF`, `IVFQuery`, `InvertIndexParam` | zvec stronger | `crates/hannsdb-py/python/hannsdb/__init__.py`, `crates/hannsdb-py/python/hannsdb/model/param/index_params.py`, `zvec/python/zvec/model/param/__init__.pyi` | HannsDB has improved materially, but zvec still exposes a broader stable public contract |
+| 接口 | Python/public param family breadth | N/A | Exposes `CollectionOption`, `OptimizeOption`, `Flat/Hnsw/IVF/IVFQuery/InvertIndex/IvfUsq` plus schema/query/reranker surfaces | Exposes richer public family including `AddColumnOption`, `AlterColumnOption`, `Flat`, `Hnsw`, `HnswRabitq`, `IVF`, `IVFQuery`, `InvertIndexParam`, `SegmentOption` | zvec stronger | `crates/hannsdb-py/python/hannsdb/__init__.py`, `crates/hannsdb-py/python/hannsdb/model/param/index_params.py`, `zvec/python/zvec/model/param/__init__.pyi` | HannsDB has improved materially again, but zvec still exposes a broader stable public contract |
 | 接口 | Quantized ANN public surface honesty | `IvfUsq`, `UsqQuantizer`, `HnswHvq` exist internally | Public `IvfUsq*` and `HnswHvq*` now exist with real runtime wiring; `HnswHvq` is intentionally narrow (`ip`-only) | `HnswRabitqIndexParam` / `HnswRabitqQueryParam` are executable public surfaces with collection tests | mixed | `Hanns/src/quantization/usq/quantizer.rs`, `Hanns/src/faiss/ivf_usq.rs`, `Hanns/src/faiss/hnsw_hvq.rs`, `crates/hannsdb-py/tests/test_ivf_usq_surface.py`, `crates/hannsdb-py/tests/test_hnsw_hvq_surface.py`, `zvec/python/tests/test_collection_hnsw_rabitq.py` | Hanns is stronger internally; zvec still leads in breadth and maturity of delivered quantized productization |
-| 接口 | Query surface combinations | N/A | `query_by_id`, `group_by`, `order_by`, built-in reranker combinations are publicly tested | zvec query surface is mature, but this session did not verify all equivalent combination tests directly | mixed | `crates/hannsdb-py/tests/test_query_executor.py`, `crates/hannsdb-py/tests/test_collection_facade.py` | zvec side is not `unknown` in general, but direct apples-to-apples combination evidence is thinner in this pass |
-| 功能 | Basic mutation support | Engine supports required field/vector mutation primitives | `update`, `add_column`, `drop_column`, `alter_column` are publicly present and tested | Present | mixed | `docs/hannsdb-vs-zvec-gap-analysis.md`, `crates/hannsdb-py/tests/test_schema_mutation_surface.py`, `zvec/python/zvec/model/param/__init__.pyi` | HannsDB no longer trails on basic presence; remaining gap is depth |
+| 接口 | Query surface combinations | N/A | `query_by_id`, `group_by`, `order_by`, built-in reranker combinations, and custom reranker + `query_by_id` / `group_by` are publicly tested | zvec query surface is mature, but this session did not verify all equivalent combination tests directly | mixed | `crates/hannsdb-py/tests/test_query_executor.py`, `crates/hannsdb-py/tests/test_collection_facade.py` | zvec side is not `unknown` in general, but direct apples-to-apples combination evidence is still thinner in this pass |
+| 功能 | Basic mutation support | Engine supports required field/vector mutation primitives | `update`, `add_column`, `drop_column`, `alter_column` are publicly present and tested, and `add_column(..., expression=...)` now supports a constant-expression subset | Present | mixed | `docs/hannsdb-vs-zvec-gap-analysis.md`, `crates/hannsdb-py/tests/test_schema_mutation_surface.py`, `zvec/python/zvec/model/param/__init__.pyi` | HannsDB no longer trails on basic presence; remaining gap is depth, especially migration semantics |
 | 功能 | `query_by_id` + string PK | Engine supports string-key resolution | Public alphanumeric `query_by_id` is tested | zvec string PK model is mature | mixed | `crates/hannsdb-core/tests/zvec_parity_string_pk.rs`, `crates/hannsdb-py/tests/test_collection_facade.py`, `docs/hannsdb-vs-zvec-gap-analysis.md` | HannsDB has closed much of the earlier gap here |
 | 功能 | Sparse query/runtime | Engine sparse runtime and tests exist | Public sparse usage is exercised in collection facade tests | Present | mixed | `crates/hannsdb-core/tests/zvec_parity_sparse.rs`, `crates/hannsdb-py/tests/test_collection_facade.py`, `docs/hannsdb-vs-zvec-gap-analysis.md` | No longer a “missing feature” gap |
 | 功能 | Quantized ANN family breadth | `UsqQuantizer`, `IvfUsq`, `HnswHvq`, PCA/USQ variants exist | `IvfUsq` and `HnswHvq` are now exposed and runtime-backed in HannsDB, though `HnswHvq` remains intentionally narrow (`ip`-only) | Public quantized family is narrower internally but more complete at product level (`HnswRabitq*`) | Hanns stronger | `Hanns/src/quantization/usq/quantizer.rs`, `Hanns/src/faiss/ivf_usq.rs`, `Hanns/src/faiss/hnsw_hvq.rs`, `Hanns/src/faiss/hnsw_pca_usq.rs`, `crates/hannsdb-py/tests/test_ivf_usq_surface.py`, `crates/hannsdb-py/tests/test_hnsw_hvq_surface.py`, `zvec/python/zvec/model/param/__init__.pyi` | Hanns/HannsDB narrowed the product gap, but zvec still has the broader mature quantized family |
@@ -103,6 +103,8 @@ Legend:
 3. `group_by`
 4. sparse query/runtime
 5. built-in reranker combinations
+6. custom reranker + `query_by_id` / `group_by`
+7. constant-expression `add_column(...)` backfill subset
 
 The remaining differences are mostly **maturity/productization**, not 0→1 feature absence.
 
@@ -154,12 +156,12 @@ This roadmap is dependency-ordered and driven by the matrix above.
 ### P1 — Expand public/product surface to match delivered capability
 
 1. **Continue broadening Python/public API to match real engine capability**
-   - Why: HannsDB core and Hanns engine currently outrun what the product surface can honestly expose
-   - Depends on: P0 quantized/runtime work for the surfaces that should become real
+   - Why: HannsDB core and Hanns engine still outrun what the product surface can honestly expose, even after the latest `InvertIndexParam` / custom-reranker / constant-expression slices
+   - Depends on: stable public API direction from previous parity slices
    - Dimensions: 接口 / 功能
 
-2. **Deepen schema/query productization**
-   - Why: basic support exists, but zvec still leads on depth and completeness
+2. **Deepen schema/query productization beyond the newly landed honest subsets**
+   - Why: basic support exists, but zvec still leads on migration depth and broader query/schema maturity
    - Depends on: stable public API direction from previous parity slices
    - Dimensions: 接口 / 功能
 

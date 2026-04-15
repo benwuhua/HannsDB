@@ -119,7 +119,7 @@ pub(crate) fn resolve_public_keys_to_internal_ids(
     }
 }
 
-pub(crate) fn register_public_keys_with_internal_ids(
+pub(crate) fn upsert_public_keys_with_internal_ids(
     paths: &CollectionPaths,
     collection_meta: &mut CollectionMetadata,
     public_keys: &[String],
@@ -130,23 +130,6 @@ pub(crate) fn register_public_keys_with_internal_ids(
             io::ErrorKind::InvalidInput,
             "public key count must match internal id count",
         ));
-    }
-
-    let mut batch_keys = HashSet::with_capacity(public_keys.len());
-    let mut batch_ids = HashSet::with_capacity(internal_ids.len());
-    for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
-        if !batch_keys.insert(public_key.clone()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate public key in batch: {public_key}"),
-            ));
-        }
-        if !batch_ids.insert(*internal_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("duplicate internal id in batch: {internal_id}"),
-            ));
-        }
     }
 
     if collection_meta.primary_key_mode == PrimaryKeyMode::Numeric
@@ -169,15 +152,27 @@ pub(crate) fn register_public_keys_with_internal_ids(
     let mut registry = ensure_string_primary_key_mode(paths, collection_meta)?;
     for (public_key, internal_id) in public_keys.iter().zip(internal_ids) {
         if let Some(existing_id) = registry.key_to_id.get(public_key).copied() {
+            if existing_id == *internal_id {
+                // Idempotent: same key → same ID, no-op.
+                continue;
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("public key already exists: {public_key} -> {existing_id}"),
+                format!(
+                    "public key already mapped to different id: {public_key} -> {existing_id}, got {internal_id}"
+                ),
             ));
         }
         if let Some(existing_key) = registry.id_to_key.get(internal_id) {
+            if existing_key == public_key {
+                // Idempotent: same ID → same key, no-op.
+                continue;
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("internal id already registered: {internal_id} -> {existing_key}"),
+                format!(
+                    "internal id already registered to different key: {internal_id} -> {existing_key}, got {public_key}"
+                ),
             ));
         }
         registry.key_to_id.insert(public_key.clone(), *internal_id);

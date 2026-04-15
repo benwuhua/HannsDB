@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
-use hannsdb_index::factory::DefaultIndexFactory;
 use hannsdb_index::scalar::ScalarValue;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +116,13 @@ pub enum VectorIndexSchema {
         ef_search: usize,
         nbits: usize,
     },
+    HnswSq {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<String>,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    },
     Ivf {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metric: Option<String>,
@@ -158,6 +164,20 @@ impl VectorIndexSchema {
             ef_construction,
             ef_search,
             nbits,
+        }
+    }
+
+    pub fn hnsw_sq(
+        metric: Option<&str>,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    ) -> Self {
+        Self::HnswSq {
+            metric: metric.map(str::to_string),
+            m,
+            ef_construction,
+            ef_search,
         }
     }
 
@@ -207,6 +227,7 @@ impl VectorIndexSchema {
         match self {
             Self::Hnsw { metric, .. }
             | Self::HnswHvq { metric, .. }
+            | Self::HnswSq { metric, .. }
             | Self::Ivf { metric, .. }
             | Self::IvfUsq { metric, .. } => metric.as_deref(),
         }
@@ -215,7 +236,9 @@ impl VectorIndexSchema {
     pub fn quantize_type(&self) -> Option<&str> {
         match self {
             Self::Hnsw { quantize_type, .. } => quantize_type.as_deref(),
-            Self::HnswHvq { .. } | Self::Ivf { .. } | Self::IvfUsq { .. } => None,
+            Self::HnswHvq { .. } | Self::HnswSq { .. } | Self::Ivf { .. } | Self::IvfUsq { .. } => {
+                None
+            }
         }
     }
 
@@ -225,6 +248,9 @@ impl VectorIndexSchema {
                 m, ef_construction, ..
             } => Some((*m, *ef_construction)),
             Self::HnswHvq {
+                m, ef_construction, ..
+            } => Some((*m, *ef_construction)),
+            Self::HnswSq {
                 m, ef_construction, ..
             } => Some((*m, *ef_construction)),
             Self::Ivf { .. } | Self::IvfUsq { .. } => None,
@@ -694,6 +720,33 @@ pub(crate) fn validate_vector_index_descriptor(
                 ));
             }
         }
+        VectorIndexKind::HnswSq => {
+            for key in params.keys() {
+                if key != "m" && key != "ef_construction" && key != "ef_search" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported hnsw_sq param: {key}"),
+                    ));
+                }
+            }
+            for key in ["m", "ef_construction", "ef_search"] {
+                if let Some(value) = params.get(key) {
+                    let value = value.as_u64().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_sq {key} must be an unsigned integer"),
+                        )
+                    })?;
+                    if value == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("hnsw_sq {key} must be > 0"),
+                        ));
+                    }
+                }
+            }
+            // HnswSq supports all metrics (l2, ip, cosine); no metric restriction.
+        }
         VectorIndexKind::Hnsw => {
             for key in params.keys() {
                 if key != "m" && key != "ef_construction" {
@@ -722,10 +775,22 @@ pub(crate) fn validate_vector_index_descriptor(
         }
     }
 
-    DefaultIndexFactory::default()
-        .create_vector_index(dimension, descriptor, None)
-        .map(|_| ())
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
+    // Validate metric string if present (HnswHvq is already validated above).
+    if descriptor.kind != VectorIndexKind::HnswHvq {
+        if let Some(metric) = descriptor.metric.as_deref() {
+            match metric.to_ascii_lowercase().as_str() {
+                "l2" | "ip" | "cosine" => {}
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported metric: {other}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn validate_schema_primary_vector_descriptor(
@@ -783,6 +848,21 @@ pub(crate) fn validate_schema_primary_vector_descriptor(
                 "ef_construction": ef_construction,
                 "ef_search": ef_search,
                 "nbits": nbits
+            }),
+        },
+        Some(VectorIndexSchema::HnswSq {
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+        }) => VectorIndexDescriptor {
+            field_name: primary_vector.name.clone(),
+            kind: VectorIndexKind::HnswSq,
+            metric: metric.clone(),
+            params: serde_json::json!({
+                "m": m,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search
             }),
         },
         Some(VectorIndexSchema::Hnsw {
@@ -867,6 +947,21 @@ pub(crate) fn validate_schema_secondary_vector_descriptors(
                     "ef_construction": ef_construction,
                     "ef_search": ef_search,
                     "nbits": nbits
+                }),
+            },
+            VectorIndexSchema::HnswSq {
+                metric,
+                m,
+                ef_construction,
+                ef_search,
+            } => VectorIndexDescriptor {
+                field_name: vector.name.clone(),
+                kind: VectorIndexKind::HnswSq,
+                metric: metric.clone(),
+                params: serde_json::json!({
+                    "m": m,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search
                 }),
             },
             VectorIndexSchema::Hnsw {

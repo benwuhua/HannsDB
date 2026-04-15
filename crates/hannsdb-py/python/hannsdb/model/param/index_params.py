@@ -8,6 +8,8 @@ __all__ = [
     "FlatIndexParam",
     "HnswIndexParam",
     "HnswHvqIndexParam",
+    "HnswSqIndexParam",
+    "InvertIndexParam",
     "IvfUsqIndexParam",
     "IvfUsqQueryParam",
     "IVFIndexParam",
@@ -28,6 +30,18 @@ def _require_int(name, value):
     if type(value) is not int:
         raise TypeError(f"{name} must be an int")
     return value
+
+
+def _require_bool(name, value):
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be a bool")
+    return value
+
+
+def _require_disabled_bool(name, value, *, owner):
+    _require_bool(name, value)
+    if value:
+        raise ValueError(f"{owner} currently supports only {name}=False")
 
 
 def _validate_metric_type(name, value):
@@ -60,6 +74,22 @@ class FlatIndexParam:
     def _get_native(self):
         return _native_module.FlatIndexParam(
             metric_type=self.metric_type,
+        )
+
+
+@dataclass(frozen=True)
+class InvertIndexParam:
+    enable_range_optimization: bool = False
+    enable_extended_wildcard: bool = False
+
+    def __post_init__(self) -> None:
+        _require_bool("enable_range_optimization", self.enable_range_optimization)
+        _require_bool("enable_extended_wildcard", self.enable_extended_wildcard)
+
+    def _get_native(self):
+        return _native_module.InvertIndexParam(
+            enable_range_optimization=self.enable_range_optimization,
+            enable_extended_wildcard=self.enable_extended_wildcard,
         )
 
 
@@ -135,6 +165,38 @@ class HnswHvqIndexParam:
 
 
 @dataclass(frozen=True)
+class HnswSqIndexParam:
+    """HNSW + SQ8 Scalar Quantization index. Supports L2, IP, and Cosine metrics."""
+
+    metric_type: str | None = None
+    m: int = 16
+    ef_construction: int = 200
+    ef_search: int = 50
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "metric_type",
+            _validate_metric_type("metric_type", self.metric_type),
+        )
+        object.__setattr__(self, "m", _require_int("m", self.m))
+        object.__setattr__(
+            self,
+            "ef_construction",
+            _require_int("ef_construction", self.ef_construction),
+        )
+        object.__setattr__(self, "ef_search", _require_int("ef_search", self.ef_search))
+
+    def _get_native(self):
+        return _native_module.HnswSqIndexParam(
+            metric_type=self.metric_type,
+            m=self.m,
+            ef_construction=self.ef_construction,
+            ef_search=self.ef_search,
+        )
+
+
+@dataclass(frozen=True)
 class IVFIndexParam:
     metric_type: str | None = None
     nlist: int = 1024
@@ -181,8 +243,7 @@ class IvfUsqIndexParam:
             _require_int("rotation_seed", self.rotation_seed),
         )
         object.__setattr__(self, "rerank_k", _require_int("rerank_k", self.rerank_k))
-        if type(self.use_high_accuracy_scan) is not bool:
-            raise TypeError("use_high_accuracy_scan must be a bool")
+        _require_bool("use_high_accuracy_scan", self.use_high_accuracy_scan)
 
     def _get_native(self):
         return _native_module.IvfUsqIndexParam(
@@ -202,8 +263,7 @@ class HnswQueryParam:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ef", _require_int("ef", self.ef))
-        if type(self.is_using_refiner) is not bool:
-            raise TypeError("is_using_refiner must be a bool")
+        _require_bool("is_using_refiner", self.is_using_refiner)
 
     def _get_native(self):
         return _native_module.HnswQueryParam(

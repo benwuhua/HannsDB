@@ -7,8 +7,8 @@ use crate::catalog::CollectionMetadata;
 use crate::document::{compare_field_value_for_sort, FieldValue};
 use crate::segment::{load_sparse_vectors, SegmentManager, SegmentMetadata, TombstoneMask};
 use crate::storage::segment_io::{
-    load_primary_dense_rows_for_segment_or_empty,
     load_payloads_or_empty as load_segment_payloads_or_empty,
+    load_primary_dense_rows_for_segment_or_empty,
     load_vectors_or_empty as load_segment_vectors_or_empty,
 };
 

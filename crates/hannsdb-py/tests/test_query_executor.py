@@ -607,6 +607,44 @@ def test_query_executor_supports_weighted_reranker_with_query_by_id(tmp_path):
     assert [hit.fields["group"] for hit in hits] == [1, 1]
 
 
+@pytest.mark.parametrize(
+    ("context_kwargs", "expected_ids", "expected_groups"),
+    [
+        ({"top_k": 2, "query_by_id": ["1"]}, ["1", "2"], [1, 1]),
+        (
+            {
+                "top_k": 3,
+                "group_by": hannsdb.QueryGroupBy(field_name="group"),
+            },
+            None,
+            [1, 2],
+        ),
+    ],
+)
+def test_query_executor_supports_custom_reranker_query_modifiers(
+    tmp_path, context_kwargs, expected_ids, expected_groups
+):
+    collection, schema = build_collection(tmp_path)
+    executor = hannsdb.QueryExecutorFactory.create(schema).build()
+    reranker = RecordingReranker()
+
+    context = hannsdb.QueryContext(
+        queries=[
+            hannsdb.VectorQuery(field_name="dense", vector=[0.0, 0.0], param=None),
+        ],
+        reranker=reranker,
+        output_fields=["group"],
+        **context_kwargs,
+    )
+
+    hits = executor.execute(collection, context)
+
+    assert reranker.seen_keys == [("dense",)]
+    if expected_ids is not None:
+        assert [hit.id for hit in hits] == expected_ids
+    assert [hit.fields["group"] for hit in hits] == expected_groups
+
+
 def test_query_executor_invokes_custom_reranker_with_stable_duplicate_field_labels(tmp_path):
     collection, schema = build_collection(tmp_path)
     executor = hannsdb.QueryExecutorFactory.create(schema).build()

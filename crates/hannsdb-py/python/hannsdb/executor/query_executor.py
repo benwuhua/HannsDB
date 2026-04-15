@@ -33,18 +33,15 @@ class QueryExecutor:
         return 1
 
     def execute(self, collection: Any, context: QueryContext):
-        if context.reranker is None:
+        reranker = context.reranker
+        if reranker is None:
             return collection.query_context(context)
-        if not isinstance(context.reranker, ReRanker):
+        if not isinstance(reranker, ReRanker):
             raise NotImplementedError("reranker is not supported by the Python facade yet")
-        if self._is_builtin_reranker(context.reranker):
+        if self._is_builtin_reranker(reranker):
             return collection.query_context(context)
         if len(context.queries) == 0:
             raise ValueError("reranker requires at least one vector query")
-        if context.query_by_id is not None:
-            raise NotImplementedError("query_by_id is not supported by the Python facade yet")
-        if context.group_by is not None:
-            raise NotImplementedError("group_by is not supported by the Python facade yet")
 
         query_results = {}
         query_name_counts: dict[str, int] = {}
@@ -59,8 +56,6 @@ class QueryExecutor:
                     replace(
                         context,
                         queries=[query],
-                        query_by_id=None,
-                        group_by=None,
                         reranker=None,
                     ),
                 )
@@ -98,7 +93,7 @@ class QueryExecutor:
                 # the reranker decides the final cutoff via its own `topn`.
                 query_results[result_key] = collection.query_context(query_context)
 
-        return context.reranker.rerank(query_results)
+        return reranker.rerank(query_results)
 
 
 @dataclass

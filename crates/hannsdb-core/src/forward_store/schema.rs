@@ -366,6 +366,7 @@ fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Res
             for row in rows {
                 match row.fields.get(&field.name) {
                     Some(FieldValue::Int64(value)) => builder.append_value(*value),
+                    Some(FieldValue::Int32(value)) => builder.append_value(*value as i64),
                     Some(_) => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -414,6 +415,7 @@ fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Res
             for row in rows {
                 match row.fields.get(&field.name) {
                     Some(FieldValue::UInt64(value)) => builder.append_value(*value),
+                    Some(FieldValue::UInt32(value)) => builder.append_value(*value as u64),
                     Some(_) => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -446,6 +448,7 @@ fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Res
             for row in rows {
                 match row.fields.get(&field.name) {
                     Some(FieldValue::Float64(value)) => builder.append_value(*value),
+                    Some(FieldValue::Float(value)) => builder.append_value(*value as f64),
                     Some(_) => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,

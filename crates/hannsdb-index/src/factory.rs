@@ -9,6 +9,8 @@ use crate::hnsw::InMemoryHnswIndex;
 use crate::hnsw::KnowhereHnswIndex;
 #[cfg(feature = "hanns-backend")]
 use crate::hnsw_hvq::HnswHvqIndex;
+#[cfg(feature = "hanns-backend")]
+use crate::hnsw_sq::HnswSqIndex;
 use crate::ivf::IvfIndex;
 #[cfg(feature = "hanns-backend")]
 use crate::ivf_usq::IvfUsqIndex;
@@ -76,6 +78,32 @@ impl IndexFactory for DefaultIndexFactory {
                     let _ = serialized;
                     Err(AdapterError::Backend(
                         "hnsw_hvq requires hanns-backend".to_string(),
+                    ))
+                }
+            }
+            VectorIndexKind::HnswSq => {
+                #[cfg(feature = "hanns-backend")]
+                {
+                    let m = read_usize_param(&descriptor.params, "m").unwrap_or(16);
+                    let ef_construction =
+                        read_usize_param(&descriptor.params, "ef_construction").unwrap_or(200);
+                    let ef_search = read_usize_param(&descriptor.params, "ef_search").unwrap_or(50);
+                    if let Some(bytes) = serialized {
+                        return Ok(Box::new(HnswSqIndex::from_bytes(dim, bytes)?));
+                    }
+                    Ok(Box::new(HnswSqIndex::new(
+                        dim,
+                        metric,
+                        m,
+                        ef_construction,
+                        ef_search,
+                    )?))
+                }
+                #[cfg(not(feature = "hanns-backend"))]
+                {
+                    let _ = serialized;
+                    Err(AdapterError::Backend(
+                        "hnsw_sq requires hanns-backend".to_string(),
                     ))
                 }
             }

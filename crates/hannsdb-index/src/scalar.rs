@@ -86,11 +86,36 @@ impl Ord for OrderedF32 {
     }
 }
 
+fn params_range_opt(descriptor: &ScalarIndexDescriptor) -> bool {
+    descriptor
+        .params
+        .get("enable_range_optimization")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn params_wildcard(descriptor: &ScalarIndexDescriptor) -> bool {
+    descriptor
+        .params
+        .get("enable_extended_wildcard")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvertedScalarIndex {
     String {
         descriptor: ScalarIndexDescriptor,
         map: HashMap<String, BTreeSet<i64>>,
+    },
+    StringOrdered {
+        descriptor: ScalarIndexDescriptor,
+        map: BTreeMap<String, BTreeSet<i64>>,
+    },
+    StringWildcard {
+        descriptor: ScalarIndexDescriptor,
+        forward: BTreeMap<String, BTreeSet<i64>>,
+        reversed: BTreeMap<String, BTreeSet<i64>>,
     },
     Int64 {
         descriptor: ScalarIndexDescriptor,
@@ -170,13 +195,38 @@ impl InvertedScalarIndex {
 
         match field_type {
             "string" => {
-                let mut map: HashMap<String, BTreeSet<i64>> = HashMap::new();
-                for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
-                    if let Some(ScalarValue::String(s)) = payload.get(field_name) {
-                        map.entry(s.clone()).or_default().insert(ext_id);
+                if params_wildcard(&descriptor) {
+                    let mut forward: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+                    let mut reversed: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+                    for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                        if let Some(ScalarValue::String(s)) = payload.get(field_name) {
+                            forward.entry(s.clone()).or_default().insert(ext_id);
+                            let rev_key: String = s.chars().rev().collect();
+                            reversed.entry(rev_key).or_default().insert(ext_id);
+                        }
                     }
+                    Self::StringWildcard {
+                        descriptor,
+                        forward,
+                        reversed,
+                    }
+                } else if params_range_opt(&descriptor) {
+                    let mut map: BTreeMap<String, BTreeSet<i64>> = BTreeMap::new();
+                    for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                        if let Some(ScalarValue::String(s)) = payload.get(field_name) {
+                            map.entry(s.clone()).or_default().insert(ext_id);
+                        }
+                    }
+                    Self::StringOrdered { descriptor, map }
+                } else {
+                    let mut map: HashMap<String, BTreeSet<i64>> = HashMap::new();
+                    for (payload, &ext_id) in payloads.iter().zip(external_ids.iter()) {
+                        if let Some(ScalarValue::String(s)) = payload.get(field_name) {
+                            map.entry(s.clone()).or_default().insert(ext_id);
+                        }
+                    }
+                    Self::String { descriptor, map }
                 }
-                Self::String { descriptor, map }
             }
             "int64" => {
                 let mut entries: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
@@ -286,6 +336,20 @@ impl InvertedScalarIndex {
                     BTreeSet::new()
                 }
             }
+            InvertedScalarIndex::StringOrdered { map, .. } => {
+                if let ScalarValue::String(s) = value {
+                    map.get(s).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
+            InvertedScalarIndex::StringWildcard { forward, .. } => {
+                if let ScalarValue::String(s) = value {
+                    forward.get(s).cloned().unwrap_or_default()
+                } else {
+                    BTreeSet::new()
+                }
+            }
             InvertedScalarIndex::Int64 { entries, .. } => {
                 if let ScalarValue::Int64(v) = value {
                     entries.get(v).cloned().unwrap_or_default()
@@ -354,6 +418,24 @@ impl InvertedScalarIndex {
         }
 
         match self {
+            InvertedScalarIndex::StringOrdered { map, .. } => {
+                if let ScalarValue::String(s) = value {
+                    let range = match op {
+                        RangeOp::Gt => map.range((Bound::Excluded(s.clone()), Bound::Unbounded)),
+                        RangeOp::Gte => map.range((Bound::Included(s.clone()), Bound::Unbounded)),
+                        RangeOp::Lt => map.range((Bound::Unbounded, Bound::Excluded(s.clone()))),
+                        RangeOp::Lte => map.range((Bound::Unbounded, Bound::Included(s.clone()))),
+                        _ => unreachable!("Eq and Ne handled above"),
+                    };
+                    let mut result = BTreeSet::new();
+                    for (_, ids) in range {
+                        result.extend(ids.iter().cloned());
+                    }
+                    result
+                } else {
+                    BTreeSet::new()
+                }
+            }
             InvertedScalarIndex::Int64 { entries, .. } => {
                 if let ScalarValue::Int64(v) = value {
                     let range = match op {
@@ -479,6 +561,20 @@ impl InvertedScalarIndex {
                 }
                 ids
             }
+            InvertedScalarIndex::StringOrdered { map, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in map.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
+            InvertedScalarIndex::StringWildcard { forward, .. } => {
+                let mut ids = BTreeSet::new();
+                for set in forward.values() {
+                    ids.extend(set.iter().cloned());
+                }
+                ids
+            }
             InvertedScalarIndex::Int64 { entries, .. } => {
                 let mut ids = BTreeSet::new();
                 for set in entries.values() {
@@ -550,10 +646,51 @@ impl InvertedScalarIndex {
         }
     }
 
+    /// Lookup all external IDs where the indexed field starts with the given prefix.
+    ///
+    /// Returns `Some(set)` for `StringWildcard` indexes, `None` for all other variants.
+    pub fn lookup_prefix(&self, prefix: &str) -> Option<BTreeSet<i64>> {
+        match self {
+            Self::StringWildcard { forward, .. } => {
+                let mut result = BTreeSet::new();
+                for (k, ids) in forward.range(prefix.to_string()..) {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    result.extend(ids);
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    /// Lookup all external IDs where the indexed field ends with the given suffix.
+    ///
+    /// Returns `Some(set)` for `StringWildcard` indexes, `None` for all other variants.
+    pub fn lookup_suffix(&self, suffix: &str) -> Option<BTreeSet<i64>> {
+        match self {
+            Self::StringWildcard { reversed, .. } => {
+                let rev_suffix: String = suffix.chars().rev().collect();
+                let mut result = BTreeSet::new();
+                for (k, ids) in reversed.range(rev_suffix.clone()..) {
+                    if !k.starts_with(&rev_suffix) {
+                        break;
+                    }
+                    result.extend(ids);
+                }
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
     /// Return the field name stored in the descriptor.
     pub fn field_name(&self) -> &str {
         match self {
             InvertedScalarIndex::String { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::StringOrdered { descriptor, .. } => &descriptor.field_name,
+            InvertedScalarIndex::StringWildcard { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Int64 { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::Int32 { descriptor, .. } => &descriptor.field_name,
             InvertedScalarIndex::UInt32 { descriptor, .. } => &descriptor.field_name,
@@ -569,6 +706,8 @@ impl InvertedScalarIndex {
     pub fn descriptor(&self) -> &ScalarIndexDescriptor {
         match self {
             InvertedScalarIndex::String { descriptor, .. } => descriptor,
+            InvertedScalarIndex::StringOrdered { descriptor, .. } => descriptor,
+            InvertedScalarIndex::StringWildcard { descriptor, .. } => descriptor,
             InvertedScalarIndex::Int64 { descriptor, .. } => descriptor,
             InvertedScalarIndex::Int32 { descriptor, .. } => descriptor,
             InvertedScalarIndex::UInt32 { descriptor, .. } => descriptor,
@@ -871,5 +1010,131 @@ mod tests {
         let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
 
         assert_eq!(index.all_indexed_ids(), BTreeSet::from([1, 3]));
+    }
+
+    fn test_descriptor_with_params(
+        field: &str,
+        params: serde_json::Value,
+    ) -> ScalarIndexDescriptor {
+        ScalarIndexDescriptor {
+            field_name: field.to_string(),
+            kind: crate::descriptor::ScalarIndexKind::Inverted,
+            params,
+        }
+    }
+
+    // -- StringOrdered (enable_range_optimization=true) tests --
+
+    #[test]
+    fn test_string_ordered_range_query() {
+        let descriptor = test_descriptor_with_params(
+            "tag",
+            serde_json::json!({"enable_range_optimization": true}),
+        );
+        let payloads = vec![
+            BTreeMap::from([("tag".into(), ScalarValue::String("apple".into()))]),
+            BTreeMap::from([("tag".into(), ScalarValue::String("banana".into()))]),
+            BTreeMap::from([("tag".into(), ScalarValue::String("cherry".into()))]),
+            BTreeMap::from([("tag".into(), ScalarValue::String("date".into()))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "tag", &payloads, &ids);
+        assert!(matches!(index, InvertedScalarIndex::StringOrdered { .. }));
+
+        // Gt "banana" → cherry, date
+        let result = index.lookup_range(RangeOp::Gt, &ScalarValue::String("banana".into()));
+        assert_eq!(result, BTreeSet::from([3, 4]));
+
+        // Gte "banana" → banana, cherry, date
+        let result = index.lookup_range(RangeOp::Gte, &ScalarValue::String("banana".into()));
+        assert_eq!(result, BTreeSet::from([2, 3, 4]));
+
+        // Lt "cherry" → apple, banana
+        let result = index.lookup_range(RangeOp::Lt, &ScalarValue::String("cherry".into()));
+        assert_eq!(result, BTreeSet::from([1, 2]));
+
+        // Lte "cherry" → apple, banana, cherry
+        let result = index.lookup_range(RangeOp::Lte, &ScalarValue::String("cherry".into()));
+        assert_eq!(result, BTreeSet::from([1, 2, 3]));
+
+        // Eq still works
+        let result = index.lookup_eq(&ScalarValue::String("banana".into()));
+        assert_eq!(result, BTreeSet::from([2]));
+    }
+
+    // -- StringWildcard (enable_extended_wildcard=true) tests --
+
+    #[test]
+    fn test_string_wildcard_prefix_lookup() {
+        let descriptor = test_descriptor_with_params(
+            "name",
+            serde_json::json!({"enable_extended_wildcard": true}),
+        );
+        let payloads = vec![
+            BTreeMap::from([("name".into(), ScalarValue::String("alice".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("alfred".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("bob".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("alicia".into()))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+        assert!(matches!(index, InvertedScalarIndex::StringWildcard { .. }));
+
+        // prefix "al" → alice (1), alfred (2), alicia (4)
+        let result = index.lookup_prefix("al").unwrap();
+        assert_eq!(result, BTreeSet::from([1, 2, 4]));
+
+        // prefix "ali" → alice (1), alicia (4)
+        let result = index.lookup_prefix("ali").unwrap();
+        assert_eq!(result, BTreeSet::from([1, 4]));
+
+        // prefix "bob" → bob (3)
+        let result = index.lookup_prefix("bob").unwrap();
+        assert_eq!(result, BTreeSet::from([3]));
+
+        // prefix "xyz" → empty
+        let result = index.lookup_prefix("xyz").unwrap();
+        assert!(result.is_empty());
+
+        // non-wildcard index returns None
+        let plain_desc = test_descriptor("name");
+        let plain_idx =
+            InvertedScalarIndex::build_from_payloads(plain_desc, "name", &payloads, &ids);
+        assert!(plain_idx.lookup_prefix("al").is_none());
+    }
+
+    #[test]
+    fn test_string_wildcard_suffix_lookup() {
+        let descriptor = test_descriptor_with_params(
+            "name",
+            serde_json::json!({"enable_extended_wildcard": true}),
+        );
+        let payloads = vec![
+            BTreeMap::from([("name".into(), ScalarValue::String("alice".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("grace".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("rice".into()))]),
+            BTreeMap::from([("name".into(), ScalarValue::String("bob".into()))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+
+        let index = InvertedScalarIndex::build_from_payloads(descriptor, "name", &payloads, &ids);
+
+        // suffix "ce" → alice (1), grace (2), rice (3) — all end in "ce"
+        let result = index.lookup_suffix("ce").unwrap();
+        assert_eq!(result, BTreeSet::from([1, 2, 3]));
+
+        // suffix "ice" → alice (1), rice (3)
+        let result = index.lookup_suffix("ice").unwrap();
+        assert_eq!(result, BTreeSet::from([1, 3]));
+
+        // suffix "ob" → bob (4)
+        let result = index.lookup_suffix("ob").unwrap();
+        assert_eq!(result, BTreeSet::from([4]));
+
+        // suffix "xyz" → empty
+        let result = index.lookup_suffix("xyz").unwrap();
+        assert!(result.is_empty());
     }
 }

@@ -5,12 +5,14 @@ import pytest
 
 
 def test_common_param_surface_reexports_flat_and_ivf_query_wrappers():
-    assert hannsdb.FlatIndexParam is hannsdb.model.param.FlatIndexParam
-    assert hannsdb.IVFQueryParam is hannsdb.model.param.IVFQueryParam
-    assert hannsdb.FlatIndexParam.__module__ == "hannsdb.model.param.index_params"
-    assert hannsdb.IVFQueryParam.__module__ == "hannsdb.model.param.index_params"
-    assert dataclasses.is_dataclass(hannsdb.FlatIndexParam)
-    assert dataclasses.is_dataclass(hannsdb.IVFQueryParam)
+    for public_cls, model_cls in (
+        (hannsdb.FlatIndexParam, hannsdb.model.param.FlatIndexParam),
+        (hannsdb.InvertIndexParam, hannsdb.model.param.InvertIndexParam),
+        (hannsdb.IVFQueryParam, hannsdb.model.param.IVFQueryParam),
+    ):
+        assert public_cls is model_cls
+        assert public_cls.__module__ == "hannsdb.model.param.index_params"
+        assert dataclasses.is_dataclass(public_cls)
 
 
 def test_flat_index_param_validates_metric_type_and_bridges_to_native():
@@ -74,8 +76,44 @@ def test_vector_query_rejects_unsupported_query_param_type():
         )
 
 
+def test_invert_index_param_validates_default_only_shape_and_bridges_to_native():
+    param = hannsdb.InvertIndexParam()
+
+    assert param.enable_range_optimization is False
+    assert param.enable_extended_wildcard is False
+    assert param._get_native().__class__ is hannsdb._native.InvertIndexParam
+
+
+def test_invert_index_param_accepts_functional_flags():
+    # enable_range_optimization=True should be accepted (no ValueError)
+    param_ro = hannsdb.InvertIndexParam(enable_range_optimization=True)
+    assert param_ro.enable_range_optimization is True
+    assert param_ro.enable_extended_wildcard is False
+    assert param_ro._get_native().__class__ is hannsdb._native.InvertIndexParam
+
+    # enable_extended_wildcard=True should be accepted (no ValueError)
+    param_ew = hannsdb.InvertIndexParam(enable_extended_wildcard=True)
+    assert param_ew.enable_range_optimization is False
+    assert param_ew.enable_extended_wildcard is True
+    assert param_ew._get_native().__class__ is hannsdb._native.InvertIndexParam
+
+    # Both flags True should be accepted
+    param_both = hannsdb.InvertIndexParam(
+        enable_range_optimization=True, enable_extended_wildcard=True
+    )
+    assert param_both.enable_range_optimization is True
+    assert param_both.enable_extended_wildcard is True
+    assert param_both._get_native().__class__ is hannsdb._native.InvertIndexParam
+
+    # Native layer also accepts both flags
+    native_ro = hannsdb._native.InvertIndexParam(enable_range_optimization=True)
+    assert native_ro.enable_range_optimization is True
+
+    native_ew = hannsdb._native.InvertIndexParam(enable_extended_wildcard=True)
+    assert native_ew.enable_extended_wildcard is True
+
+
 def test_advanced_param_families_remain_absent_from_public_surface():
-    assert hasattr(hannsdb, "InvertIndexParam") is False
     assert hasattr(hannsdb, "HnswRabitqIndexParam") is False
     assert hasattr(hannsdb, "HnswRabitqQueryParam") is False
     assert hasattr(hannsdb.DataType, "VectorFp16") is False
