@@ -55,6 +55,7 @@
   - 2026-03-21 first clean end-to-end run with knowhere HNSW: `insert=121s optimize=81s serial_latency_p99=111ms recall=1.0`; result: `result_20260321_hannsdb-1536d50k-knowhere_hannsdb.json`
   - 2026-04-13 fresh clean rerun: `result_20260413_hannsdb-p0-rerun-20260413_hannsdb.json`
   - 2026-04-13 remote hk-x86 full rerun: `result_20260413_hannsdb-hk-x86-20260413_hannsdb.json`
+  - 2026-04-15 remote x86 rerun after active-snapshot-unification: `result_20260415_hannsdb-x86-active-snapshot-20260415_hannsdb.json` with `insert=43.116s optimize=79.0623s load=122.1783s p99=0.0005s recall=0.9442`; query quality stayed flat while insert/load regressed relative to the 2026-04-13 x86 rerun
 - [ ] Convert current prototype durability into a real storage story
   - 2026-04-13: first explicit `storage` module slice landed (`storage::paths`, `storage::wal`, `storage::recovery`) without behavior regression; this is the new landing zone for further durability cleanup
   - 2026-04-13: segment read-path helpers are now starting to move under `storage::segment_io`, shrinking `db.rs` while keeping `wal_recovery` and `collection_api` green

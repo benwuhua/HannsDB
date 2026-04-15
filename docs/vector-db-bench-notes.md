@@ -1707,3 +1707,45 @@ Fresh fast-path rerun using the same entrypoint:
   - `serial_latency_p99=0.0005`
   - `recall=0.9442`
 - this rerun reused the already-prepared remote environment via the `Remote VectorDBBench environment already ready` fast path, confirming the new wrapper is not only bootstrappable but also repeatable.
+
+## 52) Remote x86 rerun after active-snapshot unification (2026-04-15)
+
+Run label:
+- `hannsdb-x86-active-snapshot-20260415`
+
+Result file:
+- `/data/work/VectorDBBench/vectordb_bench/results/HannsDB/result_20260415_hannsdb-x86-active-snapshot-20260415_hannsdb.json`
+
+Observed metrics:
+- `insert_duration=43.116`
+- `optimize_duration=79.0623`
+- `load_duration=122.1783`
+- `serial_latency_p99=0.0005`
+- `serial_latency_p95=0.0004`
+- `recall=0.9442`
+- `ndcg=0.9507`
+
+Comparison against the previous remote x86 full rerun (`2026-04-13`, `hannsdb-hk-x86-20260413`):
+- previous `insert_duration=24.1242`
+- previous `optimize_duration=78.5678`
+- previous `load_duration=102.692`
+- previous `serial_latency_p99=0.0005`
+- previous `recall=0.9442`
+
+Interpretation:
+- the latest storage/runtime lanes did **not** materially change benchmark-side recall, ndcg, or p99 on the remote x86 path
+- `optimize_duration` stayed in the same band (~79s), which suggests the recent forward_store durability/authority work did not meaningfully worsen the ANN build path
+- the visible regression is concentrated in `insert_duration` and therefore `load_duration`
+- the most likely explanation is extra write/load-path cost from the newer active-snapshot / authority-preservation materialization work, not query-path drift
+
+Comparison anchor versus the documented zvec baseline (`2026-03-21`, same benchmark shape/config):
+- zvec `insert_duration=3.6924`
+- zvec `optimize_duration=6.1556`
+- zvec `load_duration=9.848`
+- zvec `serial_latency_p99=0.0006`
+- zvec `recall=0.9395`
+
+Current takeaway:
+- HannsDB still keeps the higher recall point (`0.9442` vs `0.9395`)
+- HannsDB still remains far slower on build/load than zvec in the standard `1536D50K` case
+- p99 remains in the same sub-millisecond band and is still competitive with the documented zvec baseline
