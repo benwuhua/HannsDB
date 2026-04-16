@@ -426,3 +426,93 @@ def test_collection_index_ddl_surface_runs_core_validation(tmp_path):
         )
 
     collection.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Create / Open input validation (aligned with zvec test_collection_create_and_open)
+# ---------------------------------------------------------------------------
+
+
+def test_create_rejects_zero_dimension_vector(tmp_path):
+    """VectorSchema with dimension=0 (non-sparse) raises ValueError."""
+    with pytest.raises(ValueError):
+        hannsdb.create_and_open(
+            str(tmp_path / "zero_dim"),
+            hannsdb.CollectionSchema(
+                name="zero_dim",
+                fields=[],
+                vectors=[hannsdb.VectorSchema("v", hannsdb.DataType.VECTOR_FP32, dimension=0)],
+            ),
+        )
+
+
+def test_create_rejects_no_vectors(tmp_path):
+    """CollectionSchema with empty vectors list raises ValueError."""
+    with pytest.raises(ValueError):
+        hannsdb.create_and_open(
+            str(tmp_path / "no_vec"),
+            hannsdb.CollectionSchema(
+                name="no_vec",
+                fields=[hannsdb.FieldSchema("x", hannsdb.DataType.STRING)],
+                vectors=[],
+            ),
+        )
+
+
+def test_create_accepts_empty_name(tmp_path):
+    """Empty collection name is currently accepted (documented behavior)."""
+    col = hannsdb.create_and_open(
+        str(tmp_path / "empty_name"),
+        hannsdb.CollectionSchema(
+            name="",
+            fields=[hannsdb.FieldSchema("x", hannsdb.DataType.STRING)],
+            vectors=[hannsdb.VectorSchema("v", hannsdb.DataType.VECTOR_FP32, dimension=2)],
+        ),
+    )
+    assert col is not None
+    col.destroy()
+
+
+def test_create_accepts_duplicate_field_names(tmp_path):
+    """Duplicate field names are currently accepted (documented behavior)."""
+    col = hannsdb.create_and_open(
+        str(tmp_path / "dup_fields"),
+        hannsdb.CollectionSchema(
+            name="dup",
+            fields=[
+                hannsdb.FieldSchema("x", hannsdb.DataType.STRING),
+                hannsdb.FieldSchema("x", hannsdb.DataType.INT64),
+            ],
+            vectors=[hannsdb.VectorSchema("v", hannsdb.DataType.VECTOR_FP32, dimension=2)],
+        ),
+    )
+    assert col is not None
+    col.destroy()
+
+
+def test_create_accepts_special_chars_in_field_name(tmp_path):
+    """Field names with special chars are currently accepted (documented behavior)."""
+    col = hannsdb.create_and_open(
+        str(tmp_path / "special_field"),
+        hannsdb.CollectionSchema(
+            name="special",
+            fields=[hannsdb.FieldSchema("a/b", hannsdb.DataType.STRING)],
+            vectors=[hannsdb.VectorSchema("v", hannsdb.DataType.VECTOR_FP32, dimension=2)],
+        ),
+    )
+    assert col is not None
+    col.destroy()
+
+
+def test_create_accepts_special_chars_in_collection_name(tmp_path):
+    """Collection name with special chars is currently accepted (documented behavior)."""
+    col = hannsdb.create_and_open(
+        str(tmp_path / "special_coll"),
+        hannsdb.CollectionSchema(
+            name="a/b",
+            fields=[hannsdb.FieldSchema("x", hannsdb.DataType.STRING)],
+            vectors=[hannsdb.VectorSchema("v", hannsdb.DataType.VECTOR_FP32, dimension=2)],
+        ),
+    )
+    assert col is not None
+    col.destroy()

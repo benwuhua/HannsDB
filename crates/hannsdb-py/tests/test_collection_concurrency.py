@@ -176,3 +176,208 @@ def test_mixed_read_write_keeps_collection_usable(tmp_path):
     }
 
     collection.destroy()
+
+
+def test_concurrent_insert_and_query(tmp_path):
+    """Multiple threads insert while others query — no crashes, consistent results."""
+    collection = build_collection(tmp_path)
+
+    start = threading.Event()
+    errors = []
+    lock = threading.Lock()
+
+    def inserter(thread_id):
+        try:
+            start.wait()
+            for i in range(5):
+                doc = hannsdb.Doc(
+                    id=f"{thread_id}_{i}",
+                    vector=[float(thread_id), float(i)],
+                    fields={"group": thread_id % 3},
+                )
+                collection.insert(doc)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    def querier(_):
+        try:
+            start.wait()
+            for _ in range(5):
+                collection.query(
+                    vectors=hannsdb.VectorQuery(
+                        field_name="dense", vector=[0.0, 0.0], param=None
+                    ),
+                    topk=3,
+                )
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        *[threading.Thread(target=inserter, args=(i,)) for i in range(3)],
+        *[threading.Thread(target=querier, args=(i,)) for i in range(3)],
+    ]
+    for t in threads:
+        t.start()
+    start.set()
+    _join_threads(threads)
+
+    assert errors == []
+    stats = collection.stats
+    assert stats.doc_count == 15  # 3 threads * 5 docs
+
+    collection.destroy()
+
+
+def test_concurrent_insert_and_delete(tmp_path):
+    """Interleaved insert/delete — final doc_count matches expected."""
+    collection = build_collection(tmp_path)
+
+    errors = []
+    lock = threading.Lock()
+
+    # Phase 1: insert all docs first
+    def inserter(thread_id):
+        try:
+            for i in range(10):
+                doc = hannsdb.Doc(
+                    id=f"{thread_id}_{i}",
+                    vector=[float(thread_id), float(i)],
+                    fields={"group": thread_id},
+                )
+                collection.insert(doc)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    insert_threads = [threading.Thread(target=inserter, args=(i,)) for i in range(2)]
+    for t in insert_threads:
+        t.start()
+    _join_threads(insert_threads)
+
+    assert errors == []
+
+    # Phase 2: concurrent deletes
+    start = threading.Event()
+
+    def deleter(thread_id):
+        try:
+            start.wait()
+            for i in range(5):
+                collection.delete(f"{thread_id}_{i}")
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    delete_threads = [threading.Thread(target=deleter, args=(i,)) for i in range(2)]
+    for t in delete_threads:
+        t.start()
+    start.set()
+    _join_threads(delete_threads)
+
+    assert errors == []
+    stats = collection.stats
+    assert stats.doc_count == 10  # 20 inserted - 10 deleted
+
+    collection.destroy()
+
+
+def test_read_write_locking(tmp_path):
+    """Write holds lock; reads queue but don't deadlock."""
+    collection = build_collection(tmp_path)
+    _seed_docs(collection, 5)
+
+    start = threading.Event()
+    errors = []
+    completed = []
+    lock = threading.Lock()
+
+    def writer(_):
+        try:
+            start.wait()
+            for i in range(10, 20):
+                doc = hannsdb.Doc(
+                    id=str(i),
+                    vector=[float(i), float(i)],
+                    fields={"group": i % 3},
+                )
+                collection.insert(doc)
+            with lock:
+                completed.append("write")
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    def reader(_):
+        try:
+            start.wait()
+            collection.fetch(["0", "1", "2"])
+            collection.query(
+                vectors=hannsdb.VectorQuery(
+                    field_name="dense", vector=[0.0, 0.0], param=None
+                ),
+                topk=3,
+            )
+            with lock:
+                completed.append("read")
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer, args=(0,)),
+        *[threading.Thread(target=reader, args=(i,)) for i in range(3)],
+    ]
+    for t in threads:
+        t.start()
+    start.set()
+    _join_threads(threads, timeout=10.0)
+
+    assert errors == []
+    assert "write" in completed
+    assert completed.count("read") == 3
+
+    collection.destroy()
+
+
+def test_race_condition_detection(tmp_path):
+    """Rapid fire insert/fetch/query cycle — no crashes."""
+    collection = build_collection(tmp_path)
+
+    errors = []
+    lock = threading.Lock()
+
+    def worker(thread_id):
+        try:
+            for i in range(20):
+                doc_id = f"{thread_id}_{i}"
+                doc = hannsdb.Doc(
+                    id=doc_id,
+                    vector=[float(thread_id), float(i)],
+                    fields={"group": thread_id % 3},
+                )
+                collection.insert(doc)
+                collection.fetch([doc_id])
+                collection.query(
+                    vectors=hannsdb.VectorQuery(
+                        field_name="dense",
+                        vector=[float(thread_id), float(i)],
+                        param=None,
+                    ),
+                    topk=1,
+                )
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    _join_threads(threads, timeout=15.0)
+
+    assert errors == []
+    stats = collection.stats
+    assert stats.doc_count == 80  # 4 threads * 20 docs
+
+    collection.destroy()
