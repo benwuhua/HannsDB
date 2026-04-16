@@ -117,3 +117,35 @@ def test_advanced_param_families_remain_absent_from_public_surface():
     assert hasattr(hannsdb, "HnswRabitqIndexParam") is False
     assert hasattr(hannsdb, "HnswRabitqQueryParam") is False
     assert hasattr(hannsdb.DataType, "VectorFp16") is False
+
+
+def test_hnsw_sq_query_param_defaults_and_validation():
+    param = hannsdb.HnswSqQueryParam()
+    assert param.ef_search == 50
+    assert param._get_native().__class__ is hannsdb._native.HnswSqQueryParam
+
+
+def test_hnsw_sq_query_param_custom_ef_search():
+    param = hannsdb.HnswSqQueryParam(ef_search=100)
+    assert param.ef_search == 100
+
+
+def test_hnsw_sq_query_param_rejects_invalid():
+    import pytest
+    with pytest.raises((ValueError, TypeError)):
+        hannsdb.HnswSqQueryParam(ef_search="bad")
+
+
+def test_index_option_defaults_and_validation():
+    opt = hannsdb.IndexOption()
+    assert opt.concurrency == 0
+
+
+def test_index_option_custom_concurrency():
+    opt = hannsdb.IndexOption(concurrency=4)
+    assert opt.concurrency == 4
+
+
+def test_hnsw_sq_query_param_and_index_option_are_public():
+    assert hannsdb.HnswSqQueryParam is hannsdb.model.param.HnswSqQueryParam
+    assert hannsdb.IndexOption is not None

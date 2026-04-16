@@ -788,13 +788,13 @@ class Collection:
     def destroy(self):
         return self._core.destroy()
 
-    def create_index(self, field_name, index_param=None):
+    def create_index(self, field_name, index_param=None, option=None):
         if self._schema is None:
             raise RuntimeError("collection schema is required for index operations")
         kind, _ = _resolve_index_target(self._schema, field_name)
         if kind == "vector":
-            return self.create_vector_index(field_name, index_param)
-        return self.create_scalar_index(field_name, index_param)
+            return self.create_vector_index(field_name, index_param, option)
+        return self.create_scalar_index(field_name, index_param, option)
 
     def drop_index(self, field_name):
         if self._schema is None:
@@ -804,17 +804,25 @@ class Collection:
             return self.drop_vector_index(field_name)
         return self.drop_scalar_index(field_name)
 
-    def create_vector_index(self, field_name, index_param=None):
-        return self._core.create_vector_index(field_name, _native_value(index_param))
+    def create_vector_index(self, field_name, index_param=None, option=None):
+        native_option = _native_value(option)
+        if native_option is None:
+            return self._core.create_vector_index(field_name, _native_value(index_param))
+        return self._core.create_vector_index(field_name, _native_value(index_param), native_option)
 
     def drop_vector_index(self, field_name):
         return self._core.drop_vector_index(field_name)
 
-    def create_scalar_index(self, field_name, index_param=None):
+    def create_scalar_index(self, field_name, index_param=None, option=None):
         index_param = _normalize_scalar_index_param(index_param)
-        if index_param is None:
+        native_option = _native_value(option)
+        if index_param is None and native_option is None:
             return self._core.create_scalar_index(field_name)
-        return self._core.create_scalar_index(field_name, index_param)
+        if index_param is None:
+            return self._core.create_scalar_index(field_name, option=native_option)
+        if native_option is None:
+            return self._core.create_scalar_index(field_name, index_param)
+        return self._core.create_scalar_index(field_name, index_param, native_option)
 
     def drop_scalar_index(self, field_name):
         return self._core.drop_scalar_index(field_name)

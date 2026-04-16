@@ -3672,3 +3672,48 @@ def test_collection_convenience_index_operations_reject_ambiguous_field_names(tm
         collection.drop_index("shared")
 
     collection.destroy()
+
+
+def test_create_vector_index_accepts_index_option(tmp_path):
+    """IndexOption(concurrency=N) is accepted without error."""
+    schema = hannsdb.CollectionSchema(
+        name="opt_test",
+        primary_vector="vec",
+        fields=[],
+        vectors=[hannsdb.VectorSchema(name="vec", data_type="vector_fp32", dimension=4)],
+    )
+    col = hannsdb.create_and_open(str(tmp_path), schema)
+    col.create_vector_index("vec", hannsdb.HnswIndexParam(), option=hannsdb.IndexOption(concurrency=2))
+    col.destroy()
+
+
+def test_query_with_hnsw_sq_query_param(tmp_path):
+    """HnswSqQueryParam is accepted in VectorQuery and search returns results."""
+    schema = hannsdb.CollectionSchema(
+        name="sq_query_test",
+        primary_vector="vec",
+        fields=[],
+        vectors=[hannsdb.VectorSchema(
+            name="vec",
+            data_type="vector_fp32",
+            dimension=4,
+            index_param=hannsdb.HnswIndexParam(),
+        )],
+    )
+    col = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(id=str(i), vectors={"vec": [float(i), 0.0, 0.0, 0.0]}, fields={})
+        for i in range(10)
+    ]
+    col.insert(docs)
+    results = col.query(
+        hannsdb.VectorQuery(
+            field_name="vec",
+            vector=[1.0, 0.0, 0.0, 0.0],
+            param=hannsdb.HnswSqQueryParam(ef_search=64),
+        ),
+        topk=3,
+    )
+    assert len(results) > 0
+    col.destroy()
+

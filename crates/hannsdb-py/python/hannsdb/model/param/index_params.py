@@ -9,6 +9,7 @@ __all__ = [
     "HnswIndexParam",
     "HnswHvqIndexParam",
     "HnswSqIndexParam",
+    "HnswSqQueryParam",
     "InvertIndexParam",
     "IvfUsqIndexParam",
     "IvfUsqQueryParam",
@@ -295,4 +296,17 @@ class IvfUsqQueryParam:
     def _get_native(self):
         return _native_module.IvfUsqQueryParam(
             nprobe=self.nprobe,
+        )
+
+
+@dataclass(frozen=True)
+class HnswSqQueryParam:
+    ef_search: int = 50
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "ef_search", _require_int("ef_search", self.ef_search))
+
+    def _get_native(self):
+        return _native_module.HnswSqQueryParam(
+            ef_search=self.ef_search,
         )

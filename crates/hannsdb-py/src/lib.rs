@@ -185,6 +185,22 @@ pub struct IvfUsqQueryParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HnswSqQueryParam {
+    pub ef_search: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexOption {
+    pub concurrency: usize,
+}
+
+impl Default for IndexOption {
+    fn default() -> Self {
+        Self { concurrency: 0 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSchema {
     pub name: String,
     pub data_type: DataType,
@@ -451,23 +467,40 @@ fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery>
     };
 
     let param = match query.getattr("param") {
-        Ok(param) if !param.is_none() => Some(HnswQueryParam {
-            ef: param
-                .getattr("ef")
+        Ok(param) if !param.is_none() => {
+            // Check if it's a native PyHnswSqQueryParam first (via ef_search attr, no ef/nprobe).
+            let ef_search_val = param
+                .getattr("ef_search")
                 .ok()
-                .and_then(|value| value.extract::<usize>().ok())
-                .unwrap_or(0),
-            nprobe: param
-                .getattr("nprobe")
-                .ok()
-                .and_then(|value| value.extract::<usize>().ok())
-                .unwrap_or(0),
-            is_using_refiner: param
-                .getattr("is_using_refiner")
-                .ok()
-                .and_then(|value| value.extract::<bool>().ok())
-                .unwrap_or(false),
-        }),
+                .and_then(|v| v.extract::<usize>().ok());
+            let has_ef = param.getattr("ef").ok().and_then(|v| v.extract::<usize>().ok()).is_some();
+            if let (Some(ef_search), false) = (ef_search_val, has_ef) {
+                // HnswSqQueryParam path: use ef_search as the ef parameter
+                Some(HnswQueryParam {
+                    ef: ef_search,
+                    nprobe: 0,
+                    is_using_refiner: false,
+                })
+            } else {
+                Some(HnswQueryParam {
+                    ef: param
+                        .getattr("ef")
+                        .ok()
+                        .and_then(|value| value.extract::<usize>().ok())
+                        .unwrap_or(0),
+                    nprobe: param
+                        .getattr("nprobe")
+                        .ok()
+                        .and_then(|value| value.extract::<usize>().ok())
+                        .unwrap_or(0),
+                    is_using_refiner: param
+                        .getattr("is_using_refiner")
+                        .ok()
+                        .and_then(|value| value.extract::<bool>().ok())
+                        .unwrap_or(false),
+                })
+            }
+        }
         _ => None,
     };
 
@@ -2314,6 +2347,54 @@ impl PyIvfUsqQueryParam {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "HnswSqQueryParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyHnswSqQueryParam {
+    inner: HnswSqQueryParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyHnswSqQueryParam {
+    #[new]
+    #[pyo3(signature = (ef_search=50))]
+    fn new(ef_search: usize) -> Self {
+        Self {
+            inner: HnswSqQueryParam { ef_search },
+        }
+    }
+
+    #[getter]
+    fn ef_search(&self) -> usize {
+        self.inner.ef_search
+    }
+}
+
+#[cfg(feature = "python-binding")]
+#[pyclass(name = "IndexOption", module = "hannsdb")]
+#[derive(Clone)]
+struct PyIndexOption {
+    inner: IndexOption,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyIndexOption {
+    #[new]
+    #[pyo3(signature = (concurrency=0))]
+    fn new(concurrency: usize) -> Self {
+        Self {
+            inner: IndexOption { concurrency },
+        }
+    }
+
+    #[getter]
+    fn concurrency(&self) -> usize {
+        self.inner.concurrency
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "FieldSchema", module = "hannsdb")]
 #[derive(Clone)]
 struct PyFieldSchema {
@@ -2736,9 +2817,19 @@ impl PyVectorQuery {
                         nprobe: ivf_usq.nprobe,
                         is_using_refiner: false,
                     })
+                } else if bound.is_instance_of::<PyHnswSqQueryParam>() {
+                    let sq = bound
+                        .extract::<PyRef<'_, PyHnswSqQueryParam>>()?
+                        .inner
+                        .clone();
+                    Some(HnswQueryParam {
+                        ef: sq.ef_search,
+                        nprobe: 0,
+                        is_using_refiner: false,
+                    })
                 } else {
                     return Err(PyValueError::new_err(
-                        "query param must be HnswQueryParam, IVFQueryParam, or IvfUsqQueryParam",
+                        "query param must be HnswQueryParam, IVFQueryParam, IvfUsqQueryParam, or HnswSqQueryParam",
                     ));
                 }
             }
@@ -3195,13 +3286,15 @@ impl PyCollection {
             .map_err(io_to_py_err)
     }
 
-    #[pyo3(signature = (field_name, index_param=None))]
+    #[pyo3(signature = (field_name, index_param=None, option=None))]
     fn create_vector_index(
         &self,
         py: Python<'_>,
         field_name: String,
         index_param: Option<Py<PyAny>>,
+        option: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        let _ = option; // accepted, ignored (concurrency not yet wired to core)
         let index_param = match index_param {
             Some(param) => {
                 let bound = param.bind(py);
@@ -3263,13 +3356,15 @@ impl PyCollection {
             .map_err(io_to_py_err)
     }
 
-    #[pyo3(signature = (field_name, index_param=None))]
+    #[pyo3(signature = (field_name, index_param=None, option=None))]
     fn create_scalar_index(
         &self,
         py: Python<'_>,
         field_name: String,
         index_param: Option<Py<PyAny>>,
+        option: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        let _ = option; // accepted, ignored (concurrency not yet wired to core)
         let index_param = match index_param {
             Some(param) => {
                 let bound = param.bind(py);
@@ -3430,6 +3525,8 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyHnswQueryParam>()?;
     module.add_class::<PyIVFQueryParam>()?;
     module.add_class::<PyIvfUsqQueryParam>()?;
+    module.add_class::<PyHnswSqQueryParam>()?;
+    module.add_class::<PyIndexOption>()?;
     module.add_class::<PyFieldSchema>()?;
     module.add_class::<PyVectorSchema>()?;
     module.add_class::<PyCollectionSchema>()?;

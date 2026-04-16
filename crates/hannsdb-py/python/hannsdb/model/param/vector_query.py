@@ -34,11 +34,11 @@ def _normalize_vector(vector: Any) -> list[float]:
 def _normalize_query_param(param: Any):
     if param is None:
         return None
-    from .index_params import HnswQueryParam, IvfUsqQueryParam, IVFQueryParam
+    from .index_params import HnswQueryParam, IvfUsqQueryParam, IVFQueryParam, HnswSqQueryParam
 
-    if isinstance(param, (HnswQueryParam, IVFQueryParam, IvfUsqQueryParam)):
+    if isinstance(param, (HnswQueryParam, IVFQueryParam, IvfUsqQueryParam, HnswSqQueryParam)):
         return param
-    raise TypeError("param must be HnswQueryParam, IVFQueryParam, or IvfUsqQueryParam")
+    raise TypeError("param must be HnswQueryParam, IVFQueryParam, IvfUsqQueryParam, or HnswSqQueryParam")
 
 
 class SparseVector:
