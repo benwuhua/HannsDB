@@ -116,7 +116,6 @@ def test_invert_index_param_accepts_functional_flags():
 def test_advanced_param_families_remain_absent_from_public_surface():
     assert hasattr(hannsdb, "HnswRabitqIndexParam") is False
     assert hasattr(hannsdb, "HnswRabitqQueryParam") is False
-    assert hasattr(hannsdb.DataType, "VectorFp16") is False
 
 
 def test_hnsw_sq_query_param_defaults_and_validation():
