@@ -156,7 +156,11 @@ impl VectorIndexBackend for HnswSqIndex {
         }
         let req = hanns::api::SearchRequest {
             top_k: k,
-            nprobe: if ef_search > 0 { ef_search } else { self.inner.ef_search() },
+            nprobe: if ef_search > 0 {
+                ef_search
+            } else {
+                self.inner.ef_search()
+            },
             filter: None,
             params: None,
             radius: None,
@@ -195,7 +199,11 @@ impl VectorIndexBackend for HnswSqIndex {
         let overfetch_k = self.external_ids.len().max(k);
         let req = hanns::api::SearchRequest {
             top_k: overfetch_k,
-            nprobe: if ef_search > 0 { ef_search } else { self.inner.ef_search() },
+            nprobe: if ef_search > 0 {
+                ef_search
+            } else {
+                self.inner.ef_search()
+            },
             filter: None,
             params: None,
             radius: None,

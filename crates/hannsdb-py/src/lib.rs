@@ -3018,6 +3018,12 @@ impl PyCollectionStats {
         self.inner.live_count
     }
 
+    /// Alias for live_count — matches zvec's CollectionStats.doc_count.
+    #[getter]
+    fn doc_count(&self) -> usize {
+        self.inner.live_count
+    }
+
     #[getter]
     fn index_completeness(&self) -> std::collections::HashMap<String, f64> {
         self.inner
