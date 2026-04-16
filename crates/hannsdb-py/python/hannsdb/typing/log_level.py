@@ -10,3 +10,9 @@ class LogLevel(_StringEnum):
     Info = "info"
     Warn = "warn"
     Error = "error"
+    # SCREAMING_SNAKE_CASE aliases for zvec compatibility
+    DEBUG = "debug"
+    INFO = "info"
+    WARN = "warn"
+    ERROR = "error"
+    WARNING = "warn"  # Python logging convention alias

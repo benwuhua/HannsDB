@@ -1,7 +1,7 @@
 from . import _native as _native_module
 from ._native import *  # noqa: F401,F403
 from . import typing as typing
-from .typing import DataType, IndexType, LogLevel, MetricType, QuantizeType
+from .typing import DataType, IndexType, LogLevel, LogType, MetricType, QuantizeType
 from .executor import QueryExecutorFactory
 from .extension import ReRanker, RrfReRanker, WeightedReRanker
 from .model import (
@@ -56,6 +56,7 @@ _facade_exports = [
     "IvfUsqIndexParam",
     "IvfUsqQueryParam",
     "LogLevel",
+    "LogType",
     "QueryContext",
     "QueryGroupBy",
     "QueryOrderBy",
@@ -79,7 +80,8 @@ def _normalize_log_level(log_level):
     return log_level.strip().lower()
 
 
-def init(log_level="warn"):
+def init(log_level="warn", log_type=None, log_dir=None):
+    # log_type and log_dir accepted for zvec API compatibility; native layer only uses log_level
     return _native_module.init(_normalize_log_level(log_level))
 
 __all__ = sorted(set(_native_exports + _facade_exports))
