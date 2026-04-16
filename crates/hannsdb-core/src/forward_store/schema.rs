@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, FixedSizeListArray,
-    Float32Array, Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringArray,
-    StringBuilder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+    Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Builder, Int64Builder,
+    ListBuilder, StringArray, StringBuilder, UInt32Array, UInt32Builder, UInt64Array,
+    UInt64Builder,
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -335,13 +336,7 @@ fn vector_arrow_type(field: &VectorFieldSchema) -> DataType {
 
 fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Result<ArrayRef> {
     if field.array {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "array forward-store scalar fields not yet supported: {}",
-                field.name
-            ),
-        ));
+        return build_scalar_array_field(rows, field);
     }
 
     let array: ArrayRef = match &field.data_type {
@@ -485,6 +480,208 @@ fn build_scalar_array(rows: &[ForwardRow], field: &ScalarFieldSchema) -> io::Res
     };
 
     Ok(array)
+}
+
+/// Build an Arrow ListArray column for an array-typed scalar field.
+fn build_scalar_array_field(
+    rows: &[ForwardRow],
+    field: &ScalarFieldSchema,
+) -> io::Result<ArrayRef> {
+    match &field.data_type {
+        FieldType::String => {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::String(v) => builder.values().append_value(v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-string element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::Int64 => {
+            let mut builder = ListBuilder::new(Int64Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::Int64(v) => builder.values().append_value(*v),
+                                FieldValue::Int32(v) => builder.values().append_value(*v as i64),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-int64 element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::Int32 => {
+            let mut builder = ListBuilder::new(Int32Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::Int32(v) => builder.values().append_value(*v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-int32 element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::Float => {
+            let mut builder = ListBuilder::new(Float32Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::Float(v) => builder.values().append_value(*v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-float element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::Float64 => {
+            let mut builder = ListBuilder::new(Float64Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::Float64(v) => builder.values().append_value(*v),
+                                FieldValue::Float(v) => builder.values().append_value(*v as f64),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-float64 element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::Bool => {
+            let mut builder = ListBuilder::new(BooleanBuilder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::Bool(v) => builder.values().append_value(*v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-bool element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::UInt32 => {
+            let mut builder = ListBuilder::new(UInt32Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::UInt32(v) => builder.values().append_value(*v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-uint32 element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        FieldType::UInt64 => {
+            let mut builder = ListBuilder::new(UInt64Builder::new());
+            for row in rows {
+                match row.fields.get(&field.name) {
+                    Some(FieldValue::Array(items)) => {
+                        for item in items {
+                            match item {
+                                FieldValue::UInt64(v) => builder.values().append_value(*v),
+                                _ => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        format!("non-uint64 element in array field {}", field.name),
+                                    ))
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    _ => builder.append(false),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        unsupported => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "unsupported forward-store array element type: {:?}",
+                unsupported
+            ),
+        )),
+    }
 }
 
 fn build_vector_array(rows: &[ForwardRow], field: &VectorFieldSchema) -> io::Result<ArrayRef> {

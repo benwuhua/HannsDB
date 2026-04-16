@@ -1471,6 +1471,34 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
             FieldValue::Float(value)
         } else if let Ok(value) = value.extract::<f64>() {
             FieldValue::Float64(value)
+        } else if let Ok(list) = value.downcast::<PyList>() {
+            let items: Vec<FieldValue> = list
+                .iter()
+                .map(|item| {
+                    if item.is_instance_of::<PyBool>() {
+                        Ok(FieldValue::Bool(item.extract::<bool>()?))
+                    } else if let Ok(v) = item.extract::<String>() {
+                        Ok(FieldValue::String(v))
+                    } else if let Ok(v) = item.extract::<i32>() {
+                        Ok(FieldValue::Int32(v))
+                    } else if let Ok(v) = item.extract::<i64>() {
+                        Ok(FieldValue::Int64(v))
+                    } else if let Ok(v) = item.extract::<u32>() {
+                        Ok(FieldValue::UInt32(v))
+                    } else if let Ok(v) = item.extract::<u64>() {
+                        Ok(FieldValue::UInt64(v))
+                    } else if let Ok(v) = item.extract::<f32>() {
+                        Ok(FieldValue::Float(v))
+                    } else if let Ok(v) = item.extract::<f64>() {
+                        Ok(FieldValue::Float64(v))
+                    } else {
+                        Err(PyValueError::new_err(format!(
+                            "unsupported array element for '{key}'"
+                        )))
+                    }
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            FieldValue::Array(items)
         } else {
             return Err(PyValueError::new_err(format!(
                 "unsupported field value for '{key}'"

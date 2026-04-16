@@ -258,3 +258,59 @@ class TestDocConstructor:
         a = Doc(id="1", fields={"x": 1}, vectors={"v": [1.0]})
         b = Doc(id="1", fields={"x": 1}, vectors={"v": [1.0]})
         assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Array dtype round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestArrayDtypeRoundTrip:
+    VEC = {"vec": [0.1, 0.2, 0.3]}
+
+    def test_array_string(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("tags", DataType.STRING, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"tags": ["a", "b", "c"]}, vectors=self.VEC))
+        assert got.field("tags") == ["a", "b", "c"]
+
+    def test_array_int64(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("nums", DataType.INT64, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"nums": [10, 20, 30]}, vectors=self.VEC))
+        assert got.field("nums") == [10, 20, 30]
+
+    def test_array_int32(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("nums", DataType.INT32, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"nums": [1, 2, 3]}, vectors=self.VEC))
+        assert got.field("nums") == [1, 2, 3]
+
+    def test_array_float(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("scores", DataType.FLOAT, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"scores": [1.0, 2.0, 3.0]}, vectors=self.VEC))
+        assert got.field("scores") == [1.0, 2.0, 3.0]
+
+    def test_array_float64(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("vals", DataType.FLOAT64, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"vals": [1.5, 2.5, 3.5]}, vectors=self.VEC))
+        assert got.field("vals") == [1.5, 2.5, 3.5]
+
+    def test_array_bool(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("flags", DataType.BOOL, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"flags": [True, False, True]}, vectors=self.VEC))
+        assert got.field("flags") == [True, False, True]
+
+    def test_array_mixed_with_scalar_fields(self, tmp_path):
+        col = _make_col(tmp_path, [
+            FieldSchema("name", DataType.STRING),
+            FieldSchema("tags", DataType.STRING, array=True),
+            FieldSchema("nums", DataType.INT64, array=True),
+        ])
+        doc = Doc(id="1", fields={"name": "test", "tags": ["x", "y"], "nums": [1, 2]}, vectors=self.VEC)
+        got = _insert_and_fetch(col, doc)
+        assert got.field("name") == "test"
+        assert got.field("tags") == ["x", "y"]
+        assert got.field("nums") == [1, 2]
+
+    def test_array_field_has_field(self, tmp_path):
+        col = _make_col(tmp_path, [FieldSchema("tags", DataType.STRING, array=True)])
+        got = _insert_and_fetch(col, Doc(id="1", fields={"tags": ["a"]}, vectors=self.VEC))
+        assert got.has_field("tags") is True
