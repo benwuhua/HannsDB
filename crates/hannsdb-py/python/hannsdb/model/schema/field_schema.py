@@ -123,7 +123,7 @@ class FieldSchema:
 class VectorSchema:
     __slots__ = ("_name", "_data_type", "_dimension", "_index_param")
 
-    def __init__(self, name, data_type, dimension, index_param=None):
+    def __init__(self, name, data_type, dimension=0, index_param=None):
         self._name = str(name)
         self._data_type = _normalize_data_type(data_type)
         self._dimension = int(dimension)
