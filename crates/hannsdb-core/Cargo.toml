@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 hanns-backend = ["hannsdb-index/hanns-backend"]
+lance-storage = ["dep:lance"]
 
 [dependencies]
 arrow.workspace = true
@@ -17,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 log = "0.4"
 hannsdb-index = { path = "../hannsdb-index" }
+lance = { path = "../../../lance/rust/lance", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
