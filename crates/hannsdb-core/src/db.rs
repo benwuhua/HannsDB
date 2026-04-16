@@ -13,8 +13,8 @@ use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
     field_value_to_scalar, validate_documents, validate_schema_primary_vector_descriptor,
     validate_schema_secondary_vector_descriptors, validate_vector_index_descriptor,
-    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
-    VectorFieldSchema,
+    CollectionSchema, Document, DocumentUpdate, FieldType, FieldValue, ScalarFieldSchema,
+    SparseVector, VectorFieldSchema,
 };
 use crate::pk::{PrimaryKeyMode, PrimaryKeyRegistry};
 use crate::query::{
@@ -34,9 +34,9 @@ use crate::segment::index_runtime::{
     CachedSearchState,
 };
 use crate::segment::{
-    append_record_ids, append_records, append_records_f16, load_record_ids, load_records,
-    load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentManager, SegmentMetadata,
-    SegmentPaths, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
+    append_record_ids, append_records, append_records_f16, append_sparse_vectors, load_record_ids,
+    load_records, load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentManager,
+    SegmentMetadata, SegmentPaths, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
 };
 use crate::storage::paths::{
     collection_paths_for_dir, collection_paths_for_root, manifest_path, wal_path, CollectionPaths,
@@ -989,6 +989,12 @@ impl HannsDb {
         let mut compacted_records = Vec::new();
         let mut compacted_payloads = Vec::new();
         let mut compacted_vectors = Vec::new();
+        let mut compacted_sparse = Vec::new();
+
+        let has_sparse = collection_meta
+            .vectors
+            .iter()
+            .any(|v| matches!(v.data_type, FieldType::VectorSparse));
 
         for segment_id in &immutable_segment_ids {
             let segment_dir = paths.segments_dir.join(segment_id);
@@ -1021,6 +1027,12 @@ impl HannsDb {
             )?;
             let segment_tombstone = TombstoneMask::load_from_path(&segment_paths.tombstones)?;
 
+            let segment_sparse = if has_sparse {
+                load_sparse_vectors_or_empty(&segment_paths.sparse_vectors, segment_external_ids.len())?
+            } else {
+                vec![BTreeMap::new(); segment_external_ids.len()]
+            };
+
             if segment_external_ids
                 .len()
                 .saturating_mul(collection_meta.dimension)
@@ -1043,6 +1055,9 @@ impl HannsDb {
                 compacted_ids.push(segment_external_ids[row_idx]);
                 compacted_payloads.push(segment_payloads[row_idx].clone());
                 compacted_vectors.push(segment_vectors[row_idx].clone());
+                if has_sparse {
+                    compacted_sparse.push(segment_sparse[row_idx].clone());
+                }
             }
         }
 
@@ -1078,6 +1093,9 @@ impl HannsDb {
             &collection_meta.vectors,
             &collection_meta.primary_vector,
         )?;
+        if has_sparse && !compacted_sparse.is_empty() {
+            append_sparse_vectors(&compacted_paths.sparse_vectors, &compacted_sparse)?;
+        }
         TombstoneMask::new(compacted_ids.len()).save_to_path(&compacted_paths.tombstones)?;
         let mut compacted_meta = SegmentMetadata::new(
             compacted_segment_id.clone(),
