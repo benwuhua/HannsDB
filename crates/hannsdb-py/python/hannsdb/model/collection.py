@@ -289,6 +289,34 @@ def _coerce_scalar_value_for_field_schema(value, field_schema):
     return value
 
 
+def _validate_doc_nullable_fields(doc, schema: CollectionSchema | None, *, is_insert: bool) -> None:
+    """Raise ValueError if the doc violates nullable=False constraints.
+
+    For inserts/upserts (is_insert=True) every nullable=False field must be
+    present and non-None.  For partial updates (is_insert=False) only
+    explicitly-provided nullable=False fields are checked — missing ones are
+    allowed because they will be filled from the existing stored document.
+    """
+    if schema is None:
+        return
+    fields = getattr(doc, "fields", {}) or {}
+    for field_schema in schema.fields:
+        if field_schema.nullable:
+            continue
+        name = field_schema.name
+        if name in fields:
+            if fields[name] is None:
+                raise ValueError(
+                    f"doc validate failed: field[{name}] is configured not nullable, "
+                    f"but doc does not contain this field"
+                )
+        elif is_insert:
+            raise ValueError(
+                f"doc validate failed: field[{name}] is configured not nullable, "
+                f"but doc does not contain this field"
+            )
+
+
 def _coerce_doc_to_collection_schema(doc, schema: CollectionSchema | None):
     if schema is None:
         return _wrap_doc(doc)
@@ -653,26 +681,26 @@ class Collection:
             return _wrap_doc_result(self._core.query_context(context))
 
     def insert(self, docs):
-        docs = [
-            _coerce_doc_to_collection_schema(doc, self._schema)
-            for doc in _coerce_docs_input(docs)
-        ]
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
         with self._core_lock:
-            return self._core.insert(_coerce_docs_to_native(docs))
+            return self._core.insert(_coerce_docs_to_native(coerced))
 
     def upsert(self, docs):
-        docs = [
-            _coerce_doc_to_collection_schema(doc, self._schema)
-            for doc in _coerce_docs_input(docs)
-        ]
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
         with self._core_lock:
-            return self._core.upsert(_coerce_docs_to_native(docs))
+            return self._core.upsert(_coerce_docs_to_native(coerced))
 
     def update(self, docs):
-        patches = [
-            _coerce_doc_to_collection_schema(doc, self._schema)
-            for doc in _coerce_docs_input(docs)
-        ]
+        patches = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=False)
+            patches.append(_coerce_doc_to_collection_schema(doc, self._schema))
         ids = [doc.id for doc in patches]
         unique_ids = list(dict.fromkeys(ids))
         with self._core_lock:

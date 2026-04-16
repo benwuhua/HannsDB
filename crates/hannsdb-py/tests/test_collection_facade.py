@@ -750,7 +750,7 @@ def test_real_collection_query_matches_manual_ground_truth_for_filtered_typed_su
         primary_vector="dense",
         fields=[
             hannsdb.FieldSchema(name="group", data_type="int64"),
-            hannsdb.FieldSchema(name="color", data_type="string"),
+            hannsdb.FieldSchema(name="color", data_type="string", nullable=True),
         ],
         vectors=[
             hannsdb.VectorSchema(
@@ -3804,3 +3804,82 @@ def test_vector_query_has_id_and_has_vector():
     assert vq_vec.has_id() is False
     assert vq_vec.has_vector() is True
 
+
+# ---------------------------------------------------------------------------
+# Nullable field enforcement at insert / upsert / update
+# ---------------------------------------------------------------------------
+
+def _make_nullable_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="nullable_test",
+        primary_vector="vec",
+        fields=[
+            hannsdb.FieldSchema(name="required", data_type="string", nullable=False),
+            hannsdb.FieldSchema(name="optional", data_type="string", nullable=True),
+        ],
+        vectors=[hannsdb.VectorSchema(
+            name="vec",
+            data_type="vector_fp32",
+            dimension=3,
+            index_param=hannsdb.FlatIndexParam(),
+        )],
+    )
+    return hannsdb.create_and_open(str(tmp_path), schema)
+
+
+def test_insert_with_required_field_succeeds(tmp_path):
+    col = _make_nullable_collection(tmp_path)
+    col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": "hello"})])
+    assert col.stats.live_count == 1
+    col.destroy()
+
+
+def test_insert_without_required_field_raises(tmp_path):
+    import pytest
+    col = _make_nullable_collection(tmp_path)
+    with pytest.raises(ValueError, match="not nullable"):
+        col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={})])
+    col.destroy()
+
+
+def test_insert_with_required_field_as_none_raises(tmp_path):
+    import pytest
+    col = _make_nullable_collection(tmp_path)
+    with pytest.raises(ValueError, match="not nullable"):
+        col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": None})])
+    col.destroy()
+
+
+def test_insert_missing_optional_field_succeeds(tmp_path):
+    col = _make_nullable_collection(tmp_path)
+    col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": "hello"})])
+    assert col.stats.live_count == 1
+    col.destroy()
+
+
+def test_update_with_required_field_as_none_raises(tmp_path):
+    import pytest
+    col = _make_nullable_collection(tmp_path)
+    col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": "hello"})])
+    with pytest.raises(ValueError, match="not nullable"):
+        col.update([hannsdb.Doc(id="1", fields={"required": None})])
+    col.destroy()
+
+
+def test_update_partial_patch_omitting_required_field_succeeds(tmp_path):
+    col = _make_nullable_collection(tmp_path)
+    col.insert([hannsdb.Doc(id="1", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": "hello"})])
+    col.update([hannsdb.Doc(id="1", fields={"optional": "world"})])
+    fetched = col.fetch("1")
+    assert fetched.fields["required"] == "hello"
+    assert fetched.fields.get("optional") == "world"
+    col.destroy()
+
+
+def test_fetch_with_nonexistent_string_ids_returns_only_found(tmp_path):
+    col = _make_nullable_collection(tmp_path)
+    col.insert([hannsdb.Doc(id="exists", vectors={"vec": [1.0, 0.0, 0.0]}, fields={"required": "hi"})])
+    results = col.fetch(["exists", "ghost", "phantom"])
+    assert len(results) == 1
+    assert results[0].id == "exists"
+    col.destroy()
