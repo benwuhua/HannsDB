@@ -94,6 +94,8 @@ pub fn append_wal_record(path: &Path, record: &WalRecord) -> io::Result<()> {
     writer.write_all(encoded.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
+    // fsync to ensure the WAL entry survives power loss / kernel panic.
+    writer.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -124,7 +126,18 @@ pub fn load_wal_records(path: &Path) -> io::Result<Vec<WalRecord>> {
                 // Skip only this tail line, and keep strict parsing for earlier lines.
                 break;
             }
-            Err(err) => return Err(json_to_io_error(err)),
+            Err(err) => {
+                // A corrupted mid-file line can happen from bad sectors or partial page writes.
+                // Rather than making the database unopenable, log a warning and stop reading.
+                // We keep all records parsed so far and discard the rest of the WAL.
+                eprintln!(
+                    "warning: corrupted WAL line {} ({}), stopping replay at that point: {}",
+                    idx + 1,
+                    line.len().min(80),
+                    err
+                );
+                break;
+            }
         }
     }
     Ok(records)
@@ -141,6 +154,7 @@ pub fn truncate_wal(path: &Path) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.set_len(0)?;
     file.seek(io::SeekFrom::Start(0))?;
+    file.sync_all()?;
     Ok(())
 }
 

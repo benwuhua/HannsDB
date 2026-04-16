@@ -39,6 +39,8 @@ use crate::segment::{
     SegmentMetadata, SegmentPaths, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
 };
 use crate::storage::compaction::compact_immutable_segments;
+use crate::storage::persist;
+use crate::storage::tombstone;
 use crate::storage::paths::{
     collection_paths_for_dir, collection_paths_for_root, manifest_path, wal_path, CollectionPaths,
 };
@@ -48,7 +50,6 @@ use crate::storage::primary_keys::{
 };
 use crate::storage::recovery::{collection_name_for_wal_record, WalReplayPlan};
 use crate::storage::segment_io::{
-    invalidate_forward_store_snapshot, latest_live_row_index, latest_row_index_for_id,
     load_external_ids_for_segment_or_empty, load_payloads_or_empty,
     load_payloads_with_fields_or_empty, load_primary_dense_rows_for_segment_or_empty,
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
@@ -1446,7 +1447,6 @@ impl HannsDb {
         log_wal: bool,
     ) -> io::Result<usize> {
         let paths = self.collection_paths(collection);
-        let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
 
         if log_wal {
             append_wal_record(
@@ -1458,53 +1458,14 @@ impl HannsDb {
             )?;
         }
 
-        let mut newly_deleted = 0usize;
-        let mut remaining_ids = external_ids.iter().copied().collect::<HashSet<_>>();
-
-        for segment in segment_paths {
-            if remaining_ids.is_empty() {
-                break;
-            }
-
-            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let stored_ids = load_external_ids_for_segment_or_empty(&segment, &segment_meta)?;
-            if stored_ids.is_empty() {
-                continue;
-            }
-            let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-            let mut segment_changed = false;
-            let row_limit = segment_meta.record_count.min(stored_ids.len());
-            let stored_ids = &stored_ids[..row_limit];
-            let ids_to_check = remaining_ids.iter().copied().collect::<Vec<_>>();
-
-            for external_id in ids_to_check {
-                let Some(row_idx) = latest_row_index_for_id(stored_ids, external_id) else {
-                    continue;
-                };
-                remaining_ids.remove(&external_id);
-                if tombstone.is_deleted(row_idx) {
-                    continue;
-                }
-                if tombstone.mark_deleted(row_idx) {
-                    newly_deleted += 1;
-                    segment_changed = true;
-                }
-            }
-
-            if segment_changed {
-                segment_meta.deleted_count = tombstone.deleted_count();
-                segment_meta.save_to_path(&segment.metadata)?;
-                tombstone.save_to_path(&segment.tombstones)?;
-                invalidate_forward_store_snapshot(&segment)?;
-            }
-        }
+        let result = tombstone::mark_ids_deleted(&paths, external_ids)?;
 
         invalidate_ann_blobs(&paths.dir)?;
         if self.should_auto_compact(collection)? {
             self.compact_collection_internal(collection, true)?;
         }
         self.invalidate_search_cache(collection);
-        Ok(newly_deleted)
+        Ok(result.deleted_count)
     }
 
     fn collect_latest_live_filtered_ids(
@@ -1625,47 +1586,7 @@ impl HannsDb {
         paths: &CollectionPaths,
         external_ids: &[i64],
     ) -> io::Result<()> {
-        if external_ids.is_empty() {
-            return Ok(());
-        }
-
-        let segment_paths = SegmentManager::new(paths.dir.clone()).segment_paths()?;
-        let mut remaining_ids = external_ids.iter().copied().collect::<HashSet<_>>();
-
-        for segment in segment_paths {
-            if remaining_ids.is_empty() {
-                break;
-            }
-
-            let mut segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-            let stored_ids = load_external_ids_for_segment_or_empty(&segment, &segment_meta)?;
-            if stored_ids.is_empty() {
-                continue;
-            }
-            let mut tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-            let mut segment_changed = false;
-            let row_limit = segment_meta.record_count.min(stored_ids.len());
-            let stored_ids = &stored_ids[..row_limit];
-            let ids_to_check = remaining_ids.iter().copied().collect::<Vec<_>>();
-
-            for external_id in ids_to_check {
-                let Some(row_idx) = latest_live_row_index(stored_ids, &tombstone, external_id)
-                else {
-                    continue;
-                };
-                remaining_ids.remove(&external_id);
-                if tombstone.mark_deleted(row_idx) {
-                    segment_changed = true;
-                }
-            }
-
-            if segment_changed {
-                segment_meta.deleted_count = tombstone.deleted_count();
-                segment_meta.save_to_path(&segment.metadata)?;
-                tombstone.save_to_path(&segment.tombstones)?;
-            }
-        }
-
+        tombstone::mark_live_ids_deleted_across_segments(paths, external_ids)?;
         Ok(())
     }
 
@@ -2073,34 +1994,26 @@ impl CollectionHandle {
 
             #[cfg(feature = "hanns-backend")]
             if let Some(ref bytes) = blob_bytes {
-                let blob_path = ann_blob_path(&paths.dir, field_name);
-                if let Some(parent) = blob_path.parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        log::warn!("Failed to create ANN dir for field '{}': {e}", field_name);
-                        cache.insert(state.field_name.clone(), state);
-                        continue;
-                    }
-                }
-                if let Err(e) = fs::write(&blob_path, &bytes) {
-                    log::warn!("Failed to persist ANN index for '{}': {e}", field_name);
-                } else {
-                    log::info!(
-                        "Persisted ANN index ({} bytes) for field '{}' in collection '{}'",
-                        bytes.len(),
+                if let Some(ref ann) = state.optimized_ann {
+                    match persist::persist_ann_blob(
+                        &paths.dir,
                         field_name,
-                        collection_name
-                    );
-                    // Persist external IDs alongside the blob so the ANN can be
-                    // loaded without the original records.bin / ids.bin files.
-                    if let Some(ref ann) = state.optimized_ann {
-                        let ids_path = ann_ids_path(&paths.dir, field_name);
-                        let ids_bytes: Vec<u8> = ann
-                            .ann_external_ids
-                            .iter()
-                            .flat_map(|id| id.to_le_bytes())
-                            .collect();
-                        if let Err(e) = fs::write(&ids_path, &ids_bytes) {
-                            log::warn!("Failed to persist ANN ids for '{}': {e}", field_name);
+                        bytes,
+                        &ann.ann_external_ids,
+                    ) {
+                        Ok(()) => {
+                            log::info!(
+                                "Persisted ANN index ({} bytes) for field '{}' in collection '{}'",
+                                bytes.len(),
+                                field_name,
+                                collection_name
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to persist ANN index for '{}': {e}",
+                                field_name
+                            );
                         }
                     }
                 }
@@ -2115,169 +2028,47 @@ impl CollectionHandle {
         // Build scalar indexes for fields that have descriptors in the catalog.
         if !index_catalog.scalar_indexes.is_empty() {
             let segment_paths = self.segment_manager.segment_paths()?;
-            let mut all_payloads: Vec<BTreeMap<String, FieldValue>> = Vec::new();
-            let mut all_ids: Vec<i64> = Vec::new();
-            for segment in &segment_paths {
-                let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-                let stored_ids = load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
-                let payloads = load_payloads_or_empty(&segment, &segment_meta, stored_ids.len())?;
-                let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-                for (row_idx, ext_id) in stored_ids.iter().enumerate() {
-                    if tombstone.is_deleted(row_idx) {
-                        continue;
-                    }
-                    all_payloads.push(payloads[row_idx].clone());
-                    all_ids.push(*ext_id);
-                }
-            }
-
-            // Convert FieldValue payloads to ScalarValue payloads once.
-            let scalar_payloads: Vec<BTreeMap<String, ScalarValue>> = all_payloads
-                .iter()
-                .map(|map| {
-                    map.iter()
-                        .map(|(k, v)| (k.clone(), field_value_to_scalar(v)))
-                        .collect()
-                })
-                .collect();
+            let scalar_indexes = persist::build_scalar_indexes_from_segments(
+                &segment_paths,
+                &index_catalog.scalar_indexes,
+            )?;
 
             let mut scalar_cache = self
                 .scalar_cache
                 .lock()
                 .expect("scalar cache mutex poisoned");
-            for scalar_descriptor in &index_catalog.scalar_indexes {
-                let field_name = &scalar_descriptor.field_name;
-                let index = InvertedScalarIndex::build_from_payloads(
-                    scalar_descriptor.clone(),
-                    field_name,
-                    &scalar_payloads,
-                    &all_ids,
-                );
+            for (field_name, index) in scalar_indexes {
                 log::info!(
                     "Built scalar index for field '{}' in collection '{}' ({} indexed IDs)",
                     field_name,
                     collection_name,
                     index.all_indexed_ids().len(),
                 );
-                scalar_cache.insert(field_name.clone(), index);
+                scalar_cache.insert(field_name, index);
             }
         }
 
         // Build sparse indexes for sparse vector fields.
-        use crate::document::FieldType;
-        use hannsdb_index::descriptor::{SparseIndexDescriptor, SparseIndexKind};
-        use hannsdb_index::factory::DefaultIndexFactory;
+        let segment_paths = self.segment_manager.segment_paths()?;
+        let sparse_indexes = persist::build_sparse_indexes_from_segments(
+            &paths,
+            &segment_paths,
+            &collection_meta,
+        )?;
 
-        let sparse_fields: Vec<_> = collection_meta
-            .vectors
-            .iter()
-            .filter(|v| v.data_type == FieldType::VectorSparse)
-            .collect();
-
-        if !sparse_fields.is_empty() {
-            let segment_paths = self.segment_manager.segment_paths()?;
-
-            for vector_schema in &sparse_fields {
-                let field_name = &vector_schema.name;
-                let mut all_sparse: Vec<(i64, SparseVectorData)> = Vec::new();
-                let mut shadowed: HashSet<i64> = HashSet::new();
-
-                for segment in &segment_paths {
-                    let segment_meta = SegmentMetadata::load_from_path(&segment.metadata)?;
-                    let stored_ids =
-                        load_external_ids_for_segment_or_empty(segment, &segment_meta)?;
-                    let sparse_rows =
-                        load_sparse_vectors_or_empty(&segment.sparse_vectors, stored_ids.len())?;
-                    let tombstone = TombstoneMask::load_from_path(&segment.tombstones)?;
-
-                    for row_idx in (0..stored_ids.len()).rev() {
-                        let ext_id = stored_ids[row_idx];
-                        if !shadowed.insert(ext_id) {
-                            continue;
-                        }
-                        if tombstone.is_deleted(row_idx) {
-                            continue;
-                        }
-                        if let Some(sv) = sparse_rows[row_idx].get(field_name) {
-                            all_sparse.push((
-                                ext_id,
-                                SparseVectorData::new(sv.indices.clone(), sv.values.clone()),
-                            ));
-                        }
-                    }
-                }
-
-                if all_sparse.is_empty() {
-                    continue;
-                }
-
-                let descriptor = SparseIndexDescriptor {
-                    field_name: field_name.clone(),
-                    kind: SparseIndexKind::SparseInverted,
-                    metric: Some("ip".to_string()),
-                    params: serde_json::Value::Object(serde_json::Map::new()),
-                };
-
-                let factory = DefaultIndexFactory::default();
-                let mut index = factory
-                    .create_sparse_index(&descriptor, None)
-                    .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("sparse index create: {e:?}"))
-                    })?;
-
-                index.add(&all_sparse).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("sparse index build: {e:?}"))
-                })?;
-
-                // Pass BM25 params from the vector field schema to the sparse index.
-                if let Some(bm25_params) = &vector_schema.bm25_params {
-                    index.set_bm25_params(bm25_params.k1, bm25_params.b, bm25_params.avgdl);
-                    log::info!(
-                        "Set BM25 params (k1={}, b={}, avgdl={}) on sparse index for field '{}' in collection '{}'",
-                        bm25_params.k1, bm25_params.b, bm25_params.avgdl,
-                        field_name,
-                        collection_name,
-                    );
-                }
-
+        if !sparse_indexes.is_empty() {
+            let mut sparse_cache = self
+                .sparse_index_cache
+                .lock()
+                .expect("sparse index cache mutex poisoned");
+            for (field_name, index) in sparse_indexes {
                 log::info!(
                     "Built sparse index for field '{}' in collection '{}' ({} vectors)",
                     field_name,
                     collection_name,
                     index.len(),
                 );
-
-                // Persist to disk.
-                if let Ok(Some(bytes)) = index.serialize_to_bytes() {
-                    let blob_path = paths
-                        .dir
-                        .join("ann")
-                        .join(format!("{field_name}.sparse.bin"));
-                    if let Some(parent) = blob_path.parent() {
-                        if let Err(e) = fs::create_dir_all(parent) {
-                            log::warn!(
-                                "Failed to create ANN dir for sparse field '{}': {e}",
-                                field_name
-                            );
-                        }
-                    }
-                    if let Err(e) = fs::write(&blob_path, &bytes) {
-                        log::warn!("Failed to persist sparse index for '{}': {e}", field_name);
-                    } else {
-                        log::info!(
-                            "Persisted sparse index ({} bytes) for field '{}' in collection '{}'",
-                            bytes.len(),
-                            field_name,
-                            collection_name
-                        );
-                    }
-                }
-
-                let mut sparse_cache = self
-                    .sparse_index_cache
-                    .lock()
-                    .expect("sparse index cache mutex poisoned");
-                sparse_cache.insert(field_name.clone(), index);
+                sparse_cache.insert(field_name, index);
             }
         }
 
@@ -3012,104 +2803,22 @@ impl CollectionHandle {
         #[cfg(feature = "hanns-backend")]
         {
             let paths = self.collection_paths();
-            let collection_name = self.segment_manager.collection_name().to_string();
             let collection_meta = CollectionMetadata::load_from_path(&paths.collection_meta)?;
             let index_catalog = IndexCatalog::load_from_path(&paths.index_catalog)?;
-            let descriptor =
-                resolve_vector_descriptor_for_field(&collection_meta, &index_catalog, field_name)?
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "no descriptor for field")
-                    })?;
 
-            // Try new per-field path first
-            let new_path = ann_blob_path(&paths.dir, field_name);
-            // Fall back to legacy single-file path for primary field
-            let primary_name = &collection_meta.primary_vector;
-            let legacy_path = paths.dir.join(HNSW_INDEX_FILE);
-            let is_primary = field_name == primary_name;
-
-            let blob_path = if new_path.exists() {
-                new_path
-            } else if is_primary && legacy_path.exists() {
-                legacy_path
-            } else {
-                return Ok(None);
+            // Prepare fallback external IDs from segment data.
+            let fallback_ids = {
+                let state = self.load_search_state_for_field(field_name)?;
+                Arc::clone(&state.external_ids)
             };
 
-            let vector_schema = collection_meta
-                .vectors
-                .iter()
-                .find(|v| v.name == field_name)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("vector field '{}' not found", field_name),
-                    )
-                })?;
-
-            let metric_lc = descriptor
-                .metric
-                .clone()
-                .unwrap_or_else(|| collection_meta.metric.clone())
-                .to_ascii_lowercase();
-
-            match fs::read(&blob_path).and_then(|bytes| {
-                hannsdb_index::factory::DefaultIndexFactory::default()
-                    .create_vector_index(vector_schema.dimension, &descriptor, Some(&bytes))
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{err:?}")))
-            }) {
-                Ok(backend) => {
-                    // Try to load persisted external IDs (avoids needing records.bin).
-                    let ids_file = ann_ids_path(&paths.dir, field_name);
-                    let ann_external_ids = if ids_file.exists() {
-                        let raw = fs::read(&ids_file)?;
-                        let ids: Vec<i64> = raw
-                            .chunks_exact(8)
-                            .map(|chunk| {
-                                let buf: [u8; 8] = chunk.try_into().expect("chunk size");
-                                i64::from_le_bytes(buf)
-                            })
-                            .collect();
-                        Arc::new(ids)
-                    } else {
-                        // Legacy: fall back to loading from segment data.
-                        let state = self.load_search_state_for_field(field_name)?;
-                        Arc::clone(&state.external_ids)
-                    };
-
-                    let state = CachedSearchState {
-                        records: Arc::new(Vec::new()),
-                        external_ids: Arc::clone(&ann_external_ids),
-                        tombstone: Arc::new(TombstoneMask::new(0)),
-                        dimension: vector_schema.dimension,
-                        metric: metric_lc.clone(),
-                        field_name: field_name.to_string(),
-                        descriptor,
-                        optimized_ann: Some(OptimizedAnnState {
-                            backend: Arc::from(backend),
-                            ann_external_ids,
-                            metric: metric_lc,
-                        }),
-                    };
-
-                    log::info!(
-                        "Loaded persisted ANN index for field '{}' in '{}' from '{}'",
-                        field_name,
-                        collection_name,
-                        blob_path.display()
-                    );
-                    Ok(Some(state))
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to load persisted ANN for field '{}' in '{}' from '{}': {e}",
-                        field_name,
-                        collection_name,
-                        blob_path.display()
-                    );
-                    Ok(None)
-                }
-            }
+            persist::load_persisted_ann_from_disk(
+                &paths,
+                &collection_meta,
+                &index_catalog,
+                field_name,
+                fallback_ids,
+            )
         }
     }
 

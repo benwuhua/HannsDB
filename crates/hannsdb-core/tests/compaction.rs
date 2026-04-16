@@ -10,7 +10,7 @@ use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, write_payloads_arrow, SegmentMetadata,
     SegmentSet, TombstoneMask,
 };
-use hannsdb_core::wal::truncate_wal;
+use hannsdb_core::wal::{append_wal_record, truncate_wal, WalRecord};
 
 fn doc(id: i64, vector: Vec<f32>) -> Document {
     Document::new(id, Vec::<(String, FieldValue)>::new(), vector)
@@ -675,4 +675,99 @@ fn compaction_triggered_by_upsert_auto_compact() {
         .fetch_documents("test", &[11])
         .expect("fetch upserted doc");
     assert_eq!(fetched.len(), 1, "upserted doc should be fetchable");
+}
+
+// ---------------------------------------------------------------------------
+// Crash-during-compaction recovery via WAL replay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compaction_crash_during_compaction_recovers_via_wal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let mut db = HannsDb::open(root).expect("open db");
+
+    let schema = CollectionSchema::new("vector", 2, "l2", vec![]);
+    db.create_collection_with_schema("test", &schema)
+        .expect("create collection");
+
+    let segments_dir = collection_segments_dir(root, "test");
+
+    // Write 2 immutable segments with real data
+    write_segment(
+        &segments_dir.join("seg-000001"),
+        "seg-000001",
+        2,
+        &[doc(1, vec![0.0, 0.0]), doc(2, vec![1.0, 0.0])],
+        &[],
+    );
+    write_segment(
+        &segments_dir.join("seg-000002"),
+        "seg-000002",
+        2,
+        &[doc(3, vec![0.0, 1.0]), doc(4, vec![2.0, 0.0])],
+        &[],
+    );
+
+    // Active segment (empty, just to hold the active slot)
+    let active_dir = segments_dir.join("seg-000003");
+    std::fs::create_dir_all(&active_dir).expect("create active dir");
+    SegmentMetadata::new("seg-000003", 2, 0, 0)
+        .save_to_path(&active_dir.join("segment.json"))
+        .expect("write active segment meta");
+    TombstoneMask::new(0)
+        .save_to_path(&active_dir.join("tombstones.json"))
+        .expect("write active tombstones");
+
+    SegmentSet {
+        active_segment_id: "seg-000003".to_string(),
+        immutable_segment_ids: vec!["seg-000001".to_string(), "seg-000002".to_string()],
+    }
+    .save_to_path(
+        &root
+            .join("collections")
+            .join("test")
+            .join("segment_set.json"),
+    )
+    .expect("write segment_set");
+
+    // Truncate any WAL records from collection creation
+    truncate_wal(&root.join("wal.jsonl")).expect("truncate wal before crash simulation");
+
+    // Simulate crash-during-compaction: write a CompactCollection WAL record
+    // but do NOT actually compact (as if the process died before compacting).
+    append_wal_record(
+        &root.join("wal.jsonl"),
+        &WalRecord::CompactCollection {
+            collection_name: "test".to_string(),
+            compacted_segment_id: "compact-crash".to_string(),
+        },
+    )
+    .expect("append wal");
+
+    // Drop the db (simulating crash) and reopen
+    drop(db);
+    let mut db = HannsDb::open(root).expect("reopen db after simulated crash");
+
+    // WAL replay should have handled the incomplete compaction gracefully.
+    // The original immutable segments should still be searchable (either
+    // WAL replay re-compacted them, or they survived as-is).
+    let hits = db
+        .search("test", &[0.0, 0.0], 10)
+        .expect("search after crash recovery");
+    let hit_ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
+    assert_eq!(
+        hit_ids, vec![1, 2, 3, 4],
+        "all 4 docs should be searchable after crash-during-compaction recovery"
+    );
+
+    // Verify fetch_documents also works
+    let fetched = db
+        .fetch_documents("test", &[1, 2, 3, 4])
+        .expect("fetch after crash recovery");
+    let fetched_ids: Vec<i64> = fetched.iter().map(|doc| doc.id).collect();
+    assert_eq!(
+        fetched_ids, vec![1, 2, 3, 4],
+        "all 4 docs should be fetchable after crash-during-compaction recovery"
+    );
 }
