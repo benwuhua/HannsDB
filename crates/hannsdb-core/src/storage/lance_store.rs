@@ -2,14 +2,15 @@ use std::io;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
+use crate::query::{distance_by_metric, SearchHit};
 use crate::storage::lance_schema::arrow_schema_for_lance;
 
 pub struct LanceDatasetStore {
@@ -37,6 +38,59 @@ impl LanceDatasetStore {
         Dataset::open(self.uri.as_str()).await.map_err(lance_to_io)
     }
 
+    pub async fn read_all_documents(&self) -> io::Result<Vec<Document>> {
+        let dataset = self.open_lance().await?;
+        let batch = dataset.scan().try_into_batch().await.map_err(lance_to_io)?;
+        documents_from_lance_batch(&self.schema, &batch)
+    }
+
+    pub async fn fetch(&self, ids: &[i64]) -> io::Result<Vec<Document>> {
+        let documents = self.read_all_documents().await?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| {
+                documents
+                    .iter()
+                    .find(|document| document.id == *id)
+                    .cloned()
+            })
+            .collect())
+    }
+
+    pub async fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        let primary_vector = self.schema.primary_vector_name();
+        let mut hits = Vec::new();
+        for document in self.read_all_documents().await? {
+            let vector = document.primary_vector_for(primary_vector).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "document {} is missing primary vector {primary_vector}",
+                        document.id
+                    ),
+                )
+            })?;
+            hits.push(SearchHit {
+                id: document.id,
+                distance: distance_by_metric(query, vector, metric)?,
+            });
+        }
+        hits.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if hits.len() > top_k {
+            hits.truncate(top_k);
+        }
+        Ok(hits)
+    }
+
     async fn write(&self, documents: &[Document], mode: WriteMode) -> io::Result<()> {
         let batch = documents_to_lance_batch(&self.schema, documents)?;
         let schema = batch.schema();
@@ -50,6 +104,60 @@ impl LanceDatasetStore {
             .map(|_| ())
             .map_err(lance_to_io)
     }
+}
+
+pub fn documents_from_lance_batch(
+    schema: &CollectionSchema,
+    batch: &RecordBatch,
+) -> io::Result<Vec<Document>> {
+    let id_column = batch.column_by_name("id").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Lance batch missing id column")
+    })?;
+    let ids = id_column
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Lance id column is not Int64")
+        })?;
+
+    let mut documents = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        let mut fields = Vec::with_capacity(schema.fields.len());
+        for scalar in &schema.fields {
+            let column = batch.column_by_name(&scalar.name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Lance batch missing scalar column {}", scalar.name),
+                )
+            })?;
+            fields.push((
+                scalar.name.clone(),
+                field_value_from_column(column, row_idx, &scalar.data_type)?,
+            ));
+        }
+
+        let mut vectors = Vec::with_capacity(schema.vectors.len());
+        for vector_schema in &schema.vectors {
+            let column = batch.column_by_name(&vector_schema.name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Lance batch missing vector column {}", vector_schema.name),
+                )
+            })?;
+            vectors.push((
+                vector_schema.name.clone(),
+                vector_from_column(column, row_idx, vector_schema.dimension)?,
+            ));
+        }
+
+        documents.push(Document {
+            id: ids.value(row_idx),
+            fields: fields.into_iter().collect(),
+            vectors: vectors.into_iter().collect(),
+            sparse_vectors: Default::default(),
+        });
+    }
+    Ok(documents)
 }
 
 pub fn documents_to_lance_batch(
@@ -227,6 +335,103 @@ fn required_field<'a>(document: &'a Document, field_name: &str) -> io::Result<&'
             ),
         )
     })
+}
+
+fn field_value_from_column(
+    column: &ArrayRef,
+    row_idx: usize,
+    data_type: &FieldType,
+) -> io::Result<FieldValue> {
+    if column.is_null(row_idx) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "null Lance values are not supported by Lance storage P1",
+        ));
+    }
+    match data_type {
+        FieldType::String => column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|array| FieldValue::String(array.value(row_idx).to_string()))
+            .ok_or_else(|| column_type_error("String")),
+        FieldType::Int64 => column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|array| FieldValue::Int64(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("Int64")),
+        FieldType::Int32 => column
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|array| FieldValue::Int32(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("Int32")),
+        FieldType::UInt32 => column
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|array| FieldValue::UInt32(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("UInt32")),
+        FieldType::UInt64 => column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|array| FieldValue::UInt64(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("UInt64")),
+        FieldType::Float => column
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|array| FieldValue::Float(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("Float")),
+        FieldType::Float64 => column
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|array| FieldValue::Float64(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("Float64")),
+        FieldType::Bool => column
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|array| FieldValue::Bool(array.value(row_idx)))
+            .ok_or_else(|| column_type_error("Bool")),
+        FieldType::VectorFp32 | FieldType::VectorFp16 | FieldType::VectorSparse => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vector field type cannot be decoded as scalar column",
+            ))
+        }
+    }
+}
+
+fn vector_from_column(column: &ArrayRef, row_idx: usize, dimension: usize) -> io::Result<Vec<f32>> {
+    if column.is_null(row_idx) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "null Lance vector values are not supported by Lance storage P1",
+        ));
+    }
+    let list = column
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| column_type_error("FixedSizeList<Float32>"))?;
+    let values = list.value(row_idx);
+    let values = values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| column_type_error("Float32 vector values"))?;
+    let vector = values.values().to_vec();
+    if vector.len() != dimension {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Lance vector dimension mismatch: expected {dimension}, got {}",
+                vector.len()
+            ),
+        ));
+    }
+    Ok(vector)
+}
+
+fn column_type_error(expected: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Lance column type mismatch: expected {expected}"),
+    )
 }
 
 fn type_mismatch<T>(field_name: &str, expected: &str, actual: &FieldValue) -> io::Result<T> {

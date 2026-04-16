@@ -103,3 +103,49 @@ async fn lance_dataset_store_append_is_visible_to_lance_scan() {
     assert!(batch.schema().field_with_name("title").is_ok());
     assert!(batch.schema().field_with_name("dense").is_ok());
 }
+
+#[tokio::test]
+async fn lance_dataset_store_fetches_documents_from_lance_dataset() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema());
+    store
+        .create(&sample_documents())
+        .await
+        .expect("create lance dataset");
+
+    let fetched = store.fetch(&[20, 10]).await.expect("fetch from lance");
+
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        vec![20, 10]
+    );
+    assert_eq!(
+        fetched[0].fields.get("title"),
+        Some(&FieldValue::String("beta".to_string()))
+    );
+    assert_eq!(fetched[0].vectors.get("dense"), Some(&vec![4.0, 5.0, 6.0]));
+}
+
+#[tokio::test]
+async fn lance_dataset_store_bruteforce_searches_lance_vectors() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema());
+    store
+        .create(&sample_documents())
+        .await
+        .expect("create lance dataset");
+
+    let hits = store
+        .search(&[4.0, 5.0, 6.0], 1, "l2")
+        .await
+        .expect("search lance dataset");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 20);
+    assert_eq!(hits[0].distance, 0.0);
+}
