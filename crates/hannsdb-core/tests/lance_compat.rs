@@ -188,3 +188,75 @@ async fn lance_collection_facade_supports_basic_insert_fetch_and_search() {
         .expect("search collection");
     assert_eq!(hits[0].id, 10);
 }
+
+#[tokio::test]
+async fn lance_collection_delete_documents_hides_rows_from_lance_and_facade() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let collection =
+        LanceCollection::create(temp.path(), "docs", sample_schema(), &sample_documents())
+            .await
+            .expect("create lance collection facade");
+
+    let deleted = collection
+        .delete_documents(&[10])
+        .await
+        .expect("delete document");
+
+    assert_eq!(deleted, 1);
+    assert!(collection.fetch_documents(&[10]).await.unwrap().is_empty());
+    assert_eq!(collection.fetch_documents(&[20]).await.unwrap()[0].id, 20);
+
+    let external = lance::Dataset::open(collection.uri())
+        .await
+        .expect("open facade data with upstream Lance");
+    assert_eq!(external.count_rows(None).await.expect("count live rows"), 1);
+}
+
+#[tokio::test]
+async fn lance_collection_upsert_replaces_existing_and_inserts_new_documents() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let collection =
+        LanceCollection::create(temp.path(), "docs", sample_schema(), &sample_documents())
+            .await
+            .expect("create lance collection facade");
+    let replacements = vec![
+        Document::with_primary_vector_name(
+            20,
+            vec![
+                (
+                    "title".to_string(),
+                    FieldValue::String("beta-v2".to_string()),
+                ),
+                ("year".to_string(), FieldValue::Int64(2026)),
+            ],
+            "dense",
+            vec![7.0, 8.0, 9.0],
+        ),
+        Document::with_primary_vector_name(
+            30,
+            vec![
+                ("title".to_string(), FieldValue::String("gamma".to_string())),
+                ("year".to_string(), FieldValue::Int64(2027)),
+            ],
+            "dense",
+            vec![10.0, 11.0, 12.0],
+        ),
+    ];
+
+    let upserted = collection
+        .upsert_documents(&replacements)
+        .await
+        .expect("upsert documents");
+
+    assert_eq!(upserted, 2);
+    assert!(collection.fetch_documents(&[20]).await.unwrap()[0]
+        .fields
+        .get("title")
+        .is_some_and(|value| value == &FieldValue::String("beta-v2".to_string())));
+    assert_eq!(collection.fetch_documents(&[30]).await.unwrap()[0].id, 30);
+
+    let external = lance::Dataset::open(collection.uri())
+        .await
+        .expect("open facade data with upstream Lance");
+    assert_eq!(external.count_rows(None).await.expect("count live rows"), 3);
+}

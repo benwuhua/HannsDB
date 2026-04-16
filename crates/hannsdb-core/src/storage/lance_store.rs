@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field};
-use lance::dataset::{WriteMode, WriteParams};
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::Dataset;
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
@@ -60,6 +61,14 @@ impl LanceCollection {
         self.store.append(documents).await
     }
 
+    pub async fn delete_documents(&self, ids: &[i64]) -> io::Result<usize> {
+        self.store.delete(ids).await
+    }
+
+    pub async fn upsert_documents(&self, documents: &[Document]) -> io::Result<usize> {
+        self.store.upsert(documents).await
+    }
+
     pub async fn fetch_documents(&self, ids: &[i64]) -> io::Result<Vec<Document>> {
         self.store.fetch(ids).await
     }
@@ -107,6 +116,47 @@ impl LanceDatasetStore {
 
     pub async fn append(&self, documents: &[Document]) -> io::Result<()> {
         self.write(documents, WriteMode::Append).await
+    }
+
+    pub async fn delete(&self, ids: &[i64]) -> io::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut dataset = self.open_lance().await?;
+        let result = dataset
+            .delete(id_predicate(ids).as_str())
+            .await
+            .map_err(lance_to_io)?;
+        usize::try_from(result.num_deleted_rows).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("delete count exceeds usize: {}", result.num_deleted_rows),
+            )
+        })
+    }
+
+    pub async fn upsert(&self, documents: &[Document]) -> io::Result<usize> {
+        if documents.is_empty() {
+            return Ok(0);
+        }
+        let dataset = Arc::new(self.open_lance().await?);
+        let batch = documents_to_lance_batch(&self.schema, documents)?;
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset, vec!["id".to_string()]).map_err(lance_to_io)?;
+        let job = builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            .try_build()
+            .map_err(lance_to_io)?;
+        let (_dataset, stats) = job
+            .execute_reader(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+            .await
+            .map_err(lance_to_io)?;
+        usize::try_from(stats.num_inserted_rows + stats.num_updated_rows)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "upsert count exceeds usize"))
     }
 
     pub async fn open_lance(&self) -> io::Result<Dataset> {
@@ -178,6 +228,19 @@ impl LanceDatasetStore {
             .await
             .map(|_| ())
             .map_err(lance_to_io)
+    }
+}
+
+fn id_predicate(ids: &[i64]) -> String {
+    if ids.len() == 1 {
+        format!("id = {}", ids[0])
+    } else {
+        let ids = ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("id in ({ids})")
     }
 }
 
