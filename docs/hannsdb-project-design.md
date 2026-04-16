@@ -362,6 +362,12 @@ Current verified `knowhere-rs` findings already influenced HannsDB design:
 
 ## 10. Main risks
 
+## 10a. Lance-compatible storage direction
+
+The long-term storage direction is to make HannsDB a Lance-compatible local vector database facade. HannsDB should depend on upstream Lance crates for canonical persisted dataset format, while HannsDB owns the API/runtime facade and Hanns owns ANN acceleration.
+
+The first implementation slice is intentionally narrow and feature-gated behind `lance-storage`: it writes committed rows as real Lance datasets and proves upstream Lance can open, count, and scan them. Hanns index integration, delete/upsert mapping, legacy migration, and replacing the current segment runtime are later phases.
+
 ### Risk 1: optimize cost dominates at target scale
 
 The current biggest technical risk is not correctness. It is the cost of building the ANN state for `50K / 1536 / cosine`.

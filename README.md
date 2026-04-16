@@ -264,6 +264,9 @@ cargo build --release
 # With Hanns ANN backend
 cargo build --release --features hanns-backend
 
+# Experimental Lance-compatible storage prototype
+cargo test -p hannsdb-core --features lance-storage --test lance_compat -- --nocapture
+
 # Run tests
 cargo test --workspace
 
