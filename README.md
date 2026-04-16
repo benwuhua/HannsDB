@@ -4,7 +4,7 @@
 
 **Zero-dependency embedded vector database for local AI agents.**
 
-Pure Rust engine · PyO3 bindings · Axum HTTP · Knowhere ANN
+Pure Rust engine · PyO3 bindings · Axum HTTP · Hanns ANN
 
 [![Rust tests](https://img.shields.io/badge/rust%20tests-459-passing)](crates/hannsdb-core/tests) [![Python tests](https://img.shields.io/badge/python%20tests-325-passing)](crates/hannsdb-py/tests) [![Lines of Rust](https://img.shields.io/badge/rust-44%2C469%20loc-blue)](crates)
 
@@ -229,7 +229,7 @@ crates/
 │   ├── query/        #   Distance metrics, filter parser, executor
 │   └── forward_store/ #  Arrow IPC / Parquet columnar snapshots
 ├── hannsdb-index/    # ANN adapter layer (4,900 LOC)
-│   ├── hnsw.rs       #   HNSW (brute-force / knowhere backend)
+│   ├── hnsw.rs       #   HNSW (brute-force / Hanns backend)
 │   ├── hnsw_sq.rs    #   HNSW with scalar quantization
 │   ├── hnsw_hvq.rs   #   HNSW with hierarchical vector quantization
 │   ├── ivf_usq.rs    #   IVF with ultra-scalar quantization
@@ -261,8 +261,8 @@ crates/
 # Default build (brute-force ANN)
 cargo build --release
 
-# With knowhere ANN backend
-cargo build --release --features knowhere-backend
+# With Hanns ANN backend
+cargo build --release --features hanns-backend
 
 # Run tests
 cargo test --workspace
