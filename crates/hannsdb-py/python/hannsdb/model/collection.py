@@ -857,18 +857,46 @@ class Collection:
         return self._core.drop_vector_index(field_name)
 
     def create_scalar_index(self, field_name, index_param=None, option=None):
-        index_param = _normalize_scalar_index_param(index_param)
+        facade_index_param = index_param  # keep facade for schema update
+        native_index_param = _normalize_scalar_index_param(index_param)
         native_option = _native_value(option)
-        if index_param is None and native_option is None:
-            return self._core.create_scalar_index(field_name)
-        if index_param is None:
-            return self._core.create_scalar_index(field_name, option=native_option)
-        if native_option is None:
-            return self._core.create_scalar_index(field_name, index_param)
-        return self._core.create_scalar_index(field_name, index_param, native_option)
+        if native_index_param is None and native_option is None:
+            result = self._core.create_scalar_index(field_name)
+        elif native_index_param is None:
+            result = self._core.create_scalar_index(field_name, option=native_option)
+        elif native_option is None:
+            result = self._core.create_scalar_index(field_name, native_index_param)
+        else:
+            result = self._core.create_scalar_index(field_name, native_index_param, native_option)
+        if self._schema is not None and facade_index_param is not None:
+            fields = [
+                FieldSchema(
+                    name=f.name,
+                    data_type=f.data_type,
+                    nullable=f.nullable,
+                    array=f.array,
+                    index_param=facade_index_param if f.name == field_name else f.index_param,
+                )
+                for f in self._schema.fields
+            ]
+            self._set_schema(_replace_collection_schema(self._schema, fields=fields))
+        return result
 
     def drop_scalar_index(self, field_name):
-        return self._core.drop_scalar_index(field_name)
+        result = self._core.drop_scalar_index(field_name)
+        if self._schema is not None:
+            fields = [
+                FieldSchema(
+                    name=f.name,
+                    data_type=f.data_type,
+                    nullable=f.nullable,
+                    array=f.array,
+                    index_param=None if f.name == field_name else f.index_param,
+                )
+                for f in self._schema.fields
+            ]
+            self._set_schema(_replace_collection_schema(self._schema, fields=fields))
+        return result
 
     def list_vector_indexes(self):
         return self._core.list_vector_indexes()

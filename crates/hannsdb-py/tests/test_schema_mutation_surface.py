@@ -449,3 +449,37 @@ def test_real_collection_alter_column_rejects_indexed_field_rename_migration(tmp
             field_schema=hannsdb.FieldSchema(name="doc_count", data_type="uint64"),
             option=alter_option(),
         )
+
+
+def test_collection_schema_accepts_single_field_and_vector():
+    """CollectionSchema can take a single FieldSchema/VectorSchema (not just lists)."""
+    schema = hannsdb.CollectionSchema(
+        name="test",
+        fields=hannsdb.FieldSchema("id", "int64", index_param=hannsdb.InvertIndexParam(), nullable=False),
+        vectors=hannsdb.VectorSchema("vec", "vector_fp32", dimension=4),
+    )
+    assert len(schema.fields) == 1
+    assert len(schema.vectors) == 1
+    f = schema.field("id")
+    assert f.index_param is not None
+    assert f.index_param.type == hannsdb.IndexType.INVERT
+
+
+def test_create_scalar_index_updates_schema_index_param(tmp_path):
+    col = create_collection(tmp_path)
+    col.add_column(hannsdb.FieldSchema("weight", "float64", nullable=True), add_option())
+    assert col.schema.field("weight").index_param is None
+    col.create_scalar_index("weight", hannsdb.InvertIndexParam())
+    f = col.schema.field("weight")
+    assert f.index_param is not None
+    assert f.index_param.type == hannsdb.IndexType.INVERT
+    assert f.index_param.enable_range_optimization is False
+
+
+def test_drop_scalar_index_clears_schema_index_param(tmp_path):
+    col = create_collection(tmp_path)
+    col.add_column(hannsdb.FieldSchema("weight", "float64", nullable=True), add_option())
+    col.create_scalar_index("weight", hannsdb.InvertIndexParam())
+    assert col.schema.field("weight").index_param is not None
+    col.drop_scalar_index("weight")
+    assert col.schema.field("weight").index_param is None

@@ -48,6 +48,8 @@ class CollectionSchema:
         if vector_schema is not None:
             normalized_vectors.append(_coerce_vector_schema(vector_schema))
         if vectors is not None:
+            if not isinstance(vectors, (list, tuple)):
+                vectors = [vectors]
             normalized_vectors.extend(_coerce_vector_schema(vector) for vector in vectors)
         if not normalized_vectors:
             raise ValueError("CollectionSchema requires at least one vector schema")
@@ -58,7 +60,11 @@ class CollectionSchema:
             if primary_vector is not None
             else self._vectors[0].name
         )
-        self._fields = tuple(_coerce_field_schema(field) for field in (fields or []))
+        if fields is None:
+            fields = []
+        elif not isinstance(fields, (list, tuple)):
+            fields = [fields]
+        self._fields = tuple(_coerce_field_schema(field) for field in fields)
 
     @property
     def name(self) -> str:
