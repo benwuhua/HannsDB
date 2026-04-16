@@ -22,6 +22,8 @@ use hannsdb_core::query::{
     QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
     VectorQueryParam as CoreVectorQueryParam,
 };
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+use hannsdb_core::storage::lance_store::LanceCollection as CoreLanceCollection;
 #[cfg(feature = "python-binding")]
 use hannsdb_core::wal::{AddColumnBackfill, AlterColumnMigration};
 
@@ -3007,11 +3009,167 @@ struct PyCollection {
     inner: Option<Collection>,
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyclass(name = "LanceCollection", module = "hannsdb")]
+struct PyLanceCollection {
+    inner: Option<CoreLanceCollection>,
+    schema: CollectionSchema,
+}
+
 #[cfg(feature = "python-binding")]
 #[pyclass(name = "CollectionStats", module = "hannsdb")]
 #[derive(Clone)]
 struct PyCollectionStats {
     inner: CollectionStats,
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn block_on_lance<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> PyResult<T> {
+    tokio::runtime::Runtime::new()
+        .map_err(|err| PyRuntimeError::new_err(format!("failed to create tokio runtime: {err}")))?
+        .block_on(f)
+        .map_err(io_to_py_err)
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn core_documents_from_lance_docs(
+    docs: &[Doc],
+    schema: &CollectionSchema,
+) -> std::io::Result<Vec<CoreDocument>> {
+    let core_schema = core_schema_from_schema(schema)?;
+    let metadata = CollectionMetadata::new_with_schema(schema.name.clone(), core_schema);
+    docs.iter()
+        .map(|doc| {
+            let doc = normalize_doc_fields_for_collection(doc, &metadata)?;
+            let id = doc.id.parse::<i64>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Lance collection P4 requires numeric document ids, got '{}'",
+                        doc.id
+                    ),
+                )
+            })?;
+            core_document_from_doc(&doc, &schema.primary_vector, id)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn py_docs_from_lance_core_documents(
+    documents: Vec<CoreDocument>,
+    primary_vector_name: &str,
+) -> Vec<Doc> {
+    documents
+        .into_iter()
+        .map(|document| {
+            let public_id = document.id.to_string();
+            doc_from_core_document(document, primary_vector_name, public_id)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+impl PyLanceCollection {
+    fn inner_ref(&self) -> PyResult<&CoreLanceCollection> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Lance collection already destroyed"))
+    }
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pymethods]
+impl PyLanceCollection {
+    #[getter]
+    fn name(&self) -> PyResult<String> {
+        Ok(self.inner_ref()?.name().to_string())
+    }
+
+    #[getter]
+    fn uri(&self) -> PyResult<String> {
+        Ok(self.inner_ref()?.uri().to_string())
+    }
+
+    fn insert(&self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
+        let docs = docs
+            .into_iter()
+            .map(|doc| doc.borrow(py).inner.clone())
+            .collect::<Vec<_>>();
+        let docs = core_documents_from_lance_docs(&docs, &self.schema).map_err(io_to_py_err)?;
+        block_on_lance(self.inner_ref()?.insert_documents(&docs)).map(|_| docs.len())
+    }
+
+    fn upsert(&self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
+        let docs = docs
+            .into_iter()
+            .map(|doc| doc.borrow(py).inner.clone())
+            .collect::<Vec<_>>();
+        let docs = core_documents_from_lance_docs(&docs, &self.schema).map_err(io_to_py_err)?;
+        block_on_lance(self.inner_ref()?.upsert_documents(&docs))
+    }
+
+    fn fetch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Py<PyDoc>>> {
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<i64>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Lance collection P4 requires numeric document ids, got '{id}'"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let docs = block_on_lance(self.inner_ref()?.fetch_documents(&ids))?;
+        py_docs_from_lance_core_documents(docs, &self.schema.primary_vector)
+            .into_iter()
+            .map(|inner| Py::new(py, PyDoc { inner }))
+            .collect()
+    }
+
+    fn delete(&self, ids: Vec<String>) -> PyResult<usize> {
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<i64>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Lance collection P4 requires numeric document ids, got '{id}'"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        block_on_lance(self.inner_ref()?.delete_documents(&ids))
+    }
+
+    #[pyo3(signature = (vector, topk=10, metric="l2"))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        vector: Vec<f32>,
+        topk: usize,
+        metric: &str,
+    ) -> PyResult<Vec<Py<PyDoc>>> {
+        let hits = block_on_lance(self.inner_ref()?.search(&vector, topk, metric))?;
+        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let scores = hits
+            .iter()
+            .map(|hit| (hit.id, hit.distance))
+            .collect::<BTreeMap<_, _>>();
+        let docs = block_on_lance(self.inner_ref()?.fetch_documents(&ids))?;
+        py_docs_from_lance_core_documents(docs, &self.schema.primary_vector)
+            .into_iter()
+            .map(|mut inner| {
+                if let Ok(id) = inner.id.parse::<i64>() {
+                    inner.score = scores.get(&id).copied();
+                }
+                Py::new(py, PyDoc { inner })
+            })
+            .collect()
+    }
+
+    fn destroy(&mut self) {
+        self.inner = None;
+    }
 }
 
 #[cfg(feature = "python-binding")]
@@ -3583,6 +3741,55 @@ fn py_open(
     })
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "create_lance_collection")]
+#[pyo3(signature = (path, schema, docs))]
+fn py_create_lance_collection(
+    py: Python<'_>,
+    path: String,
+    schema: Py<PyCollectionSchema>,
+    docs: Vec<Py<PyDoc>>,
+) -> PyResult<PyLanceCollection> {
+    let schema = schema.borrow(py).inner.clone();
+    let docs = docs
+        .into_iter()
+        .map(|doc| doc.borrow(py).inner.clone())
+        .collect::<Vec<_>>();
+    let core_documents = core_documents_from_lance_docs(&docs, &schema).map_err(io_to_py_err)?;
+    let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+    let collection = block_on_lance(CoreLanceCollection::create(
+        path,
+        schema.name.clone(),
+        core_schema,
+        &core_documents,
+    ))?;
+    Ok(PyLanceCollection {
+        inner: Some(collection),
+        schema,
+    })
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "open_lance_collection")]
+#[pyo3(signature = (path, schema))]
+fn py_open_lance_collection(
+    py: Python<'_>,
+    path: String,
+    schema: Py<PyCollectionSchema>,
+) -> PyResult<PyLanceCollection> {
+    let schema = schema.borrow(py).inner.clone();
+    let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+    let collection = block_on_lance(CoreLanceCollection::open(
+        path,
+        schema.name.clone(),
+        core_schema,
+    ))?;
+    Ok(PyLanceCollection {
+        inner: Some(collection),
+        schema,
+    })
+}
+
 #[cfg(feature = "python-binding")]
 #[pymodule(name = "_native")]
 fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3616,9 +3823,15 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyWeightedReRanker>()?;
     module.add_class::<PyCollectionStats>()?;
     module.add_class::<PyCollection>()?;
+    #[cfg(feature = "lance-storage")]
+    module.add_class::<PyLanceCollection>()?;
     module.add_function(wrap_pyfunction!(py_init, module)?)?;
     module.add_function(wrap_pyfunction!(py_create_and_open, module)?)?;
     module.add_function(wrap_pyfunction!(py_open, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(py_create_lance_collection, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(py_open_lance_collection, module)?)?;
     Ok(())
 }
 

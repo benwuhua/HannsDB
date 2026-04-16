@@ -10,6 +10,7 @@ default = []
 python-binding = ["dep:pyo3", "dep:numpy", "python-extension-module"]
 python-extension-module = ["pyo3/extension-module"]
 hanns-backend = ["hannsdb-core/hanns-backend"]
+lance-storage = ["hannsdb-core/lance-storage", "dep:tokio"]
 
 [lib]
 name = "_native"
@@ -20,6 +21,7 @@ crate-type = ["rlib"]
 hannsdb-core = { path = "../hannsdb-core" }
 pyo3 = { version = "0.23", features = ["abi3-py39"], optional = true }
 numpy = { version = "0.23", optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

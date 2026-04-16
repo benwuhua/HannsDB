@@ -24,7 +24,14 @@ from ..model.schema.field_schema import (
     _coerce_vector_schema,
 )
 
-__all__ = ["Collection", "create_and_open", "open"]
+__all__ = [
+    "Collection",
+    "LanceCollection",
+    "create_and_open",
+    "open",
+    "create_lance_collection",
+    "open_lance_collection",
+]
 
 _INT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)$")
 _FLOAT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)\.[0-9]+$")
@@ -931,3 +938,82 @@ def create_and_open(path, schema, option: CollectionOption | None = None):
 def open(path, option: CollectionOption | None = None):
     core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)
+
+
+class LanceCollection:
+    def __init__(self, core_collection, schema: CollectionSchema):
+        self._core = core_collection
+        self._schema = _coerce_collection_schema(schema)
+        self._core_lock = threading.RLock()
+
+    @property
+    def name(self) -> str:
+        return self._core.name
+
+    @property
+    def uri(self) -> str:
+        return self._core.uri
+
+    @property
+    def schema(self) -> CollectionSchema:
+        return self._schema
+
+    def insert(self, docs):
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
+        with self._core_lock:
+            return MutationResult(self._core.insert(_coerce_docs_to_native(coerced)))
+
+    def upsert(self, docs):
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
+        with self._core_lock:
+            return MutationResult(self._core.upsert(_coerce_docs_to_native(coerced)))
+
+    def fetch(self, ids):
+        single_id, ids = _coerce_id_input(ids)
+        with self._core_lock:
+            result = _wrap_doc_result(self._core.fetch(ids))
+        if single_id:
+            return result[0] if result else None
+        return result
+
+    def delete(self, ids):
+        _, ids = _coerce_id_input(ids)
+        with self._core_lock:
+            return MutationResult(self._core.delete(ids))
+
+    def search(self, vector, topk=10, metric="l2"):
+        with self._core_lock:
+            return _wrap_doc_result(self._core.search(vector, topk, metric))
+
+    def destroy(self):
+        with self._core_lock:
+            return self._core.destroy()
+
+
+def create_lance_collection(path, schema, docs):
+    coerced_schema = _coerce_collection_schema(schema)
+    coerced_docs = []
+    for doc in _coerce_docs_input(docs):
+        _validate_doc_nullable_fields(doc, coerced_schema, is_insert=True)
+        coerced_docs.append(_coerce_doc_to_collection_schema(doc, coerced_schema))
+    core_collection = _native_module.create_lance_collection(
+        path,
+        _schema_to_native(coerced_schema),
+        _coerce_docs_to_native(coerced_docs),
+    )
+    return LanceCollection(core_collection, coerced_schema)
+
+
+def open_lance_collection(path, schema):
+    coerced_schema = _coerce_collection_schema(schema)
+    core_collection = _native_module.open_lance_collection(
+        path,
+        _schema_to_native(coerced_schema),
+    )
+    return LanceCollection(core_collection, coerced_schema)
