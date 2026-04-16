@@ -3,7 +3,9 @@
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
 };
-use hannsdb_core::storage::lance_store::{documents_to_lance_batch, LanceDatasetStore};
+use hannsdb_core::storage::lance_store::{
+    documents_to_lance_batch, LanceCollection, LanceDatasetStore,
+};
 
 fn sample_schema() -> CollectionSchema {
     CollectionSchema {
@@ -148,4 +150,41 @@ async fn lance_dataset_store_bruteforce_searches_lance_vectors() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 20);
     assert_eq!(hits[0].distance, 0.0);
+}
+
+#[tokio::test]
+async fn lance_collection_facade_supports_basic_insert_fetch_and_search() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let docs = sample_documents();
+    let collection = LanceCollection::create(temp.path(), "docs", sample_schema(), &docs[..1])
+        .await
+        .expect("create lance collection facade");
+
+    collection
+        .insert_documents(&docs[1..])
+        .await
+        .expect("insert second batch");
+
+    let external = lance::Dataset::open(collection.uri())
+        .await
+        .expect("open facade data with upstream Lance");
+    assert_eq!(external.count_rows(None).await.expect("count rows"), 2);
+
+    let fetched = collection
+        .fetch_documents(&[20, 10])
+        .await
+        .expect("fetch documents");
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        vec![20, 10]
+    );
+
+    let hits = collection
+        .search(&[1.0, 2.0, 3.0], 1, "l2")
+        .await
+        .expect("search collection");
+    assert_eq!(hits[0].id, 10);
 }

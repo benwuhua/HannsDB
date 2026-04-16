@@ -1,4 +1,5 @@
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -13,6 +14,76 @@ use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
 use crate::query::{distance_by_metric, SearchHit};
 use crate::storage::lance_schema::arrow_schema_for_lance;
 
+pub struct LanceCollection {
+    name: String,
+    store: LanceDatasetStore,
+}
+
+impl LanceCollection {
+    pub async fn create(
+        root: impl AsRef<Path>,
+        name: impl Into<String>,
+        schema: CollectionSchema,
+        documents: &[Document],
+    ) -> io::Result<Self> {
+        let name = name.into();
+        let uri = lance_collection_uri(root.as_ref(), &name);
+        if let Some(parent) = uri.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = LanceDatasetStore::new(path_to_uri(&uri)?, schema);
+        store.create(documents).await?;
+        Ok(Self { name, store })
+    }
+
+    pub async fn open(
+        root: impl AsRef<Path>,
+        name: impl Into<String>,
+        schema: CollectionSchema,
+    ) -> io::Result<Self> {
+        let name = name.into();
+        let uri = lance_collection_uri(root.as_ref(), &name);
+        let store = LanceDatasetStore::new(path_to_uri(&uri)?, schema);
+        let _ = store.open_lance().await?;
+        Ok(Self { name, store })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uri(&self) -> &str {
+        self.store.uri()
+    }
+
+    pub async fn insert_documents(&self, documents: &[Document]) -> io::Result<()> {
+        self.store.append(documents).await
+    }
+
+    pub async fn fetch_documents(&self, ids: &[i64]) -> io::Result<Vec<Document>> {
+        self.store.fetch(ids).await
+    }
+
+    pub async fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.store.search(query, top_k, metric).await
+    }
+}
+
+fn lance_collection_uri(root: &Path, name: &str) -> PathBuf {
+    root.join("collections").join(format!("{name}.lance"))
+}
+
+fn path_to_uri(path: &Path) -> io::Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Lance path is not valid UTF-8"))
+}
+
 pub struct LanceDatasetStore {
     uri: String,
     schema: CollectionSchema,
@@ -24,6 +95,10 @@ impl LanceDatasetStore {
             uri: uri.into(),
             schema,
         }
+    }
+
+    pub fn uri(&self) -> &str {
+        self.uri.as_str()
     }
 
     pub async fn create(&self, documents: &[Document]) -> io::Result<()> {
