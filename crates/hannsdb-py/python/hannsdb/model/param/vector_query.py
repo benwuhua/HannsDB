@@ -76,8 +76,11 @@ class VectorQuery:
     param: Optional[Any] = None
 
     def __post_init__(self) -> None:
-        # Only normalize if it's a dense vector (not SparseVector)
-        if not isinstance(self.vector, SparseVector):
+        # Accept both the facade SparseVector and the native PyO3 SparseVector (duck-typed).
+        is_sparse = isinstance(self.vector, SparseVector) or (
+            hasattr(self.vector, "indices") and hasattr(self.vector, "values")
+        )
+        if not is_sparse:
             self.vector = _normalize_vector(self.vector)
         self.param = _normalize_query_param(self.param)
 
