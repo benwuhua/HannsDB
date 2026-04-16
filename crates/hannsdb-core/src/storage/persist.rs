@@ -7,12 +7,18 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
+#[cfg(feature = "hanns-backend")]
 use std::path::Path;
+#[cfg(feature = "hanns-backend")]
 use std::sync::Arc;
 
-use crate::catalog::{CollectionMetadata, IndexCatalog};
+use crate::catalog::CollectionMetadata;
+#[cfg(feature = "hanns-backend")]
+use crate::catalog::IndexCatalog;
 use crate::document::{field_value_to_scalar, FieldType, FieldValue};
+#[cfg(feature = "hanns-backend")]
 use crate::query::resolve_vector_descriptor_for_field;
+#[cfg(feature = "hanns-backend")]
 use crate::segment::index_runtime::{
     ann_blob_path, ann_ids_path, CachedSearchState, OptimizedAnnState,
 };
@@ -32,6 +38,7 @@ use hannsdb_index::sparse::{SparseIndexBackend, SparseVectorData};
 // ---------------------------------------------------------------------------
 
 /// Persist an ANN index blob and its external IDs to disk.
+#[cfg(feature = "hanns-backend")]
 pub fn persist_ann_blob(
     collection_dir: &Path,
     field_name: &str,
@@ -177,11 +184,13 @@ pub fn build_sparse_indexes_from_segments(
         let factory = DefaultIndexFactory::default();
         let mut index = factory
             .create_sparse_index(&descriptor, None)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sparse index create: {e:?}")))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("sparse index create: {e:?}"))
+            })?;
 
-        index
-            .add(&all_sparse)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("sparse index build: {e:?}")))?;
+        index.add(&all_sparse).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("sparse index build: {e:?}"))
+        })?;
 
         if let Some(bm25_params) = &vector_schema.bm25_params {
             index.set_bm25_params(bm25_params.k1, bm25_params.b, bm25_params.avgdl);
@@ -189,7 +198,10 @@ pub fn build_sparse_indexes_from_segments(
 
         // Persist to disk.
         if let Ok(Some(bytes)) = index.serialize_to_bytes() {
-            let blob_path = paths.dir.join("ann").join(format!("{field_name}.sparse.bin"));
+            let blob_path = paths
+                .dir
+                .join("ann")
+                .join(format!("{field_name}.sparse.bin"));
             if let Some(parent) = blob_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -219,7 +231,6 @@ pub fn load_persisted_ann_from_disk(
     field_name: &str,
     fallback_external_ids: Arc<Vec<i64>>,
 ) -> io::Result<Option<CachedSearchState>> {
-    use hannsdb_index::descriptor::VectorIndexDescriptor;
     use crate::segment::index_runtime::HNSW_INDEX_FILE;
 
     let descriptor =

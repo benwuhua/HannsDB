@@ -135,10 +135,18 @@ fn lifecycle_compact_reopen_search_returns_correct_results() {
         let mut db = HannsDb::open(root).expect("reopen before compact");
         db.compact_collection("docs").expect("compact collection");
     }
+    let segment_set_before =
+        SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("segment_set before");
 
     // Reopen.  WAL has only CompactCollection (no CreateCollection) →
     // plan has no owned collections → no wipe → on-disk compacted state kept.
     let db = HannsDb::open(root).expect("reopen after compact");
+    let segment_set_after =
+        SegmentSet::load_from_path(&segment_set_path(root, "docs")).expect("segment_set after");
+    assert_eq!(
+        segment_set_after.immutable_segment_ids, segment_set_before.immutable_segment_ids,
+        "reopen should not replay an already persisted CompactCollection WAL record"
+    );
     let hits = db
         .search("docs", &[0.0_f32, 0.0], 10)
         .expect("search after reopen");

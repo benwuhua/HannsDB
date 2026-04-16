@@ -1024,8 +1024,7 @@ fn api_query_context_merges_primary_and_secondary_vector_recall_sources() {
 }
 
 #[test]
-fn api_query_context_single_vector_ef_search_matches_legacy_search_path_with_secondary_schema(
-) {
+fn api_query_context_single_vector_ef_search_matches_legacy_search_path_with_secondary_schema() {
     let root = unique_temp_dir("hannsdb_typed_query_single_vector_ef_search_secondary_schema");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(

@@ -22,6 +22,7 @@ use hannsdb_core::query::{
     QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
     VectorQueryParam as CoreVectorQueryParam,
 };
+#[cfg(feature = "python-binding")]
 use hannsdb_core::wal::{AddColumnBackfill, AlterColumnMigration};
 
 pub fn bootstrap_symbol() -> &'static str {

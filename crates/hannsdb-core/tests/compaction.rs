@@ -16,17 +16,6 @@ fn doc(id: i64, vector: Vec<f32>) -> Document {
     Document::new(id, Vec::<(String, FieldValue)>::new(), vector)
 }
 
-fn doc_with_field(
-    id: i64,
-    vector: Vec<f32>,
-    field_name: &str,
-    field_value: FieldValue,
-) -> Document {
-    let mut fields = Vec::new();
-    fields.push((field_name.to_string(), field_value));
-    Document::new(id, fields, vector)
-}
-
 fn write_segment(
     segment_dir: &Path,
     segment_id: &str,
@@ -486,7 +475,11 @@ fn compaction_single_immutable_segment() {
     let hits = db
         .search("test", &[1.0, 2.0, 3.0, 4.0], 10)
         .expect("search after compact");
-    assert_eq!(hits.len(), 5, "all 5 docs should be searchable after compact");
+    assert_eq!(
+        hits.len(),
+        5,
+        "all 5 docs should be searchable after compact"
+    );
 
     // Verify fetch works
     let fetched = db
@@ -514,8 +507,12 @@ fn compaction_multiple_rounds() {
     let segments_dir = seg_dir.join("segments");
 
     // Round 1: use write_segment to create 2 immutable segments directly
-    let docs1: Vec<Document> = (0..3).map(|i| doc(i as i64, vec![1.0, 2.0, 3.0, 4.0])).collect();
-    let docs2: Vec<Document> = (3..5).map(|i| doc(i as i64, vec![5.0, 6.0, 7.0, 8.0])).collect();
+    let docs1: Vec<Document> = (0..3)
+        .map(|i| doc(i as i64, vec![1.0, 2.0, 3.0, 4.0]))
+        .collect();
+    let docs2: Vec<Document> = (3..5)
+        .map(|i| doc(i as i64, vec![5.0, 6.0, 7.0, 8.0]))
+        .collect();
     write_segment(&segments_dir.join("seg-a1"), "seg-a1", dim, &docs1, &[]);
     write_segment(&segments_dir.join("seg-a2"), "seg-a2", dim, &docs2, &[]);
     // Active segment with 0 rows
@@ -552,7 +549,9 @@ fn compaction_multiple_rounds() {
 
     // Round 2: add another immutable segment, compact again
     drop(db);
-    let docs3: Vec<Document> = (5..8).map(|i| doc(i as i64, vec![9.0, 10.0, 11.0, 12.0])).collect();
+    let docs3: Vec<Document> = (5..8)
+        .map(|i| doc(i as i64, vec![9.0, 10.0, 11.0, 12.0]))
+        .collect();
     write_segment(&segments_dir.join("seg-b1"), "seg-b1", dim, &docs3, &[]);
     // New active
     let active_dir2 = segments_dir.join("seg-b2");
@@ -615,7 +614,12 @@ fn compaction_triggered_by_upsert_auto_compact() {
         fs::create_dir_all(&dir).expect("create seg dir");
 
         let docs: Vec<Document> = (0..2)
-            .map(|i| doc((seg_idx * 10 + i) as i64, vec![seg_idx as f32, 0.0, 0.0, 0.0]))
+            .map(|i| {
+                doc(
+                    (seg_idx * 10 + i) as i64,
+                    vec![seg_idx as f32, 0.0, 0.0, 0.0],
+                )
+            })
             .collect();
         write_segment(&dir, &seg_id, dim, &docs, &[]);
     }
@@ -747,7 +751,7 @@ fn compaction_crash_during_compaction_recovers_via_wal() {
 
     // Drop the db (simulating crash) and reopen
     drop(db);
-    let mut db = HannsDb::open(root).expect("reopen db after simulated crash");
+    let db = HannsDb::open(root).expect("reopen db after simulated crash");
 
     // WAL replay should have handled the incomplete compaction gracefully.
     // The original immutable segments should still be searchable (either
@@ -757,7 +761,8 @@ fn compaction_crash_during_compaction_recovers_via_wal() {
         .expect("search after crash recovery");
     let hit_ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
     assert_eq!(
-        hit_ids, vec![1, 2, 3, 4],
+        hit_ids,
+        vec![1, 2, 3, 4],
         "all 4 docs should be searchable after crash-during-compaction recovery"
     );
 
@@ -767,7 +772,8 @@ fn compaction_crash_during_compaction_recovers_via_wal() {
         .expect("fetch after crash recovery");
     let fetched_ids: Vec<i64> = fetched.iter().map(|doc| doc.id).collect();
     assert_eq!(
-        fetched_ids, vec![1, 2, 3, 4],
+        fetched_ids,
+        vec![1, 2, 3, 4],
         "all 4 docs should be fetchable after crash-during-compaction recovery"
     );
 }

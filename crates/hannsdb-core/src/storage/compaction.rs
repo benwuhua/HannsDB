@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
 
 use crate::catalog::CollectionMetadata;
 use crate::document::FieldType;
@@ -12,7 +11,7 @@ use crate::segment::{
     load_records, load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentMetadata,
     SegmentPaths, TombstoneMask, VersionSet,
 };
-use crate::storage::paths::{CollectionPaths, CollectionPaths as Paths};
+use crate::storage::paths::CollectionPaths;
 use crate::storage::segment_io::{
     load_payloads_or_empty, load_sparse_vectors_or_empty, load_vectors_or_empty,
     materialize_forward_store_snapshot, next_compacted_segment_id,
@@ -22,10 +21,6 @@ use crate::storage::segment_io::{
 pub struct CompactionResult {
     /// The new compacted segment ID.
     pub compacted_segment_id: String,
-    /// Number of live rows in the compacted segment.
-    pub live_row_count: usize,
-    /// The immutable segment IDs that were merged (and should be removed).
-    pub merged_segment_ids: Vec<String>,
 }
 
 /// Compact all immutable segments of a collection into a single segment.
@@ -40,8 +35,6 @@ pub fn compact_immutable_segments(
     if !paths.segment_set.exists() {
         return Ok(CompactionResult {
             compacted_segment_id: String::new(),
-            live_row_count: 0,
-            merged_segment_ids: vec![],
         });
     }
 
@@ -49,8 +42,6 @@ pub fn compact_immutable_segments(
     if version_set.immutable_segment_ids().is_empty() {
         return Ok(CompactionResult {
             compacted_segment_id: String::new(),
-            live_row_count: 0,
-            merged_segment_ids: vec![],
         });
     }
 
@@ -189,8 +180,6 @@ pub fn compact_immutable_segments(
     compacted_meta.save_to_path(&compacted_dir.join("segment.json"))?;
     materialize_forward_store_snapshot(&compacted_paths, collection_meta)?;
 
-    let live_row_count = compacted_ids.len();
-
     version_set = VersionSet::new(
         version_set.active_segment_id().to_string(),
         vec![compacted_segment_id.clone()],
@@ -202,7 +191,5 @@ pub fn compact_immutable_segments(
 
     Ok(CompactionResult {
         compacted_segment_id,
-        live_row_count,
-        merged_segment_ids: immutable_segment_ids,
     })
 }

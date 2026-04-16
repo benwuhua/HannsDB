@@ -34,7 +34,6 @@ fn sparse_field_schema(name: &str) -> VectorFieldSchema {
 // Test 1: RRF basic — 2 dense vector fields, query both, rerank with RRF
 // ---------------------------------------------------------------------------
 
-
 #[test]
 fn api_rrf_basic_two_dense_fields() {
     let root = unique_temp_dir("hannsdb_rrf_basic");
@@ -130,7 +129,6 @@ fn api_rrf_basic_two_dense_fields() {
 // ---------------------------------------------------------------------------
 // Test 2: RRF score calculation — verify formula 1/(k+rank+1)
 // ---------------------------------------------------------------------------
-
 
 #[test]
 fn api_rrf_score_calculation_matches_formula() {
@@ -236,7 +234,6 @@ fn api_rrf_score_calculation_matches_formula() {
 // Test 3: Weighted basic — 2 dense vector fields, query both, rerank with weights
 // ---------------------------------------------------------------------------
 
-
 #[test]
 fn api_weighted_basic_two_dense_fields() {
     let root = unique_temp_dir("hannsdb_weighted_basic");
@@ -320,7 +317,6 @@ fn api_weighted_basic_two_dense_fields() {
 // Test 4: Weighted with metric normalization — verify L2/IP/COSINE normalization
 // ---------------------------------------------------------------------------
 
-
 #[test]
 fn api_weighted_metric_normalization() {
     // Test with cosine metric override
@@ -400,7 +396,6 @@ fn api_weighted_metric_normalization() {
 // ---------------------------------------------------------------------------
 // Test 5: Dense + sparse hybrid — query dense and sparse fields with RRF reranker
 // ---------------------------------------------------------------------------
-
 
 #[test]
 fn api_dense_sparse_hybrid_rrf() {
@@ -581,7 +576,6 @@ fn api_rrf_with_filter() {
 // ---------------------------------------------------------------------------
 // Test 7: Weighted with unequal weights — 0.7 vs 0.3
 // ---------------------------------------------------------------------------
-
 
 #[test]
 fn api_weighted_unequal_weights() {

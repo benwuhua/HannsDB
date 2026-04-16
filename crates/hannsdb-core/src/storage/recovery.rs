@@ -20,6 +20,7 @@ pub(crate) struct WalCollectionPlan {
     pub(crate) requires_delta_replay: bool,
     pub(crate) requires_data_files: bool,
     pub(crate) requires_vector_sidecar: bool,
+    expected_compacted_segment_id: Option<String>,
     delta_expectations: HashMap<i64, ReplayExpectedRow>,
 }
 
@@ -126,13 +127,12 @@ impl WalReplayPlan {
                     }
                 }
                 WalRecord::CompactCollection {
-                    collection_name, ..
+                    collection_name,
+                    compacted_segment_id,
                 } => {
                     let plan = ensure_collection_plan(&mut collections, collection_name);
                     plan.requires_data_files = true;
-                    if !plan.created_in_wal {
-                        plan.requires_delta_replay = true;
-                    }
+                    plan.expected_compacted_segment_id = Some(compacted_segment_id.clone());
                 }
                 WalRecord::UpdateDocuments {
                     collection,
@@ -345,6 +345,17 @@ fn requires_replay_for_segment_set(
     plan: &WalCollectionPlan,
 ) -> io::Result<bool> {
     let segment_manager = SegmentManager::new(paths.dir.clone());
+    if let Some(expected_compacted_segment_id) = &plan.expected_compacted_segment_id {
+        let version_set = crate::segment::VersionSet::load_from_path(&paths.segment_set)?;
+        if !version_set
+            .immutable_segment_ids()
+            .iter()
+            .any(|segment_id| segment_id == expected_compacted_segment_id)
+        {
+            return Ok(true);
+        }
+    }
+
     for segment in segment_manager.segment_paths()? {
         let segment_meta = match SegmentMetadata::load_from_path(&segment.metadata) {
             Ok(meta) => meta,

@@ -51,7 +51,5 @@ async fn main() {
         .expect("failed to bind port");
     println!("  listening on 0.0.0.0:{port}");
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }

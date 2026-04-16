@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, FixedSizeListArray,
-    Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Builder, Int64Builder,
-    ListBuilder, StringArray, StringBuilder, UInt32Array, UInt32Builder, UInt64Array,
-    UInt64Builder,
+    Float32Array, Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder,
+    StringArray, StringBuilder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Schema};

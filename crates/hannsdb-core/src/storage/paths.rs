@@ -25,10 +25,6 @@ pub(crate) fn collection_paths_for_dir(dir: &Path) -> CollectionPaths {
         segment_set: dir.join("segment_set.json"),
         segments_dir: dir.join("segments"),
         segment_meta: dir.join("segment.json"),
-        records: dir.join("records.bin"),
-        external_ids: dir.join("ids.bin"),
-        payloads: dir.join("payloads.jsonl"),
-        vectors: dir.join("vectors.jsonl"),
         tombstones: dir.join("tombstones.json"),
     }
 }
@@ -41,9 +37,5 @@ pub(crate) struct CollectionPaths {
     pub(crate) segment_set: PathBuf,
     pub(crate) segments_dir: PathBuf,
     pub(crate) segment_meta: PathBuf,
-    pub(crate) records: PathBuf,
-    pub(crate) external_ids: PathBuf,
-    pub(crate) payloads: PathBuf,
-    pub(crate) vectors: PathBuf,
     pub(crate) tombstones: PathBuf,
 }

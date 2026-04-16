@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::io;
 
-use crate::segment::{SegmentManager, SegmentMetadata, SegmentPaths, TombstoneMask};
+use crate::segment::{SegmentManager, SegmentMetadata, TombstoneMask};
 use crate::storage::paths::CollectionPaths;
 use crate::storage::segment_io::{
     invalidate_forward_store_snapshot, latest_live_row_index, latest_row_index_for_id,
@@ -131,7 +131,5 @@ pub fn mark_live_ids_deleted_across_segments(
         }
     }
 
-    Ok(TombstoneResult {
-        deleted_count: 0,
-    })
+    Ok(TombstoneResult { deleted_count: 0 })
 }

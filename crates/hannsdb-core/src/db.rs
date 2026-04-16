@@ -13,8 +13,8 @@ use crate::catalog::{CollectionMetadata, IndexCatalog, ManifestMetadata};
 use crate::document::{
     field_value_to_scalar, validate_documents, validate_schema_primary_vector_descriptor,
     validate_schema_secondary_vector_descriptors, validate_vector_index_descriptor,
-    CollectionSchema, Document, DocumentUpdate, FieldType, FieldValue, ScalarFieldSchema,
-    SparseVector, VectorFieldSchema,
+    CollectionSchema, Document, DocumentUpdate, FieldValue, ScalarFieldSchema, SparseVector,
+    VectorFieldSchema,
 };
 use crate::pk::{PrimaryKeyMode, PrimaryKeyRegistry};
 use crate::query::{
@@ -25,25 +25,20 @@ use crate::query::{
 };
 #[cfg(feature = "hanns-backend")]
 use crate::segment::index_runtime::ann_search_with_bitset;
-#[cfg(feature = "hanns-backend")]
-use crate::segment::index_runtime::OptimizedAnnState;
-#[cfg(feature = "hanns-backend")]
-use crate::segment::index_runtime::HNSW_INDEX_FILE;
 use crate::segment::index_runtime::{
     ann_blob_path, ann_ids_path, ann_search, build_optimized_ann_state, invalidate_ann_blobs,
     CachedSearchState,
 };
+#[cfg(all(test, feature = "hanns-backend"))]
+use crate::segment::{append_record_ids, append_records, SegmentPaths};
 use crate::segment::{
-    append_record_ids, append_records, append_records_f16, append_sparse_vectors, load_record_ids,
-    load_records, load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentManager,
-    SegmentMetadata, SegmentPaths, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
+    SegmentManager, SegmentMetadata, SegmentSet, SegmentWriter, TombstoneMask, VersionSet,
 };
 use crate::storage::compaction::compact_immutable_segments;
-use crate::storage::persist;
-use crate::storage::tombstone;
 use crate::storage::paths::{
     collection_paths_for_dir, collection_paths_for_root, manifest_path, wal_path, CollectionPaths,
 };
+use crate::storage::persist;
 use crate::storage::primary_keys::{
     assign_internal_ids_for_public_keys, display_key_for_internal_id, load_primary_key_registry,
     resolve_public_keys_to_internal_ids, upsert_public_keys_with_internal_ids,
@@ -54,8 +49,9 @@ use crate::storage::segment_io::{
     load_payloads_with_fields_or_empty, load_primary_dense_rows_for_segment_or_empty,
     load_shadowed_live_records, load_shadowed_live_vector_records, load_sparse_vectors_or_empty,
     load_vectors_or_empty, materialize_active_segment_arrow_snapshots,
-    materialize_forward_store_snapshot, next_compacted_segment_id, persisted_ann_exists,
+    materialize_forward_store_snapshot, persisted_ann_exists,
 };
+use crate::storage::tombstone;
 use crate::storage::wal::{
     append_wal_record, load_wal_records, load_wal_records_or_empty, truncate_wal, WalRecord,
 };
@@ -2010,10 +2006,7 @@ impl CollectionHandle {
                             );
                         }
                         Err(e) => {
-                            log::warn!(
-                                "Failed to persist ANN index for '{}': {e}",
-                                field_name
-                            );
+                            log::warn!("Failed to persist ANN index for '{}': {e}", field_name);
                         }
                     }
                 }
@@ -2050,11 +2043,8 @@ impl CollectionHandle {
 
         // Build sparse indexes for sparse vector fields.
         let segment_paths = self.segment_manager.segment_paths()?;
-        let sparse_indexes = persist::build_sparse_indexes_from_segments(
-            &paths,
-            &segment_paths,
-            &collection_meta,
-        )?;
+        let sparse_indexes =
+            persist::build_sparse_indexes_from_segments(&paths, &segment_paths, &collection_meta)?;
 
         if !sparse_indexes.is_empty() {
             let mut sparse_cache = self
