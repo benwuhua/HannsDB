@@ -3,12 +3,54 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, UInt32Array, UInt64Array,
+    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
+use lance::dataset::{WriteMode, WriteParams};
+use lance::Dataset;
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
 use crate::storage::lance_schema::arrow_schema_for_lance;
+
+pub struct LanceDatasetStore {
+    uri: String,
+    schema: CollectionSchema,
+}
+
+impl LanceDatasetStore {
+    pub fn new(uri: impl Into<String>, schema: CollectionSchema) -> Self {
+        Self {
+            uri: uri.into(),
+            schema,
+        }
+    }
+
+    pub async fn create(&self, documents: &[Document]) -> io::Result<()> {
+        self.write(documents, WriteMode::Create).await
+    }
+
+    pub async fn append(&self, documents: &[Document]) -> io::Result<()> {
+        self.write(documents, WriteMode::Append).await
+    }
+
+    pub async fn open_lance(&self) -> io::Result<Dataset> {
+        Dataset::open(self.uri.as_str()).await.map_err(lance_to_io)
+    }
+
+    async fn write(&self, documents: &[Document], mode: WriteMode) -> io::Result<()> {
+        let batch = documents_to_lance_batch(&self.schema, documents)?;
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let params = WriteParams {
+            mode,
+            ..WriteParams::default()
+        };
+        Dataset::write(reader, self.uri.as_str(), Some(params))
+            .await
+            .map(|_| ())
+            .map_err(lance_to_io)
+    }
+}
 
 pub fn documents_to_lance_batch(
     schema: &CollectionSchema,
@@ -196,4 +238,8 @@ fn type_mismatch<T>(field_name: &str, expected: &str, actual: &FieldValue) -> io
 
 fn arrow_to_io(err: arrow_schema::ArrowError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+fn lance_to_io(err: lance::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err.to_string())
 }

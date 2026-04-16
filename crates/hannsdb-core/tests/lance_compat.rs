@@ -3,7 +3,7 @@
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
 };
-use hannsdb_core::storage::lance_store::documents_to_lance_batch;
+use hannsdb_core::storage::lance_store::{documents_to_lance_batch, LanceDatasetStore};
 
 fn sample_schema() -> CollectionSchema {
     CollectionSchema {
@@ -58,4 +58,48 @@ fn lance_batch_conversion_preserves_ids_scalars_and_vectors() {
         batch.schema().field_with_name("dense").unwrap().name(),
         "dense"
     );
+}
+
+#[tokio::test]
+async fn lance_dataset_store_writes_dataset_openable_by_lance() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema());
+
+    store
+        .create(&sample_documents())
+        .await
+        .expect("create lance dataset");
+
+    let dataset = lance::Dataset::open(uri.to_str().unwrap())
+        .await
+        .expect("open with upstream lance");
+    assert_eq!(dataset.count_rows(None).await.expect("count rows"), 2);
+}
+
+#[tokio::test]
+async fn lance_dataset_store_append_is_visible_to_lance_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema());
+
+    store
+        .create(&sample_documents()[..1])
+        .await
+        .expect("create lance dataset");
+    store
+        .append(&sample_documents()[1..])
+        .await
+        .expect("append lance dataset");
+
+    let dataset = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema())
+        .open_lance()
+        .await
+        .expect("open via store");
+    assert_eq!(dataset.count_rows(None).await.expect("count rows"), 2);
+
+    let batch = dataset.scan().try_into_batch().await.expect("scan rows");
+    assert_eq!(batch.num_rows(), 2);
+    assert!(batch.schema().field_with_name("title").is_ok());
+    assert!(batch.schema().field_with_name("dense").is_ok());
 }
