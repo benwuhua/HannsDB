@@ -1,11 +1,9 @@
-/// Integration tests ported from zvec's filter expression and query tests.
+/// Integration tests for filter expressions and queries.
 ///
-/// Source references:
-///   zvec/python/tests/detail/test_collection_dql.py  (AND/OR, parentheses, IN, NOT IN, topk, output_fields)
-///   zvec/python/tests/test_collection.py              (TestCollectionQuery)
-///
-/// Adapted to HannsDB's Rust API: `query_with_context` with `QueryContext`, and
-/// `query_documents` for filter-only queries.
+/// Covers:
+///   AND/OR, parentheses, IN, NOT IN, topk, output_fields, comparison operators,
+///   has_prefix/has_suffix, LIKE, NOT LIKE, bool/float/string filters, and
+///   filter-only queries.
 use hannsdb_core::db::HannsDb;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
@@ -67,7 +65,7 @@ fn insert_standard_docs(db: &mut HannsDb, coll: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_and_two_conditions() {
+fn api_filter_and_two_conditions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -121,7 +119,7 @@ fn zvec_parity_filter_and_two_conditions() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_or_two_conditions() {
+fn api_filter_or_two_conditions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -164,7 +162,7 @@ fn zvec_parity_filter_or_two_conditions() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_parentheses_and_or_combined() {
+fn api_filter_parentheses_and_or_combined() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -200,7 +198,7 @@ fn zvec_parity_filter_parentheses_and_or_combined() {
 }
 
 #[test]
-fn zvec_parity_filter_parentheses_or_and_combined() {
+fn api_filter_parentheses_or_and_combined() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -243,7 +241,7 @@ fn zvec_parity_filter_parentheses_or_and_combined() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_in_list_integers() {
+fn api_filter_in_list_integers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -285,7 +283,7 @@ fn zvec_parity_filter_in_list_integers() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_not_in_list_integers() {
+fn api_filter_not_in_list_integers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -327,7 +325,7 @@ fn zvec_parity_filter_not_in_list_integers() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_has_prefix() {
+fn api_filter_has_prefix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -370,7 +368,7 @@ fn zvec_parity_filter_has_prefix() {
 }
 
 #[test]
-fn zvec_parity_filter_has_suffix() {
+fn api_filter_has_suffix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -417,7 +415,7 @@ fn zvec_parity_filter_has_suffix() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_like_contains() {
+fn api_filter_like_contains() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -452,7 +450,7 @@ fn zvec_parity_filter_like_contains() {
 }
 
 #[test]
-fn zvec_parity_filter_like_suffix_pattern() {
+fn api_filter_like_suffix_pattern() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -487,7 +485,7 @@ fn zvec_parity_filter_like_suffix_pattern() {
 }
 
 #[test]
-fn zvec_parity_filter_not_like() {
+fn api_filter_not_like() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -525,7 +523,7 @@ fn zvec_parity_filter_not_like() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_output_fields_projection() {
+fn api_query_output_fields_projection() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -572,7 +570,7 @@ fn zvec_parity_query_output_fields_projection() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_include_vector() {
+fn api_query_include_vector() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -612,7 +610,7 @@ fn zvec_parity_query_include_vector() {
 }
 
 #[test]
-fn zvec_parity_query_exclude_vector_by_default() {
+fn api_query_exclude_vector_by_default() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -656,7 +654,7 @@ fn zvec_parity_query_exclude_vector_by_default() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_topk_variations() {
+fn api_query_topk_variations() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -741,7 +739,7 @@ fn zvec_parity_query_topk_variations() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_empty_result_impossible_and() {
+fn api_query_empty_result_impossible_and() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -778,7 +776,7 @@ fn zvec_parity_query_empty_result_impossible_and() {
 }
 
 #[test]
-fn zvec_parity_query_empty_result_incompatible_equals() {
+fn api_query_empty_result_incompatible_equals() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -816,7 +814,7 @@ fn zvec_parity_query_empty_result_incompatible_equals() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_consistency_repeated_identical_queries() {
+fn api_query_consistency_repeated_identical_queries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -872,7 +870,7 @@ fn zvec_parity_query_consistency_repeated_identical_queries() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_all_comparison_operators() {
+fn api_filter_all_comparison_operators() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1014,7 +1012,7 @@ fn zvec_parity_filter_all_comparison_operators() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_bool_field_equals_true() {
+fn api_filter_bool_field_equals_true() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1055,7 +1053,7 @@ fn zvec_parity_filter_bool_field_equals_true() {
 }
 
 #[test]
-fn zvec_parity_filter_bool_field_equals_false() {
+fn api_filter_bool_field_equals_false() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1093,7 +1091,7 @@ fn zvec_parity_filter_bool_field_equals_false() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_float_field_range() {
+fn api_filter_float_field_range() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1142,7 +1140,7 @@ fn zvec_parity_filter_float_field_range() {
 }
 
 #[test]
-fn zvec_parity_filter_float_field_equals() {
+fn api_filter_float_field_equals() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1181,7 +1179,7 @@ fn zvec_parity_filter_float_field_equals() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_only_query_returns_all_matching_docs() {
+fn api_filter_only_query_returns_all_matching_docs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1220,7 +1218,7 @@ fn zvec_parity_filter_only_query_returns_all_matching_docs() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_only_query_with_output_fields() {
+fn api_filter_only_query_with_output_fields() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1257,7 +1255,7 @@ fn zvec_parity_filter_only_query_with_output_fields() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_output_fields_include_vector_with_filter() {
+fn api_query_output_fields_include_vector_with_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1307,7 +1305,7 @@ fn zvec_parity_query_output_fields_include_vector_with_filter() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_in_list_strings() {
+fn api_filter_in_list_strings() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())
@@ -1359,7 +1357,7 @@ fn zvec_parity_filter_in_list_strings() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_not_operator() {
+fn api_filter_not_operator() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
     db.create_collection_with_schema("docs", &standard_schema())

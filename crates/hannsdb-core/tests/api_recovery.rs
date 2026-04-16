@@ -106,8 +106,8 @@ fn rewrite_collection_to_two_segment_layout(
 }
 
 #[test]
-fn zvec_parity_recovery_opening_same_collection_twice_reuses_same_handle() {
-    let root = unique_temp_dir("hannsdb_zvec_handle_reuse");
+fn api_recovery_opening_same_collection_twice_reuses_same_handle() {
+    let root = unique_temp_dir("hannsdb_handle_reuse");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
         .expect("create collection");
@@ -122,8 +122,8 @@ fn zvec_parity_recovery_opening_same_collection_twice_reuses_same_handle() {
 }
 
 #[test]
-fn zvec_parity_recovery_version_set_persists_format_metadata_on_disk() {
-    let root = unique_temp_dir("hannsdb_zvec_version_set_persisted");
+fn api_recovery_version_set_persists_format_metadata_on_disk() {
+    let root = unique_temp_dir("hannsdb_version_set_persisted");
     fs::create_dir_all(&root).expect("create temp dir");
     let path = root.join("segment_set.json");
 
@@ -144,8 +144,8 @@ fn zvec_parity_recovery_version_set_persists_format_metadata_on_disk() {
 }
 
 #[test]
-fn zvec_parity_recovery_version_set_loads_legacy_segment_set_json() {
-    let root = unique_temp_dir("hannsdb_zvec_version_set_legacy");
+fn api_recovery_version_set_loads_legacy_segment_set_json() {
+    let root = unique_temp_dir("hannsdb_version_set_legacy");
     fs::create_dir_all(&root).expect("create temp dir");
     let path = root.join("segment_set.json");
 
@@ -164,8 +164,8 @@ fn zvec_parity_recovery_version_set_loads_legacy_segment_set_json() {
 }
 
 #[test]
-fn zvec_parity_recovery_reopen_reads_multi_segment_version_metadata_through_handle() {
-    let root = unique_temp_dir("hannsdb_zvec_reopen_version_set");
+fn api_recovery_reopen_reads_multi_segment_version_metadata_through_handle() {
+    let root = unique_temp_dir("hannsdb_reopen_version_set");
     {
         let mut db = HannsDb::open(&root).expect("open db");
         db.create_collection("docs", 2, "l2")
@@ -208,8 +208,8 @@ fn zvec_parity_recovery_reopen_reads_multi_segment_version_metadata_through_hand
 }
 
 #[test]
-fn zvec_parity_recovery_collection_handle_supports_concurrent_search_and_optimize() {
-    let root = unique_temp_dir("hannsdb_zvec_handle_concurrency");
+fn api_recovery_collection_handle_supports_concurrent_search_and_optimize() {
+    let root = unique_temp_dir("hannsdb_handle_concurrency");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
         .expect("create collection");

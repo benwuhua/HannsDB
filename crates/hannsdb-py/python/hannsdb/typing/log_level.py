@@ -10,7 +10,7 @@ class LogLevel(_StringEnum):
     Info = "info"
     Warn = "warn"
     Error = "error"
-    # SCREAMING_SNAKE_CASE aliases for zvec compatibility
+    # SCREAMING_SNAKE_CASE aliases
     DEBUG = "debug"
     INFO = "info"
     WARN = "warn"

@@ -6,10 +6,7 @@ __all__ = ["IndexType"]
 
 
 class IndexType(IntEnum):
-    """Enumeration of supported index types.
-
-    Values match zvec's IndexType for compatibility.
-    """
+    """Enumeration of supported index types."""
     UNDEFINED = 0
     HNSW = 1
     IVF = 3

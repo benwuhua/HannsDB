@@ -429,7 +429,7 @@ def test_collection_index_ddl_surface_runs_core_validation(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Create / Open input validation (aligned with zvec test_collection_create_and_open)
+# Create / Open input validation
 # ---------------------------------------------------------------------------
 
 

@@ -537,7 +537,6 @@ def test_query_executor_supports_builtin_rrf_reranker(tmp_path, monkeypatch):
     )
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
-    monkeypatch.delenv("ZVEC_QUERY_CONCURRENCY", raising=False)
     monkeypatch.delenv("HANNSDB_QUERY_CONCURRENCY", raising=False)
 
     context = hannsdb.QueryContext(
@@ -679,7 +678,7 @@ def test_query_executor_reranker_fanout_can_run_concurrently_when_enabled(
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
     reranker = RecordingReranker()
 
-    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+    monkeypatch.setenv("HANNSDB_QUERY_CONCURRENCY", "2")
 
     context = hannsdb.QueryContext(
         top_k=2,
@@ -707,7 +706,7 @@ def test_query_executor_propagates_errors_from_concurrent_fanout(
     )
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
-    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+    monkeypatch.setenv("HANNSDB_QUERY_CONCURRENCY", "2")
 
     context = hannsdb.QueryContext(
         top_k=2,
@@ -735,7 +734,7 @@ def test_query_executor_surfaces_fast_failure_before_slow_neighbor(
     )
     executor = hannsdb.QueryExecutorFactory.create(schema).build()
 
-    monkeypatch.setenv("ZVEC_QUERY_CONCURRENCY", "2")
+    monkeypatch.setenv("HANNSDB_QUERY_CONCURRENCY", "2")
 
     context = hannsdb.QueryContext(
         top_k=2,

@@ -1,4 +1,4 @@
-"""Exception handling tests — aligned with zvec test_collection_exception.py.
+"""Exception handling tests.
 
 Verifies that missing required parameters raise TypeError, and that
 positive-path lifecycle operations succeed without exceptions.

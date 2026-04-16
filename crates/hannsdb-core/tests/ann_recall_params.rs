@@ -1,9 +1,4 @@
-/// Port of zvec recall calculation and query parameter tests.
-///
-/// Mirrors patterns from:
-///   - zvec/python/tests/detail/test_collection_recall.py
-///   - zvec/python/tests/detail/test_collection_dql.py
-///   - zvec/python/tests/detail/distance_helper.py
+/// Recall calculation and query parameter tests.
 ///
 /// Distance conventions (matching HannsDB internals):
 ///   L2     = sqrt(sum((a-b)^2))
@@ -16,7 +11,7 @@ use hannsdb_core::document::{
 use hannsdb_core::query::{QueryContext, QueryVector, VectorQuery, VectorQueryParam};
 
 // ---------------------------------------------------------------------------
-// Inline distance helpers (mirroring zvec distance_helper.py / search.rs)
+// Inline distance helpers
 // ---------------------------------------------------------------------------
 
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
@@ -139,7 +134,7 @@ fn insert_test_data(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_recall_l2_metric_brute_force_ground_truth() {
+fn api_recall_l2_metric_brute_force_ground_truth() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -170,7 +165,7 @@ fn zvec_parity_recall_l2_metric_brute_force_ground_truth() {
 }
 
 #[test]
-fn zvec_parity_recall_cosine_metric_brute_force_ground_truth() {
+fn api_recall_cosine_metric_brute_force_ground_truth() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -200,7 +195,7 @@ fn zvec_parity_recall_cosine_metric_brute_force_ground_truth() {
 }
 
 #[test]
-fn zvec_parity_recall_ip_metric_brute_force_ground_truth() {
+fn api_recall_ip_metric_brute_force_ground_truth() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -234,7 +229,7 @@ fn zvec_parity_recall_ip_metric_brute_force_ground_truth() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_recall_improves_after_optimize() {
+fn api_recall_improves_after_optimize() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -277,7 +272,7 @@ fn zvec_parity_recall_improves_after_optimize() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_ef_search_higher_ef_gives_equal_or_better_recall() {
+fn api_ef_search_higher_ef_gives_equal_or_better_recall() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -314,7 +309,7 @@ fn zvec_parity_ef_search_higher_ef_gives_equal_or_better_recall() {
 }
 
 #[test]
-fn zvec_parity_ef_search_via_query_context_matches_search_with_ef() {
+fn api_ef_search_via_query_context_matches_search_with_ef() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -373,11 +368,11 @@ fn zvec_parity_ef_search_via_query_context_matches_search_with_ef() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: query_by_id (port of zvec test_query_by_id)
+// Tests: query_by_id
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_by_id_returns_results_using_existing_vector() {
+fn api_query_by_id_returns_results_using_existing_vector() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -424,11 +419,11 @@ fn zvec_parity_query_by_id_returns_results_using_existing_vector() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: Query consistency (port of zvec test_query_consistency)
+// Tests: Query consistency
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_query_consistency_same_results_five_times() {
+fn api_query_consistency_same_results_five_times() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -458,7 +453,7 @@ fn zvec_parity_query_consistency_same_results_five_times() {
 }
 
 #[test]
-fn zvec_parity_typed_query_consistency_same_results_five_times() {
+fn api_typed_query_consistency_same_results_five_times() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -511,7 +506,7 @@ fn zvec_parity_typed_query_consistency_same_results_five_times() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_topk_one_returns_single_result() {
+fn api_topk_one_returns_single_result() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -531,7 +526,7 @@ fn zvec_parity_topk_one_returns_single_result() {
 }
 
 #[test]
-fn zvec_parity_topk_exceeds_record_count_returns_all_records() {
+fn api_topk_exceeds_record_count_returns_all_records() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -568,7 +563,7 @@ fn zvec_parity_topk_exceeds_record_count_returns_all_records() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filter_excludes_all_returns_empty() {
+fn api_filter_excludes_all_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -630,7 +625,7 @@ fn zvec_parity_filter_excludes_all_returns_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_filtered_recall_matches_ground_truth() {
+fn api_filtered_recall_matches_ground_truth() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -716,7 +711,7 @@ fn zvec_parity_filtered_recall_matches_ground_truth() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_distances_sorted_ascending_l2() {
+fn api_distances_sorted_ascending_l2() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -737,7 +732,7 @@ fn zvec_parity_distances_sorted_ascending_l2() {
 }
 
 #[test]
-fn zvec_parity_distances_sorted_ascending_cosine() {
+fn api_distances_sorted_ascending_cosine() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -758,7 +753,7 @@ fn zvec_parity_distances_sorted_ascending_cosine() {
 }
 
 #[test]
-fn zvec_parity_distances_sorted_ascending_ip() {
+fn api_distances_sorted_ascending_ip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -784,7 +779,7 @@ fn zvec_parity_distances_sorted_ascending_ip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_brute_force_matches_search_for_l2() {
+fn api_brute_force_matches_search_for_l2() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -805,7 +800,7 @@ fn zvec_parity_brute_force_matches_search_for_l2() {
 }
 
 #[test]
-fn zvec_parity_brute_force_matches_search_for_cosine() {
+fn api_brute_force_matches_search_for_cosine() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 
@@ -826,7 +821,7 @@ fn zvec_parity_brute_force_matches_search_for_cosine() {
 }
 
 #[test]
-fn zvec_parity_brute_force_matches_search_for_ip() {
+fn api_brute_force_matches_search_for_ip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = HannsDb::open(dir.path()).expect("open db");
 

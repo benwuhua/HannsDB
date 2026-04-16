@@ -7,7 +7,7 @@ def test_doc_is_pure_python_facade_type():
     assert hannsdb.Doc.__module__ == "hannsdb.model.doc"
 
 
-def test_doc_constructor_supports_legacy_and_zvec_shapes():
+def test_doc_constructor_supports_legacy_and_vectors_shapes():
     legacy = hannsdb.Doc(
         id="1",
         vector=[0.1, 0.2],
@@ -15,7 +15,7 @@ def test_doc_constructor_supports_legacy_and_zvec_shapes():
         fields={"session_id": "abc"},
         score=0.5,
     )
-    zvec = hannsdb.Doc(
+    modern = hannsdb.Doc(
         id="2",
         score=0.25,
         vectors={"dense": [0.3, 0.4]},
@@ -26,12 +26,12 @@ def test_doc_constructor_supports_legacy_and_zvec_shapes():
     assert legacy.field("session_id") == "abc"
     assert legacy.has_vector("dense") is True
     assert legacy.has_field("session_id") is True
-    assert zvec.vector("dense") == [0.3, 0.4]
-    assert zvec.field("session_id") == "def"
-    assert zvec.has_vector("dense") is True
-    assert zvec.has_field("session_id") is True
+    assert modern.vector("dense") == [0.3, 0.4]
+    assert modern.field("session_id") == "def"
+    assert modern.has_vector("dense") is True
+    assert modern.has_field("session_id") is True
     assert legacy._get_native().__class__ is hannsdb._native.Doc
-    assert zvec._get_native().__class__ is hannsdb._native.Doc
+    assert modern._get_native().__class__ is hannsdb._native.Doc
 
 
 def test_doc_normalizes_numpy_vectors_and_replace():
@@ -3750,7 +3750,7 @@ def test_query_with_hnsw_sq_query_param(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# VectorQuery.id — query by document id (zvec API parity)
+# VectorQuery.id — query by document id
 # ---------------------------------------------------------------------------
 
 def _make_id_query_collection(tmp_path):

@@ -26,7 +26,7 @@ fn sparse_field_schema(name: &str) -> VectorFieldSchema {
 }
 
 #[test]
-fn zvec_parity_sparse_bruteforce_search_returns_correct_ordering() {
+fn api_sparse_bruteforce_search_returns_correct_ordering() {
     let root = unique_temp_dir("hannsdb_sparse_bruteforce");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -93,7 +93,7 @@ fn zvec_parity_sparse_bruteforce_search_returns_correct_ordering() {
 }
 
 #[test]
-fn zvec_parity_dense_and_sparse_mixed_query_works() {
+fn api_dense_and_sparse_mixed_query_works() {
     let root = unique_temp_dir("hannsdb_sparse_mixed");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -160,7 +160,7 @@ fn zvec_parity_dense_and_sparse_mixed_query_works() {
 }
 
 #[test]
-fn zvec_parity_sparse_query_with_filter() {
+fn api_sparse_query_with_filter() {
     let root = unique_temp_dir("hannsdb_sparse_filter");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(

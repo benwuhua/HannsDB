@@ -28,7 +28,7 @@ class DataType(_StringEnum):
     ArrayBool = "array_bool"
     ArrayUInt32 = "array_uint32"
     ArrayUInt64 = "array_uint64"
-    # SCREAMING_SNAKE_CASE aliases for zvec compatibility
+    # SCREAMING_SNAKE_CASE aliases
     STRING = "string"
     INT32 = "int32"
     INT64 = "int64"
@@ -36,7 +36,7 @@ class DataType(_StringEnum):
     UINT64 = "uint64"
     FLOAT = "float"
     FLOAT64 = "float64"
-    DOUBLE = "float64"  # zvec DOUBLE maps to float64
+    DOUBLE = "float64"  # alias for float64
     BOOL = "bool"
     VECTOR_FP32 = "vector_fp32"
     VECTOR_INT8 = "vector_int8"

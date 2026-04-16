@@ -1,7 +1,7 @@
 """Doc field-level access and dtype round-trip tests.
 
-Aligned with zvec test_doc.py TestCppDoc: verifies that scalar field values
-survive an insert→fetch round-trip with correct dtype semantics.
+Verifies that scalar field values survive an insert->fetch round-trip
+with correct dtype semantics.
 """
 
 import math

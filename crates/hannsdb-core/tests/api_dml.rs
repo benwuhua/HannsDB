@@ -1,5 +1,4 @@
-//! DML edge-case and concurrent-operation tests ported from zvec's
-//! test_collection_dml.py and test_collection_concurrency.py.
+//! DML edge-case and concurrent-operation tests.
 //!
 //! Covers:
 //!   batch insert, duplicate-id rejection, upsert, partial update,

@@ -10,7 +10,7 @@ class QuantizeType(_StringEnum):
     Fp16 = "fp16"
     Int8 = "int8"
     Int4 = "int4"
-    # SCREAMING_SNAKE_CASE aliases for zvec compatibility
+    # SCREAMING_SNAKE_CASE aliases
     UNDEFINED = "undefined"
     FP16 = "fp16"
     INT8 = "int8"

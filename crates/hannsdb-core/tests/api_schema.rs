@@ -31,7 +31,7 @@ fn stored_schema_value() -> Value {
 }
 
 #[test]
-fn zvec_parity_schema_round_trips_multiple_vector_fields() {
+fn api_schema_round_trips_multiple_vector_fields() {
     let actual = stored_schema_value();
     let vectors = actual["vectors"]
         .as_array()
@@ -48,7 +48,7 @@ fn zvec_parity_schema_round_trips_multiple_vector_fields() {
 }
 
 #[test]
-fn zvec_parity_schema_round_trips_vector_index_metadata() {
+fn api_schema_round_trips_vector_index_metadata() {
     let actual = stored_schema_value();
     let vectors = actual
         .get("vectors")
@@ -78,7 +78,7 @@ fn zvec_parity_schema_round_trips_vector_index_metadata() {
 }
 
 #[test]
-fn zvec_parity_schema_round_trips_nullable_and_array_scalar_fields() {
+fn api_schema_round_trips_nullable_and_array_scalar_fields() {
     let actual_fields = stored_schema_value()["fields"].clone();
     let expected_fields = json!([
         {
@@ -105,7 +105,7 @@ fn zvec_parity_schema_round_trips_nullable_and_array_scalar_fields() {
 }
 
 #[test]
-fn zvec_parity_schema_migrates_legacy_single_vector_metadata_into_field_registries() {
+fn api_schema_migrates_legacy_single_vector_metadata_into_field_registries() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let path = tempdir.path().join("collection.json");
     let legacy_metadata = json!({
@@ -150,7 +150,7 @@ fn zvec_parity_schema_migrates_legacy_single_vector_metadata_into_field_registri
 }
 
 #[test]
-fn zvec_parity_schema_legacy_constructor_maps_to_single_primary_vector_registry() {
+fn api_schema_legacy_constructor_maps_to_single_primary_vector_registry() {
     let schema = CollectionSchema::new(
         "dense",
         384,

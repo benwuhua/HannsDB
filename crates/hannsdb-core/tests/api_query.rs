@@ -191,7 +191,7 @@ fn rewrite_collection_to_two_segment_layout_with_secondary_vectors(
 }
 
 #[test]
-fn zvec_parity_schema_query_surface_compiles_against_typed_batch_request() {
+fn api_schema_query_surface_compiles_against_typed_batch_request() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let crate_dir = tempdir.path().join("query-surface-check");
     let src_dir = crate_dir.join("src");
@@ -257,7 +257,7 @@ fn main() {
 }
 
 #[test]
-fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter() {
+fn api_query_context_merges_vector_and_query_by_id_sources_with_filter() {
     let root = unique_temp_dir("hannsdb_typed_query_context_merge");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -340,7 +340,7 @@ fn zvec_parity_query_context_merges_vector_and_query_by_id_sources_with_filter()
 }
 
 #[test]
-fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce_path() {
+fn api_query_context_supports_secondary_vector_field_on_typed_bruteforce_path() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_vector");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -413,7 +413,7 @@ fn zvec_parity_query_context_supports_secondary_vector_field_on_typed_bruteforce
 }
 
 #[test]
-fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_typed_fast_path_with_ef_search(
+fn api_query_context_supports_schema_indexed_secondary_vector_field_on_typed_fast_path_with_ef_search(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_schema_indexed_fast_path");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -494,7 +494,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_on_t
 }
 
 #[test]
-fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with_dimension_mismatch_between_primary_and_secondary(
+fn api_query_context_supports_schema_indexed_secondary_vector_field_with_dimension_mismatch_between_primary_and_secondary(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_schema_indexed_dimension_mismatch");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -575,7 +575,7 @@ fn zvec_parity_query_context_supports_schema_indexed_secondary_vector_field_with
 }
 
 #[test]
-fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_on_typed_fast_path_with_ef_search(
+fn api_query_context_supports_descriptor_backed_secondary_vector_field_on_typed_fast_path_with_ef_search(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_descriptor_indexed_fast_path");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -665,7 +665,7 @@ fn zvec_parity_query_context_supports_descriptor_backed_secondary_vector_field_o
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_field() {
+fn api_query_context_rejects_ef_search_for_unindexed_secondary_vector_field() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_unindexed_ef_search");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -728,7 +728,7 @@ fn zvec_parity_query_context_rejects_ef_search_for_unindexed_secondary_vector_fi
 }
 
 #[test]
-fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_bruteforce_path() {
+fn api_query_context_uses_secondary_vector_field_metric_on_typed_bruteforce_path() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_vector_metric");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -805,7 +805,7 @@ fn zvec_parity_query_context_uses_secondary_vector_field_metric_on_typed_brutefo
 }
 
 #[test]
-fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_bruteforce_path() {
+fn api_query_context_uses_query_by_id_field_name_metric_on_typed_bruteforce_path() {
     let root = unique_temp_dir("hannsdb_typed_query_query_by_id_field_metric");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -885,7 +885,7 @@ fn zvec_parity_query_context_uses_query_by_id_field_name_metric_on_typed_brutefo
 }
 
 #[test]
-fn zvec_parity_query_context_accepts_mixed_metric_typed_recall_sources() {
+fn api_query_context_accepts_mixed_metric_typed_recall_sources() {
     let root = unique_temp_dir("hannsdb_typed_query_mixed_metric_recall");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -944,7 +944,7 @@ fn zvec_parity_query_context_accepts_mixed_metric_typed_recall_sources() {
 }
 
 #[test]
-fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources() {
+fn api_query_context_merges_primary_and_secondary_vector_recall_sources() {
     let root = unique_temp_dir("hannsdb_typed_query_mixed_recall");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -1024,7 +1024,7 @@ fn zvec_parity_query_context_merges_primary_and_secondary_vector_recall_sources(
 }
 
 #[test]
-fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_with_secondary_schema(
+fn api_query_context_single_vector_ef_search_matches_legacy_search_path_with_secondary_schema(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_single_vector_ef_search_secondary_schema");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1100,7 +1100,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path_
 }
 
 #[test]
-fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
+fn api_query_context_group_by_returns_best_hit_per_group() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_recall");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1181,7 +1181,7 @@ fn zvec_parity_query_context_group_by_returns_best_hit_per_group() {
 }
 
 #[test]
-fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
+fn api_query_context_group_by_keeps_top_ranked_missing_field_hit() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_missing_field");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1247,7 +1247,7 @@ fn zvec_parity_query_context_group_by_keeps_top_ranked_missing_field_hit() {
 }
 
 #[test]
-fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
+fn api_query_context_group_by_canonicalizes_float_groups() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_float_canonical");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1311,7 +1311,7 @@ fn zvec_parity_query_context_group_by_canonicalizes_float_groups() {
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
+fn api_query_context_rejects_group_by_on_invalid_or_vector_field() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_invalid_field");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1385,7 +1385,7 @@ fn zvec_parity_query_context_rejects_group_by_on_invalid_or_vector_field() {
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
+fn api_query_context_rejects_filter_only_group_by_in_this_slice() {
     let root = unique_temp_dir("hannsdb_typed_query_group_by_filter_only");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1424,7 +1424,7 @@ fn zvec_parity_query_context_rejects_filter_only_group_by_in_this_slice() {
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_reranker_until_supported() {
+fn api_query_context_rejects_reranker_until_supported() {
     let root = unique_temp_dir("hannsdb_typed_query_reranker");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
@@ -1459,7 +1459,7 @@ fn zvec_parity_query_context_rejects_reranker_until_supported() {
 }
 
 #[test]
-fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match() {
+fn api_query_context_prefers_newer_segment_version_over_better_old_match() {
     let root = unique_temp_dir("hannsdb_typed_query_segment_shadowing");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1537,7 +1537,7 @@ fn zvec_parity_query_context_prefers_newer_segment_version_over_better_old_match
 }
 
 #[test]
-fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respects_tombstones_and_missing_vectors(
+fn api_query_context_secondary_fast_path_shadowing_across_segments_respects_tombstones_and_missing_vectors(
 ) {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_shadowing_across_segments");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -1693,7 +1693,7 @@ fn zvec_parity_query_context_secondary_fast_path_shadowing_across_segments_respe
 }
 
 #[test]
-fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_secondary_insert() {
+fn api_query_context_invalidates_secondary_fast_path_cache_after_secondary_insert() {
     let root = unique_temp_dir("hannsdb_typed_query_secondary_cache_invalidation");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -1826,7 +1826,7 @@ fn zvec_parity_query_context_invalidates_secondary_fast_path_cache_after_seconda
 }
 
 #[test]
-fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segment_row() {
+fn api_query_context_tombstoned_newer_duplicate_still_shadows_older_segment_row() {
     let root = unique_temp_dir("hannsdb_typed_query_tombstoned_shadowing");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1899,7 +1899,7 @@ fn zvec_parity_query_context_tombstoned_newer_duplicate_still_shadows_older_segm
 }
 
 #[test]
-fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombstoned() {
+fn api_query_by_id_rejects_older_segment_row_when_newer_state_is_tombstoned() {
     let root = unique_temp_dir("hannsdb_typed_query_by_id_tombstoned_shadowing");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -1968,7 +1968,7 @@ fn zvec_parity_query_by_id_rejects_older_segment_row_when_newer_state_is_tombsto
 }
 
 #[test]
-fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path() {
+fn api_query_context_single_vector_ef_search_matches_legacy_search_path() {
     let root = unique_temp_dir("hannsdb_typed_query_single_vector_ef_search");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
@@ -2030,7 +2030,7 @@ fn zvec_parity_query_context_single_vector_ef_search_matches_legacy_search_path(
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
+fn api_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
     let root = unique_temp_dir("hannsdb_typed_query_params");
     let mut db = HannsDb::open(&root).expect("open db");
     db.create_collection("docs", 2, "l2")
@@ -2068,7 +2068,7 @@ fn zvec_parity_query_context_rejects_ef_search_on_query_by_id_merge_shape() {
 }
 
 #[test]
-fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_k() {
+fn api_filter_only_query_returns_live_docs_in_id_order_and_respects_top_k() {
     let root = unique_temp_dir("hannsdb_typed_query_filter_only");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -2191,7 +2191,7 @@ fn zvec_parity_filter_only_query_returns_live_docs_in_id_order_and_respects_top_
 }
 
 #[test]
-fn zvec_parity_query_context_matches_manual_ground_truth_for_typed_filter_queries() {
+fn api_query_context_matches_manual_ground_truth_for_typed_filter_queries() {
     let root = unique_temp_dir("hannsdb_typed_query_ground_truth");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -2306,7 +2306,7 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
+fn api_query_context_projects_output_fields_on_typed_hits() {
     let root = unique_temp_dir("hannsdb_typed_query_output_fields");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -2380,7 +2380,7 @@ fn zvec_parity_query_context_projects_output_fields_on_typed_hits() {
 }
 
 #[test]
-fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
+fn api_query_context_includes_vectors_on_single_vector_fast_path() {
     let root = unique_temp_dir("hannsdb_typed_query_include_vector");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -2447,7 +2447,7 @@ fn zvec_parity_query_context_includes_vectors_on_single_vector_fast_path() {
 }
 
 #[test]
-fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
+fn api_query_context_includes_vectors_with_query_by_id_recall_source() {
     let root = unique_temp_dir("hannsdb_typed_query_include_vector_query_by_id");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -2511,7 +2511,7 @@ fn zvec_parity_query_context_includes_vectors_with_query_by_id_recall_source() {
 }
 
 #[test]
-fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_name_is_unset() {
+fn api_query_context_defaults_query_by_id_to_primary_vector_when_field_name_is_unset() {
     let root = unique_temp_dir("hannsdb_typed_query_query_by_id_primary_default");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -2578,7 +2578,7 @@ fn zvec_parity_query_context_defaults_query_by_id_to_primary_vector_when_field_n
 }
 
 #[test]
-fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configured() {
+fn api_query_context_uses_secondary_vector_for_query_by_id_when_configured() {
     let root = unique_temp_dir("hannsdb_typed_query_query_by_id_secondary_recall");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -2642,7 +2642,7 @@ fn zvec_parity_query_context_uses_secondary_vector_for_query_by_id_when_configur
 }
 
 #[test]
-fn zvec_parity_query_context_rejects_invalid_query_by_id_field_name() {
+fn api_query_context_rejects_invalid_query_by_id_field_name() {
     let root = unique_temp_dir("hannsdb_typed_query_query_by_id_invalid_field");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new("dense", 2, "l2", vec![]);
@@ -2676,7 +2676,7 @@ fn zvec_parity_query_context_rejects_invalid_query_by_id_field_name() {
 }
 
 #[test]
-fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing() {
+fn api_query_context_errors_when_secondary_query_by_id_vector_is_missing() {
     let root = unique_temp_dir("hannsdb_typed_query_query_by_id_missing_secondary");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -2726,7 +2726,7 @@ fn zvec_parity_query_context_errors_when_secondary_query_by_id_vector_is_missing
 }
 
 #[test]
-fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_absent() {
+fn api_query_context_ignores_query_by_id_field_name_when_query_by_id_is_absent() {
     let root = unique_temp_dir("hannsdb_typed_query_ignore_query_by_id_field_name");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -2791,7 +2791,7 @@ fn zvec_parity_query_context_ignores_query_by_id_field_name_when_query_by_id_is_
 }
 
 #[test]
-fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_from_disk() {
+fn api_query_context_include_vector_errors_when_fetched_hit_disappears_from_disk() {
     let root = unique_temp_dir("hannsdb_typed_query_include_vector_fetch_mismatch");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(
@@ -2865,7 +2865,7 @@ fn zvec_parity_query_context_include_vector_errors_when_fetched_hit_disappears_f
 }
 
 #[test]
-fn zvec_parity_filter_only_query_projects_output_fields() {
+fn api_filter_only_query_projects_output_fields() {
     let root = unique_temp_dir("hannsdb_typed_query_filter_only_output_fields");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(

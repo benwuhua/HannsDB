@@ -15,7 +15,7 @@ fn unique_temp_dir(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn zvec_parity_string_pk_reopens_and_query_by_id_resolves_alphanumeric_key() {
+fn api_string_pk_reopens_and_query_by_id_resolves_alphanumeric_key() {
     let root = unique_temp_dir("hannsdb_string_pk_query_by_id");
     let mut db = HannsDb::open(&root).expect("open db");
     let schema = CollectionSchema::new(

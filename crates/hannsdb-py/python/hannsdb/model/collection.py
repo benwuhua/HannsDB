@@ -70,7 +70,7 @@ class MutationResult(int):
     """An int subclass returned by insert/upsert/update/delete/delete_by_filter.
 
     Preserves all int semantics (comparison, arithmetic) while adding an .ok()
-    method for zvec API compatibility.
+    method that returns True when the value is non-negative.
     """
 
     def ok(self) -> bool:

@@ -82,7 +82,7 @@ def _normalize_log_level(log_level):
 
 
 def init(log_level="warn", log_type=None, log_dir=None):
-    # log_type and log_dir accepted for zvec API compatibility; native layer only uses log_level
+    # log_type and log_dir accepted for API compatibility; native layer only uses log_level
     return _native_module.init(_normalize_log_level(log_level))
 
 __all__ = sorted(set(_native_exports + _facade_exports))

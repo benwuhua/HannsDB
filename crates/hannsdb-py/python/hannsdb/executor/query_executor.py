@@ -21,7 +21,7 @@ class QueryExecutor:
 
     @staticmethod
     def _query_concurrency() -> int:
-        for env_name in ("ZVEC_QUERY_CONCURRENCY", "HANNSDB_QUERY_CONCURRENCY"):
+        for env_name in ("HANNSDB_QUERY_CONCURRENCY",):
             raw_value = os.getenv(env_name)
             if raw_value is None:
                 continue

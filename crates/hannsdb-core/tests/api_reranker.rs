@@ -1,13 +1,6 @@
-//! Integration tests ported from zvec's multi-vector reranker test suite.
+//! Integration tests for multi-vector reranker functionality.
 //!
-//! Source tests:
-//! - zvec/python/tests/detail/test_collection_dql.py
-//!   - test_query_multivector_rrf
-//!   - test_query_multivector_weighted
-//!   - TestRRFScoreCalculation
-//! - zvec/python/tests/test_reranker.py
-//!   - TestRrfReRanker
-//!   - TestWeightedReRanker
+//! Covers RRF and weighted reranking with dense and sparse vector fields.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,10 +33,10 @@ fn sparse_field_schema(name: &str) -> VectorFieldSchema {
 // ---------------------------------------------------------------------------
 // Test 1: RRF basic — 2 dense vector fields, query both, rerank with RRF
 // ---------------------------------------------------------------------------
-// Ported from zvec test_query_multivector_rrf and test_reranker.py TestRrfReRanker.test_rerank
+
 
 #[test]
-fn zvec_parity_rrf_basic_two_dense_fields() {
+fn api_rrf_basic_two_dense_fields() {
     let root = unique_temp_dir("hannsdb_rrf_basic");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -137,11 +130,10 @@ fn zvec_parity_rrf_basic_two_dense_fields() {
 // ---------------------------------------------------------------------------
 // Test 2: RRF score calculation — verify formula 1/(k+rank+1)
 // ---------------------------------------------------------------------------
-// Ported from zvec TestRRFScoreCalculation.test_rrf_score_calculation_formula
-// and test_rrf_score, test_multi_vector_rrf_scores
+
 
 #[test]
-fn zvec_parity_rrf_score_calculation_matches_formula() {
+fn api_rrf_score_calculation_matches_formula() {
     let root = unique_temp_dir("hannsdb_rrf_formula");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -243,10 +235,10 @@ fn zvec_parity_rrf_score_calculation_matches_formula() {
 // ---------------------------------------------------------------------------
 // Test 3: Weighted basic — 2 dense vector fields, query both, rerank with weights
 // ---------------------------------------------------------------------------
-// Ported from zvec test_reranker.py TestWeightedReRanker.test_rerank
+
 
 #[test]
-fn zvec_parity_weighted_basic_two_dense_fields() {
+fn api_weighted_basic_two_dense_fields() {
     let root = unique_temp_dir("hannsdb_weighted_basic");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -327,10 +319,10 @@ fn zvec_parity_weighted_basic_two_dense_fields() {
 // ---------------------------------------------------------------------------
 // Test 4: Weighted with metric normalization — verify L2/IP/COSINE normalization
 // ---------------------------------------------------------------------------
-// Ported from zvec test_reranker.py TestWeightedReRanker.test_normalize_score
+
 
 #[test]
-fn zvec_parity_weighted_metric_normalization() {
+fn api_weighted_metric_normalization() {
     // Test with cosine metric override
     let root = unique_temp_dir("hannsdb_weighted_metric");
     let mut db = HannsDb::open(&root).expect("open db");
@@ -408,10 +400,10 @@ fn zvec_parity_weighted_metric_normalization() {
 // ---------------------------------------------------------------------------
 // Test 5: Dense + sparse hybrid — query dense and sparse fields with RRF reranker
 // ---------------------------------------------------------------------------
-// Ported from zvec test_query_multivector_rrf pattern (multi-modal recall)
+
 
 #[test]
-fn zvec_parity_dense_sparse_hybrid_rrf() {
+fn api_dense_sparse_hybrid_rrf() {
     let root = unique_temp_dir("hannsdb_hybrid_rrf");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -505,7 +497,7 @@ fn zvec_parity_dense_sparse_hybrid_rrf() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_rrf_with_filter() {
+fn api_rrf_with_filter() {
     let root = unique_temp_dir("hannsdb_rrf_filter");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -589,10 +581,10 @@ fn zvec_parity_rrf_with_filter() {
 // ---------------------------------------------------------------------------
 // Test 7: Weighted with unequal weights — 0.7 vs 0.3
 // ---------------------------------------------------------------------------
-// Ported from zvec TestWeightedReRanker test patterns
+
 
 #[test]
-fn zvec_parity_weighted_unequal_weights() {
+fn api_weighted_unequal_weights() {
     let root = unique_temp_dir("hannsdb_weighted_unequal");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -685,7 +677,7 @@ fn zvec_parity_weighted_unequal_weights() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_single_vector_no_reranker_unchanged() {
+fn api_single_vector_no_reranker_unchanged() {
     let root = unique_temp_dir("hannsdb_no_reranker");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -761,7 +753,7 @@ fn zvec_parity_single_vector_no_reranker_unchanged() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_rrf_topk_limits_results() {
+fn api_rrf_topk_limits_results() {
     let root = unique_temp_dir("hannsdb_rrf_topk");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(
@@ -853,7 +845,7 @@ fn zvec_parity_rrf_topk_limits_results() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn zvec_parity_rrf_with_output_fields() {
+fn api_rrf_with_output_fields() {
     let root = unique_temp_dir("hannsdb_rrf_output_fields");
     let mut db = HannsDb::open(&root).expect("open db");
     let mut schema = CollectionSchema::new(

@@ -3046,7 +3046,7 @@ impl PyCollectionStats {
         self.inner.live_count
     }
 
-    /// Alias for live_count — matches zvec's CollectionStats.doc_count.
+    /// Alias for live_count — mirrors CollectionStats.doc_count.
     #[getter]
     fn doc_count(&self) -> usize {
         self.inner.live_count
