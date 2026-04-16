@@ -3748,3 +3748,59 @@ def test_query_with_hnsw_sq_query_param(tmp_path):
     assert len(results) > 0
     col.destroy()
 
+
+# ---------------------------------------------------------------------------
+# VectorQuery.id — query by document id (zvec API parity)
+# ---------------------------------------------------------------------------
+
+def _make_id_query_collection(tmp_path):
+    schema = hannsdb.CollectionSchema(
+        name="id_query_test",
+        primary_vector="vec",
+        fields=[],
+        vectors=[hannsdb.VectorSchema(
+            name="vec",
+            data_type="vector_fp32",
+            dimension=4,
+            index_param=hannsdb.FlatIndexParam(),
+        )],
+    )
+    col = hannsdb.create_and_open(str(tmp_path), schema)
+    docs = [
+        hannsdb.Doc(id=str(i), vectors={"vec": [float(i), 0.0, 0.0, 0.0]}, fields={})
+        for i in range(5)
+    ]
+    col.insert(docs)
+    return col
+
+
+def test_vector_query_id_field_only(tmp_path):
+    """VectorQuery(id=...) returns neighbours of the referenced document's vector."""
+    col = _make_id_query_collection(tmp_path)
+    results = col.query(
+        hannsdb.VectorQuery(field_name="vec", id="2"),
+        topk=3,
+    )
+    assert len(results) > 0
+    ids = {r.id for r in results}
+    assert "2" in ids
+    col.destroy()
+
+
+def test_vector_query_id_and_vector_raises(tmp_path):
+    """Providing both id and vector raises ValueError."""
+    import pytest
+    with pytest.raises(ValueError):
+        hannsdb.VectorQuery(field_name="vec", vector=[1.0, 0.0, 0.0, 0.0], id="2")
+
+
+def test_vector_query_has_id_and_has_vector():
+    """has_id() and has_vector() reflect which source is set."""
+    vq_id = hannsdb.VectorQuery(field_name="vec", id="42")
+    assert vq_id.has_id() is True
+    assert vq_id.has_vector() is False
+
+    vq_vec = hannsdb.VectorQuery(field_name="vec", vector=[1.0, 0.0, 0.0, 0.0])
+    assert vq_vec.has_id() is False
+    assert vq_vec.has_vector() is True
+

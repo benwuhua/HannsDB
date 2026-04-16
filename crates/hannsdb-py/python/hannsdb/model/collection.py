@@ -402,6 +402,21 @@ def _build_query_context(
     else:
         query_list = [vectors]
 
+    # Extract VectorQuery objects that carry .id instead of .vector and promote
+    # them to query_by_id/query_by_id_field_name on the context (only when the
+    # caller hasn't already provided an explicit query_by_id).
+    if query_by_id is None:
+        id_queries = [q for q in query_list if getattr(q, "id", None) is not None]
+        if id_queries:
+            if len(id_queries) > 1:
+                raise ValueError(
+                    "At most one id-based VectorQuery may be provided per query call"
+                )
+            id_vq = id_queries[0]
+            query_list = [q for q in query_list if getattr(q, "id", None) is None]
+            query_by_id = id_vq.id
+            query_by_id_field_name = id_vq.field_name
+
     return QueryContext(
         top_k=topk,
         filter=filter,

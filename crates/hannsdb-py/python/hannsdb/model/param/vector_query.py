@@ -72,17 +72,36 @@ class SparseVector:
 @dataclass
 class VectorQuery:
     field_name: str
-    vector: Any  # Can be list[float], numpy.ndarray, or SparseVector
+    vector: Any = None  # list[float], numpy.ndarray, or SparseVector; None when id is set
     param: Optional[Any] = None
+    id: Optional[str] = None  # Query by document id instead of explicit vector
 
     def __post_init__(self) -> None:
+        if self.id is not None and self.vector is not None:
+            raise ValueError("Cannot provide both id and vector in VectorQuery")
         # Accept both the facade SparseVector and the native PyO3 SparseVector (duck-typed).
-        is_sparse = isinstance(self.vector, SparseVector) or (
-            hasattr(self.vector, "indices") and hasattr(self.vector, "values")
-        )
-        if not is_sparse:
-            self.vector = _normalize_vector(self.vector)
+        if self.vector is not None:
+            is_sparse = isinstance(self.vector, SparseVector) or (
+                hasattr(self.vector, "indices") and hasattr(self.vector, "values")
+            )
+            if not is_sparse:
+                self.vector = _normalize_vector(self.vector)
         self.param = _normalize_query_param(self.param)
+
+    def has_id(self) -> bool:
+        """Return True if this query is based on a document id."""
+        return self.id is not None
+
+    def has_vector(self) -> bool:
+        """Return True if this query contains an explicit vector."""
+        if self.vector is None:
+            return False
+        if hasattr(self.vector, "indices"):  # sparse
+            return True
+        try:
+            return len(self.vector) > 0
+        except TypeError:
+            return False
 
 
 @dataclass
