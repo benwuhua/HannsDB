@@ -593,7 +593,10 @@ fn build_scalar_array_field(
                                 _ => {
                                     return Err(io::Error::new(
                                         io::ErrorKind::InvalidInput,
-                                        format!("non-float64 element in array field {}", field.name),
+                                        format!(
+                                            "non-float64 element in array field {}",
+                                            field.name
+                                        ),
                                     ))
                                 }
                             }

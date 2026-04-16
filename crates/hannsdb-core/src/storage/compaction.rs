@@ -8,9 +8,9 @@ use std::path::Path;
 use crate::catalog::CollectionMetadata;
 use crate::document::FieldType;
 use crate::segment::{
-    append_record_ids, append_records, append_records_f16, append_sparse_vectors,
-    load_record_ids, load_records, load_records_f16, write_payloads_arrow, write_vectors_arrow,
-    SegmentMetadata, SegmentPaths, TombstoneMask, VersionSet,
+    append_record_ids, append_records, append_records_f16, append_sparse_vectors, load_record_ids,
+    load_records, load_records_f16, write_payloads_arrow, write_vectors_arrow, SegmentMetadata,
+    SegmentPaths, TombstoneMask, VersionSet,
 };
 use crate::storage::paths::{CollectionPaths, CollectionPaths as Paths};
 use crate::storage::segment_io::{
