@@ -190,6 +190,11 @@ pub struct HnswSqQueryParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HnswHvqQueryParam {
+    pub ef_search: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexOption {
     pub concurrency: usize,
 }
@@ -473,7 +478,11 @@ fn py_vector_query_from_pyany(query: &Bound<'_, PyAny>) -> PyResult<VectorQuery>
                 .getattr("ef_search")
                 .ok()
                 .and_then(|v| v.extract::<usize>().ok());
-            let has_ef = param.getattr("ef").ok().and_then(|v| v.extract::<usize>().ok()).is_some();
+            let has_ef = param
+                .getattr("ef")
+                .ok()
+                .and_then(|v| v.extract::<usize>().ok())
+                .is_some();
             if let (Some(ef_search), false) = (ef_search_val, has_ef) {
                 // HnswSqQueryParam path: use ef_search as the ef parameter
                 Some(HnswQueryParam {
@@ -2371,6 +2380,30 @@ impl PyHnswSqQueryParam {
 }
 
 #[cfg(feature = "python-binding")]
+#[pyclass(name = "HnswHvqQueryParam", module = "hannsdb")]
+#[derive(Clone)]
+struct PyHnswHvqQueryParam {
+    inner: HnswHvqQueryParam,
+}
+
+#[cfg(feature = "python-binding")]
+#[pymethods]
+impl PyHnswHvqQueryParam {
+    #[new]
+    #[pyo3(signature = (ef_search=50))]
+    fn new(ef_search: usize) -> Self {
+        Self {
+            inner: HnswHvqQueryParam { ef_search },
+        }
+    }
+
+    #[getter]
+    fn ef_search(&self) -> usize {
+        self.inner.ef_search
+    }
+}
+
+#[cfg(feature = "python-binding")]
 #[pyclass(name = "IndexOption", module = "hannsdb")]
 #[derive(Clone)]
 struct PyIndexOption {
@@ -2827,9 +2860,19 @@ impl PyVectorQuery {
                         nprobe: 0,
                         is_using_refiner: false,
                     })
+                } else if bound.is_instance_of::<PyHnswHvqQueryParam>() {
+                    let hvq = bound
+                        .extract::<PyRef<'_, PyHnswHvqQueryParam>>()?
+                        .inner
+                        .clone();
+                    Some(HnswQueryParam {
+                        ef: hvq.ef_search,
+                        nprobe: 0,
+                        is_using_refiner: false,
+                    })
                 } else {
                     return Err(PyValueError::new_err(
-                        "query param must be HnswQueryParam, IVFQueryParam, IvfUsqQueryParam, or HnswSqQueryParam",
+                        "query param must be HnswQueryParam, IVFQueryParam, IvfUsqQueryParam, HnswSqQueryParam, or HnswHvqQueryParam",
                     ));
                 }
             }
@@ -3526,6 +3569,7 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyIVFQueryParam>()?;
     module.add_class::<PyIvfUsqQueryParam>()?;
     module.add_class::<PyHnswSqQueryParam>()?;
+    module.add_class::<PyHnswHvqQueryParam>()?;
     module.add_class::<PyIndexOption>()?;
     module.add_class::<PyFieldSchema>()?;
     module.add_class::<PyVectorSchema>()?;

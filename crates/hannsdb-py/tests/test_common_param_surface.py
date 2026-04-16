@@ -149,3 +149,24 @@ def test_index_option_custom_concurrency():
 def test_hnsw_sq_query_param_and_index_option_are_public():
     assert hannsdb.HnswSqQueryParam is hannsdb.model.param.HnswSqQueryParam
     assert hannsdb.IndexOption is not None
+
+
+def test_hnsw_hvq_query_param_defaults_and_validation():
+    param = hannsdb.HnswHvqQueryParam()
+    assert param.ef_search == 50
+    assert param._get_native().__class__ is hannsdb._native.HnswHvqQueryParam
+
+
+def test_hnsw_hvq_query_param_custom_ef_search():
+    param = hannsdb.HnswHvqQueryParam(ef_search=200)
+    assert param.ef_search == 200
+
+
+def test_hnsw_hvq_query_param_rejects_invalid():
+    import pytest
+    with pytest.raises((ValueError, TypeError)):
+        hannsdb.HnswHvqQueryParam(ef_search="bad")
+
+
+def test_hnsw_hvq_query_param_is_public():
+    assert hannsdb.HnswHvqQueryParam is hannsdb.model.param.HnswHvqQueryParam

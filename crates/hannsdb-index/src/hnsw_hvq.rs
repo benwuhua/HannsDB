@@ -142,8 +142,11 @@ impl VectorIndexBackend for HnswHvqIndex {
         &self,
         query: &[f32],
         k: usize,
-        _ef_search: usize,
+        ef_search: usize,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
+        // hanns::faiss::HnswHvqIndex.search does not accept a runtime ef_search;
+        // the value is accepted for API parity but honoured only at construction time.
+        let _ = ef_search;
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
                 expected: self.dim,
@@ -169,9 +172,10 @@ impl VectorIndexBackend for HnswHvqIndex {
         &self,
         query: &[f32],
         k: usize,
-        _ef_search: usize,
+        ef_search: usize,
         bitset: &hanns::BitsetView,
     ) -> Result<Vec<HnswSearchHit>, AdapterError> {
+        let _ = ef_search;
         if query.len() != self.dim {
             return Err(AdapterError::InvalidDimension {
                 expected: self.dim,
