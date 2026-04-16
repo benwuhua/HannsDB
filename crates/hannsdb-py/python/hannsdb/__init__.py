@@ -31,7 +31,7 @@ from .model import (
     VectorQuery,
     VectorSchema,
 )
-from .model.collection import create_and_open, open
+from .model.collection import MutationResult, create_and_open, open
 
 _native_exports = [name for name in dir(_native_module) if not name.startswith("_")]
 _facade_exports = [
@@ -63,6 +63,7 @@ _facade_exports = [
     "QueryExecutorFactory",
     "OptimizeOption",
     "MetricType",
+    "MutationResult",
     "ReRanker",
     "RrfReRanker",
     "WeightedReRanker",

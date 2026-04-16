@@ -66,6 +66,17 @@ def _resolve_index_target(schema: CollectionSchema, field_name: str):
     raise KeyError(field_name)
 
 
+class MutationResult(int):
+    """An int subclass returned by insert/upsert/update/delete/delete_by_filter.
+
+    Preserves all int semantics (comparison, arithmetic) while adding an .ok()
+    method for zvec API compatibility.
+    """
+
+    def ok(self) -> bool:
+        return self >= 0
+
+
 def _native_value(value):
     native_getter = getattr(value, "_get_native", None)
     if native_getter is not None:
@@ -686,7 +697,7 @@ class Collection:
             _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
             coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
         with self._core_lock:
-            return self._core.insert(_coerce_docs_to_native(coerced))
+            return MutationResult(self._core.insert(_coerce_docs_to_native(coerced)))
 
     def upsert(self, docs):
         coerced = []
@@ -694,7 +705,7 @@ class Collection:
             _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
             coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
         with self._core_lock:
-            return self._core.upsert(_coerce_docs_to_native(coerced))
+            return MutationResult(self._core.upsert(_coerce_docs_to_native(coerced)))
 
     def update(self, docs):
         patches = []
@@ -717,9 +728,9 @@ class Collection:
                 current_docs[patch.id] = merged
                 merged_docs[patch.id] = merged
 
-            return self._core.upsert(
+            return MutationResult(self._core.upsert(
                 _coerce_docs_to_native([merged_docs[doc_id] for doc_id in unique_ids if doc_id in merged_docs])
-            )
+            ))
 
     def fetch(self, ids):
         single_id, ids = _coerce_id_input(ids)
@@ -731,10 +742,10 @@ class Collection:
 
     def delete(self, ids):
         _, ids = _coerce_id_input(ids)
-        return self._core.delete(ids)
+        return MutationResult(self._core.delete(ids))
 
     def delete_by_filter(self, filter: str):
-        return self._core.delete_by_filter(filter)
+        return MutationResult(self._core.delete_by_filter(filter))
 
     def _set_schema(self, schema: CollectionSchema | None):
         self._schema = _coerce_collection_schema(schema) if schema is not None else None
