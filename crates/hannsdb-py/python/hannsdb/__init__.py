@@ -1,7 +1,7 @@
 from . import _native as _native_module
 from ._native import *  # noqa: F401,F403
 from . import typing as typing
-from .typing import DataType, LogLevel, MetricType, QuantizeType
+from .typing import DataType, IndexType, LogLevel, MetricType, QuantizeType
 from .executor import QueryExecutorFactory
 from .extension import ReRanker, RrfReRanker, WeightedReRanker
 from .model import (
@@ -41,6 +41,7 @@ _facade_exports = [
     "CollectionSchema",
     "CollectionOption",
     "DataType",
+    "IndexType",
     "Doc",
     "FieldSchema",
     "FlatIndexParam",

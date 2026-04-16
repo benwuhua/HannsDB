@@ -170,3 +170,69 @@ def test_hnsw_hvq_query_param_rejects_invalid():
 
 def test_hnsw_hvq_query_param_is_public():
     assert hannsdb.HnswHvqQueryParam is hannsdb.model.param.HnswHvqQueryParam
+
+
+# --- IndexType enum ---
+
+def test_index_type_is_exported():
+    assert hasattr(hannsdb, "IndexType")
+    assert hannsdb.IndexType.HNSW == 1
+    assert hannsdb.IndexType.IVF == 3
+    assert hannsdb.IndexType.FLAT == 4
+    assert hannsdb.IndexType.INVERT == 10
+
+
+def test_index_param_type_properties():
+    assert hannsdb.FlatIndexParam().type == hannsdb.IndexType.FLAT
+    assert hannsdb.HnswIndexParam().type == hannsdb.IndexType.HNSW
+    assert hannsdb.InvertIndexParam().type == hannsdb.IndexType.INVERT
+    assert hannsdb.IVFIndexParam().type == hannsdb.IndexType.IVF
+    assert hannsdb.IvfUsqIndexParam().type == hannsdb.IndexType.IVF_USQ
+    assert hannsdb.HnswSqIndexParam().type == hannsdb.IndexType.HNSW_SQ
+    assert hannsdb.HnswHvqIndexParam().type == hannsdb.IndexType.HNSW_HVQ
+
+
+# --- DataType uppercase aliases ---
+
+def test_data_type_uppercase_aliases():
+    assert hannsdb.DataType.FLOAT is hannsdb.DataType.Float
+    assert hannsdb.DataType.INT64 is hannsdb.DataType.Int64
+    assert hannsdb.DataType.INT32 is hannsdb.DataType.Int32
+    assert hannsdb.DataType.STRING is hannsdb.DataType.String
+    assert hannsdb.DataType.BOOL is hannsdb.DataType.Bool
+    assert hannsdb.DataType.VECTOR_FP32 is hannsdb.DataType.VectorFp32
+
+
+def test_data_type_new_variants():
+    assert hannsdb.DataType.VECTOR_INT8 is not None
+    assert str(hannsdb.DataType.VECTOR_INT8) == "vector_int8"
+    assert hannsdb.DataType.SPARSE_VECTOR_FP32 is not None
+    assert str(hannsdb.DataType.SPARSE_VECTOR_FP32) == "sparse_vector_fp32"
+
+
+# --- MetricType uppercase aliases ---
+
+def test_metric_type_uppercase_aliases():
+    assert hannsdb.MetricType.COSINE is hannsdb.MetricType.Cosine
+    assert hannsdb.MetricType.IP is hannsdb.MetricType.Ip
+    assert hannsdb.MetricType.L2 is hannsdb.MetricType.L2  # L2 is already uppercase
+
+
+# --- FieldSchema.index_param ---
+
+def test_field_schema_accepts_index_param():
+    f = hannsdb.FieldSchema("id", data_type="int64", index_param=hannsdb.InvertIndexParam())
+    assert f.index_param is not None
+    assert f.index_param.type == hannsdb.IndexType.INVERT
+    assert f.index_param.enable_range_optimization is False
+
+
+def test_field_schema_index_param_defaults_to_none():
+    f = hannsdb.FieldSchema("name", data_type="string")
+    assert f.index_param is None
+
+
+def test_field_schema_index_param_is_readonly():
+    f = hannsdb.FieldSchema("id", data_type="int64", index_param=hannsdb.InvertIndexParam())
+    with pytest.raises(AttributeError):
+        f.index_param = hannsdb.InvertIndexParam(enable_range_optimization=True)

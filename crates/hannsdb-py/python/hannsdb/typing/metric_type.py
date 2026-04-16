@@ -9,3 +9,6 @@ class MetricType(_StringEnum):
     L2 = "l2"
     Cosine = "cosine"
     Ip = "ip"
+    # SCREAMING_SNAKE_CASE aliases for zvec compatibility
+    COSINE = "cosine"
+    IP = "ip"

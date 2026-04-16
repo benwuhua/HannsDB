@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ... import _native as _native_module
+from ...typing.index_type import IndexType
 
 __all__ = [
     "FlatIndexParam",
@@ -73,6 +74,10 @@ class FlatIndexParam:
             _validate_metric_type("metric_type", self.metric_type),
         )
 
+    @property
+    def type(self) -> IndexType:
+        return IndexType.FLAT
+
     def _get_native(self):
         return _native_module.FlatIndexParam(
             metric_type=self.metric_type,
@@ -87,6 +92,10 @@ class InvertIndexParam:
     def __post_init__(self) -> None:
         _require_bool("enable_range_optimization", self.enable_range_optimization)
         _require_bool("enable_extended_wildcard", self.enable_extended_wildcard)
+
+    @property
+    def type(self) -> IndexType:
+        return IndexType.INVERT
 
     def _get_native(self):
         return _native_module.InvertIndexParam(
@@ -119,6 +128,10 @@ class HnswIndexParam:
             "quantize_type",
             _validate_quantize_type("quantize_type", self.quantize_type),
         )
+
+    @property
+    def type(self) -> IndexType:
+        return IndexType.HNSW
 
     def _get_native(self):
         return _native_module.HnswIndexParam(
@@ -155,6 +168,10 @@ class HnswHvqIndexParam:
         object.__setattr__(self, "ef_search", _require_int("ef_search", self.ef_search))
         object.__setattr__(self, "nbits", _require_int("nbits", self.nbits))
 
+    @property
+    def type(self) -> IndexType:
+        return IndexType.HNSW_HVQ
+
     def _get_native(self):
         return _native_module.HnswHvqIndexParam(
             metric_type=self.metric_type,
@@ -189,6 +206,10 @@ class HnswSqIndexParam:
         )
         object.__setattr__(self, "ef_search", _require_int("ef_search", self.ef_search))
 
+    @property
+    def type(self) -> IndexType:
+        return IndexType.HNSW_SQ
+
     def _get_native(self):
         return _native_module.HnswSqIndexParam(
             metric_type=self.metric_type,
@@ -210,6 +231,10 @@ class IVFIndexParam:
             _validate_metric_type("metric_type", self.metric_type),
         )
         object.__setattr__(self, "nlist", _require_int("nlist", self.nlist))
+
+    @property
+    def type(self) -> IndexType:
+        return IndexType.IVF
 
     def _get_native(self):
         return _native_module.IVFIndexParam(
@@ -246,6 +271,10 @@ class IvfUsqIndexParam:
         )
         object.__setattr__(self, "rerank_k", _require_int("rerank_k", self.rerank_k))
         _require_bool("use_high_accuracy_scan", self.use_high_accuracy_scan)
+
+    @property
+    def type(self) -> IndexType:
+        return IndexType.IVF_USQ
 
     def _get_native(self):
         return _native_module.IvfUsqIndexParam(

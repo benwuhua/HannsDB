@@ -25,6 +25,7 @@ def _coerce_field_schema(value) -> "FieldSchema":
         data_type=value.data_type,
         nullable=bool(getattr(value, "nullable", False)),
         array=bool(getattr(value, "array", False)),
+        index_param=getattr(value, "index_param", None),
     )
 
 
@@ -48,28 +49,30 @@ def _normalize_index_param(index_param):
         HnswIndexParam,
         IvfUsqIndexParam,
         IVFIndexParam,
+        InvertIndexParam,
     )
 
     if isinstance(
         index_param,
-        (FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, IvfUsqIndexParam),
+        (FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, IvfUsqIndexParam, InvertIndexParam),
     ):
         return index_param
     if type(index_param) is not object:
         return index_param
     raise TypeError(
-        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, or IvfUsqIndexParam"
+        "index_param must be FlatIndexParam, HnswIndexParam, HnswHvqIndexParam, IVFIndexParam, IvfUsqIndexParam, or InvertIndexParam"
     )
 
 
 class FieldSchema:
-    __slots__ = ("_name", "_data_type", "_nullable", "_array")
+    __slots__ = ("_name", "_data_type", "_nullable", "_array", "_index_param")
 
-    def __init__(self, name, data_type, nullable: bool = False, array: bool = False):
+    def __init__(self, name, data_type, nullable: bool = False, array: bool = False, index_param=None):
         self._name = str(name)
         self._data_type = _normalize_data_type(data_type)
         self._nullable = bool(nullable)
         self._array = bool(array)
+        self._index_param = _normalize_index_param(index_param)
 
     @property
     def name(self) -> str:
@@ -87,6 +90,10 @@ class FieldSchema:
     def array(self) -> bool:
         return self._array
 
+    @property
+    def index_param(self):
+        return self._index_param
+
     def _get_native(self):
         return _native_module.FieldSchema(
             self.name,
@@ -102,7 +109,8 @@ class FieldSchema:
         return (
             "FieldSchema("
             f"name={self.name!r}, data_type={self.data_type!r}, "
-            f"nullable={self.nullable!r}, array={self.array!r})"
+            f"nullable={self.nullable!r}, array={self.array!r}, "
+            f"index_param={self.index_param!r})"
         )
 
     def __eq__(self, other) -> bool:
