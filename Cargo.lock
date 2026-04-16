@@ -2934,6 +2934,8 @@ name = "hannsdb-core"
 version = "0.1.0"
 dependencies = [
  "arrow 54.3.1",
+ "arrow-array 57.3.0",
+ "arrow-schema 57.3.0",
  "half",
  "hannsdb-index",
  "lance",
