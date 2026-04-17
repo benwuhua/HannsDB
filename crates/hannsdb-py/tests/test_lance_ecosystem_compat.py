@@ -1,0 +1,39 @@
+import pytest
+
+import hannsdb
+
+
+def _schema():
+    return hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[hannsdb.FieldSchema(name="title", data_type="string")],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+
+def test_hannsdb_lance_collection_is_readable_by_external_lance_python(tmp_path):
+    lance = pytest.importorskip("lance")
+
+    collection = hannsdb.create_lance_collection(
+        str(tmp_path),
+        _schema(),
+        [
+            hannsdb.Doc(id="10", fields={"title": "alpha"}, vectors={"dense": [1.0, 0.0]}),
+            hannsdb.Doc(id="20", fields={"title": "beta"}, vectors={"dense": [0.0, 1.0]}),
+        ],
+    )
+
+    dataset = lance.dataset(collection.uri)
+    assert dataset.count_rows() == 2
+
+    table = dataset.to_table()
+    assert table.num_rows == 2
+    assert set(table.column_names) >= {"id", "title", "dense"}
+    assert table.column("title").to_pylist() == ["alpha", "beta"]
