@@ -6,6 +6,7 @@ use hannsdb_core::document::{
 use hannsdb_core::storage::lance_store::{
     documents_to_lance_batch, LanceCollection, LanceDatasetStore,
 };
+use hannsdb_core::storage::selector::{StorageBackend, StorageCollection};
 
 fn sample_schema() -> CollectionSchema {
     CollectionSchema {
@@ -230,6 +231,49 @@ async fn lance_collection_can_reopen_with_inferred_schema() {
             .map(|document| document.id)
             .collect::<Vec<_>>(),
         vec![10, 20]
+    );
+}
+
+#[tokio::test]
+async fn core_storage_selector_can_create_and_reopen_lance_collection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let docs = sample_documents();
+
+    let collection = StorageBackend::Lance
+        .create_collection(temp.path(), "docs", sample_schema(), &docs[..1])
+        .await
+        .expect("create via storage selector");
+    assert!(matches!(collection, StorageCollection::Lance(_)));
+    assert_eq!(collection.name(), "docs");
+
+    collection
+        .insert_documents(&docs[1..])
+        .await
+        .expect("insert through selected collection");
+    let fetched = collection
+        .fetch_documents(&[10, 20])
+        .await
+        .expect("fetch through selected collection");
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        vec![10, 20]
+    );
+
+    let reopened = StorageBackend::Lance
+        .open_collection_inferred(temp.path(), "docs")
+        .await
+        .expect("reopen via storage selector");
+    assert_eq!(reopened.schema().primary_vector_name(), "dense");
+    assert_eq!(
+        reopened
+            .fetch_documents(&[20])
+            .await
+            .expect("fetch reopened")[0]
+            .id,
+        20
     );
 }
 
