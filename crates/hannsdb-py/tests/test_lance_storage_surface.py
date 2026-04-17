@@ -51,3 +51,21 @@ def test_lance_collection_surface_create_insert_fetch_search_delete_upsert(tmp_p
 
     reopened = hannsdb.open_lance_collection(str(tmp_path), _schema())
     assert [doc.id for doc in reopened.fetch(["20", "30"])] == ["20", "30"]
+
+
+def test_lance_collection_surface_exposes_hanns_sidecar_optimize(tmp_path):
+    collection = hannsdb.create_lance_collection(str(tmp_path), _schema(), _docs())
+
+    path = collection.hanns_index_path("dense")
+    assert str(path).endswith("_hannsdb/ann/dense.hanns")
+
+    collection.optimize_hanns("dense", metric="l2")
+    assert path.exists()
+
+    hits = collection.search([1.0, 0.0], topk=1, metric="l2")
+    assert [doc.id for doc in hits] == ["10"]
+
+    collection.insert(
+        [hannsdb.Doc(id="30", fields={"title": "gamma"}, vectors={"dense": [2.0, 0.0]})]
+    )
+    assert not path.exists()

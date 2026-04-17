@@ -3141,6 +3141,21 @@ impl PyLanceCollection {
         block_on_lance(self.inner_ref()?.delete_documents(&ids))
     }
 
+    #[cfg(feature = "hanns-backend")]
+    fn hanns_index_path(&self, field_name: &str) -> PyResult<String> {
+        Ok(self
+            .inner_ref()?
+            .hanns_index_path(field_name)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    #[pyo3(signature = (field_name, metric="l2"))]
+    fn optimize_hanns(&self, field_name: &str, metric: &str) -> PyResult<()> {
+        block_on_lance(self.inner_ref()?.optimize_hanns(field_name, metric))
+    }
+
     #[pyo3(signature = (vector, topk=10, metric="l2"))]
     fn search(
         &self,

@@ -987,6 +987,13 @@ class LanceCollection:
         with self._core_lock:
             return MutationResult(self._core.delete(ids))
 
+    def hanns_index_path(self, field_name):
+        return Path(self._core.hanns_index_path(field_name))
+
+    def optimize_hanns(self, field_name, metric="l2"):
+        with self._core_lock:
+            return self._core.optimize_hanns(field_name, metric)
+
     def search(self, vector, topk=10, metric="l2"):
         with self._core_lock:
             return _wrap_doc_result(self._core.search(vector, topk, metric))
