@@ -58,6 +58,7 @@ impl SparseVector {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
+    Null,
     String(String),
     Int64(i64),
     Int32(i32),
@@ -987,6 +988,7 @@ pub(crate) fn validate_schema_secondary_vector_descriptors(
 /// Convert a core `FieldValue` into the index crate's `ScalarValue`.
 pub(crate) fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
     match value {
+        FieldValue::Null => ScalarValue::String("null".to_string()),
         FieldValue::String(s) => ScalarValue::String(s.clone()),
         FieldValue::Int64(v) => ScalarValue::Int64(*v),
         FieldValue::Int32(v) => ScalarValue::Int64(*v as i64),
@@ -1005,6 +1007,9 @@ pub(crate) fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
 pub(crate) fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Ordering {
     match (a, b) {
         (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
+        (FieldValue::Null, FieldValue::Null) => Ordering::Equal,
+        (FieldValue::Null, _) => Ordering::Less,
+        (_, FieldValue::Null) => Ordering::Greater,
         (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
         (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
         (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),

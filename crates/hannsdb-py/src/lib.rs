@@ -835,7 +835,13 @@ fn coerce_field_value_for_schema(
                 .with_flags(schema.nullable, false);
         return items
             .iter()
-            .map(|item| coerce_field_value_for_schema(field_name, item, &element_schema))
+            .map(|item| {
+                if matches!(item, FieldValue::Null) {
+                    Ok(FieldValue::Null)
+                } else {
+                    coerce_field_value_for_schema(field_name, item, &element_schema)
+                }
+            })
             .collect::<std::io::Result<Vec<_>>>()
             .map(FieldValue::Array);
     }
@@ -1544,7 +1550,9 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
             let items: Vec<FieldValue> = list
                 .iter()
                 .map(|item| {
-                    if item.is_instance_of::<PyBool>() {
+                    if item.is_none() {
+                        Ok(FieldValue::Null)
+                    } else if item.is_instance_of::<PyBool>() {
                         Ok(FieldValue::Bool(item.extract::<bool>()?))
                     } else if let Ok(v) = item.extract::<String>() {
                         Ok(FieldValue::String(v))
@@ -1594,6 +1602,7 @@ fn py_dict_to_vectors(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, V
 #[cfg(feature = "python-binding")]
 fn field_value_to_py<'py>(py: Python<'py>, value: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
     match value {
+        FieldValue::Null => Ok(py.None().into_bound(py).into_any()),
         FieldValue::String(v) => Ok(v.clone().into_pyobject(py)?.into_any()),
         FieldValue::Int64(v) => Ok(v.into_pyobject(py)?.into_any()),
         FieldValue::Int32(v) => Ok(v.into_pyobject(py)?.into_any()),
@@ -1623,6 +1632,7 @@ fn fields_to_py_dict<'py>(
     let dict = PyDict::new(py);
     for (name, value) in fields {
         match value {
+            FieldValue::Null => dict.set_item(name, py.None())?,
             FieldValue::String(value) => dict.set_item(name, value)?,
             FieldValue::Int64(value) => dict.set_item(name, *value)?,
             FieldValue::Int32(value) => dict.set_item(name, *value)?,

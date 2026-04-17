@@ -907,6 +907,8 @@ fn parse_pattern(input: &str) -> io::Result<String> {
 
 fn values_equal(left: &FieldValue, right: &FieldValue) -> bool {
     match (left, right) {
+        (FieldValue::Null, FieldValue::Null) => true,
+        (FieldValue::Null, _) | (_, FieldValue::Null) => false,
         (FieldValue::String(a), FieldValue::String(b)) => a == b,
         (FieldValue::Bool(a), FieldValue::Bool(b)) => a == b,
         // Same-type numeric equality
@@ -932,6 +934,9 @@ fn values_equal(left: &FieldValue, right: &FieldValue) -> bool {
 
 fn compare_values(left: &FieldValue, right: &FieldValue) -> Option<Ordering> {
     match (left, right) {
+        (FieldValue::Null, FieldValue::Null) => Some(Ordering::Equal),
+        (FieldValue::Null, _) => Some(Ordering::Less),
+        (_, FieldValue::Null) => Some(Ordering::Greater),
         (FieldValue::String(a), FieldValue::String(b)) => Some(a.cmp(b)),
         // Same-type numeric comparisons
         (FieldValue::Int64(a), FieldValue::Int64(b)) => Some(a.cmp(b)),

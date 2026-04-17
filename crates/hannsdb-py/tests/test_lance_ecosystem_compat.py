@@ -152,6 +152,40 @@ def test_hannsdb_lance_array_scalars_are_readable_by_external_lance_python(tmp_p
     assert table.column("flags").to_pylist() == [[True, False], [False]]
 
 
+def test_hannsdb_lance_array_null_elements_are_readable_by_external_lance_python(tmp_path):
+    lance = pytest.importorskip("lance")
+
+    schema = hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="tags", data_type="string", array=True),
+            hannsdb.FieldSchema(name="scores", data_type="int64", array=True),
+        ],
+        vectors=[hannsdb.VectorSchema(name="dense", data_type="vector_fp32", dimension=2)],
+    )
+    collection = hannsdb.create_lance_collection(
+        str(tmp_path),
+        schema,
+        [
+            hannsdb.Doc(
+                id="10",
+                fields={"tags": ["red", None, "blue"], "scores": [1, None, 2]},
+                vectors={"dense": [1.0, 0.0]},
+            )
+        ],
+    )
+
+    table = lance.dataset(collection.uri).to_table()
+    assert table.column("tags").to_pylist() == [["red", None, "blue"]]
+    assert table.column("scores").to_pylist() == [[1, None, 2]]
+
+    reopened = hannsdb.open(str(tmp_path), storage="lance")
+    doc = reopened.fetch(["10"])[0]
+    assert doc.field("tags") == ["red", None, "blue"]
+    assert doc.field("scores") == [1, None, 2]
+
+
 def test_hannsdb_lance_nullable_scalars_are_written_as_lance_nulls(tmp_path):
     lance = pytest.importorskip("lance")
 

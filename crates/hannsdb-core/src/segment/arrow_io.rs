@@ -345,6 +345,7 @@ fn infer_ad_hoc_specs(
 
 fn infer_field_value_shape(value: &FieldValue) -> Option<(FieldType, bool)> {
     match value {
+        FieldValue::Null => None,
         FieldValue::String(_) => Some((FieldType::String, false)),
         FieldValue::Int64(_) => Some((FieldType::Int64, false)),
         FieldValue::Int32(_) => Some((FieldType::Int32, false)),

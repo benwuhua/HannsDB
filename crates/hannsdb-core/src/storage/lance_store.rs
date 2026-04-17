@@ -733,6 +733,7 @@ fn string_list_array_for_documents(
         };
         for item in items {
             match item {
+                FieldValue::Null => builder.values().append_null(),
                 FieldValue::String(value) => builder.values().append_value(value),
                 value => return type_mismatch(field_name, "String array item", value),
             }
@@ -760,6 +761,7 @@ macro_rules! scalar_list_array_for_documents {
                 };
                 for item in items {
                     match item {
+                        FieldValue::Null => builder.values().append_null(),
                         FieldValue::$variant(value) => builder.values().append_value(*value),
                         value => return type_mismatch(field_name, $item_expected, value),
                     }
@@ -795,6 +797,7 @@ fn int64_list_array_for_documents(
         };
         for item in items {
             match item {
+                FieldValue::Null => builder.values().append_null(),
                 FieldValue::Int64(value) => builder.values().append_value(*value),
                 value => return type_mismatch(field_name, "Int64 array item", value),
             }
@@ -990,6 +993,7 @@ fn array_field_value_from_column(
     let mut items = Vec::new();
     for item_idx in 0..values.len() {
         if values.is_null(item_idx) {
+            items.push(FieldValue::Null);
             continue;
         }
         items.push(scalar_field_value_from_column(

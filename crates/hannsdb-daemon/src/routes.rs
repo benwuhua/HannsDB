@@ -1232,6 +1232,7 @@ pub(crate) fn build_query_context(
 
 pub(crate) fn field_value_to_json(value: FieldValue) -> serde_json::Value {
     match value {
+        FieldValue::Null => serde_json::Value::Null,
         FieldValue::String(value) => serde_json::Value::String(value),
         FieldValue::Int64(value) => serde_json::Value::Number(value.into()),
         FieldValue::Int32(value) => serde_json::Value::Number(value.into()),
