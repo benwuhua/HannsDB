@@ -509,10 +509,9 @@ pub fn documents_from_lance_batch(
                     format!("Lance batch missing scalar column {}", scalar.name),
                 )
             })?;
-            fields.push((
-                scalar.name.clone(),
-                field_value_from_column(column, row_idx, &scalar.data_type)?,
-            ));
+            if let Some(value) = field_value_from_column(column, row_idx, &scalar.data_type)? {
+                fields.push((scalar.name.clone(), value));
+            }
         }
 
         let mut vectors = Vec::with_capacity(schema.vectors.len());
@@ -720,53 +719,50 @@ fn field_value_from_column(
     column: &ArrayRef,
     row_idx: usize,
     data_type: &FieldType,
-) -> io::Result<FieldValue> {
+) -> io::Result<Option<FieldValue>> {
     if column.is_null(row_idx) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "null Lance values are not supported by Lance storage P1",
-        ));
+        return Ok(None);
     }
     match data_type {
         FieldType::String => column
             .as_any()
             .downcast_ref::<StringArray>()
-            .map(|array| FieldValue::String(array.value(row_idx).to_string()))
+            .map(|array| Some(FieldValue::String(array.value(row_idx).to_string())))
             .ok_or_else(|| column_type_error("String")),
         FieldType::Int64 => column
             .as_any()
             .downcast_ref::<Int64Array>()
-            .map(|array| FieldValue::Int64(array.value(row_idx)))
+            .map(|array| Some(FieldValue::Int64(array.value(row_idx))))
             .ok_or_else(|| column_type_error("Int64")),
         FieldType::Int32 => column
             .as_any()
             .downcast_ref::<Int32Array>()
-            .map(|array| FieldValue::Int32(array.value(row_idx)))
+            .map(|array| Some(FieldValue::Int32(array.value(row_idx))))
             .ok_or_else(|| column_type_error("Int32")),
         FieldType::UInt32 => column
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .map(|array| FieldValue::UInt32(array.value(row_idx)))
+            .map(|array| Some(FieldValue::UInt32(array.value(row_idx))))
             .ok_or_else(|| column_type_error("UInt32")),
         FieldType::UInt64 => column
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .map(|array| FieldValue::UInt64(array.value(row_idx)))
+            .map(|array| Some(FieldValue::UInt64(array.value(row_idx))))
             .ok_or_else(|| column_type_error("UInt64")),
         FieldType::Float => column
             .as_any()
             .downcast_ref::<Float32Array>()
-            .map(|array| FieldValue::Float(array.value(row_idx)))
+            .map(|array| Some(FieldValue::Float(array.value(row_idx))))
             .ok_or_else(|| column_type_error("Float")),
         FieldType::Float64 => column
             .as_any()
             .downcast_ref::<Float64Array>()
-            .map(|array| FieldValue::Float64(array.value(row_idx)))
+            .map(|array| Some(FieldValue::Float64(array.value(row_idx))))
             .ok_or_else(|| column_type_error("Float64")),
         FieldType::Bool => column
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .map(|array| FieldValue::Bool(array.value(row_idx)))
+            .map(|array| Some(FieldValue::Bool(array.value(row_idx))))
             .ok_or_else(|| column_type_error("Bool")),
         FieldType::VectorFp32 | FieldType::VectorFp16 | FieldType::VectorSparse => {
             Err(io::Error::new(

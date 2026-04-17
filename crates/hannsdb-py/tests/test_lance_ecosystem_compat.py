@@ -177,3 +177,50 @@ def test_external_lance_dataset_supported_scalars_roundtrip_through_hannsdb(tmp_
     assert doc.field("f32") == 1.5
     assert doc.field("f64") == 3.5
     assert doc.field("flag") is True
+
+
+def test_external_lance_dataset_nullable_scalars_are_omitted_from_docs(tmp_path):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+
+    values = pa.array([1.0, 0.0, 0.0, 1.0], type=pa.float32())
+    table = pa.table(
+        {
+            "id": pa.array([10, 20], type=pa.int64()),
+            "title": pa.array(["alpha", None], type=pa.string()),
+            "dense": pa.FixedSizeListArray.from_arrays(values, 2),
+        }
+    )
+    uri = tmp_path / "collections" / "docs.lance"
+    uri.parent.mkdir()
+    lance.write_dataset(table, uri)
+
+    collection = hannsdb.open(str(tmp_path), storage="lance")
+
+    assert collection.schema.field("title").nullable is True
+    alpha, missing = collection.fetch(["10", "20"])
+    assert alpha.field("title") == "alpha"
+    assert missing.has_field("title") is False
+    with pytest.raises(KeyError, match="title"):
+        missing.field("title")
+
+
+def test_external_lance_dataset_null_vectors_are_rejected_by_hannsdb(tmp_path):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+
+    table = pa.table(
+        {
+            "id": pa.array([10, 20], type=pa.int64()),
+            "title": pa.array(["alpha", "beta"], type=pa.string()),
+            "dense": pa.array([[1.0, 0.0], None], type=pa.list_(pa.float32(), 2)),
+        }
+    )
+    uri = tmp_path / "collections" / "docs.lance"
+    uri.parent.mkdir()
+    lance.write_dataset(table, uri)
+
+    collection = hannsdb.open(str(tmp_path), storage="lance")
+
+    with pytest.raises(RuntimeError, match="null Lance vector values"):
+        collection.fetch(["20"])
