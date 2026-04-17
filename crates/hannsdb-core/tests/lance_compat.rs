@@ -80,6 +80,20 @@ async fn lance_dataset_store_writes_dataset_openable_by_lance() {
 }
 
 #[tokio::test]
+async fn lance_dataset_store_can_create_empty_dataset() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("empty.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), sample_schema());
+
+    store.create(&[]).await.expect("create empty dataset");
+
+    let dataset = lance::Dataset::open(uri.to_str().unwrap())
+        .await
+        .expect("open empty dataset with upstream lance");
+    assert_eq!(dataset.count_rows(None).await.expect("count rows"), 0);
+}
+
+#[tokio::test]
 async fn lance_dataset_store_append_is_visible_to_lance_scan() {
     let temp = tempfile::tempdir().expect("tempdir");
     let uri = temp.path().join("docs.lance");

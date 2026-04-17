@@ -1,4 +1,5 @@
 import hannsdb
+import pytest
 
 
 def _schema():
@@ -69,3 +70,27 @@ def test_lance_collection_surface_exposes_hanns_sidecar_optimize(tmp_path):
         [hannsdb.Doc(id="30", fields={"title": "gamma"}, vectors={"dense": [2.0, 0.0]})]
     )
     assert not path.exists()
+
+
+def test_create_and_open_storage_lance_routes_to_lance_collection(tmp_path):
+    collection = hannsdb.create_and_open(str(tmp_path), _schema(), storage="lance")
+
+    assert isinstance(collection, hannsdb.LanceCollection)
+    assert collection.name == "docs"
+    assert collection.insert(_docs()) == 2
+    assert [doc.id for doc in collection.fetch(["10", "20"])] == ["10", "20"]
+
+
+def test_open_storage_lance_requires_schema_and_reopens_collection(tmp_path):
+    created = hannsdb.create_and_open(str(tmp_path), _schema(), storage="lance")
+    created.insert(_docs())
+
+    reopened = hannsdb.open(str(tmp_path), storage="lance", schema=_schema())
+
+    assert isinstance(reopened, hannsdb.LanceCollection)
+    assert [doc.id for doc in reopened.fetch(["20"])] == ["20"]
+
+
+def test_open_storage_lance_requires_schema(tmp_path):
+    with pytest.raises(ValueError, match="schema is required"):
+        hannsdb.open(str(tmp_path), storage="lance")

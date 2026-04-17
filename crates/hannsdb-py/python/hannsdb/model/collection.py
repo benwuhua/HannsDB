@@ -926,7 +926,19 @@ class Collection:
         return getattr(self._core, name)
 
 
-def create_and_open(path, schema, option: CollectionOption | None = None):
+def _normalize_storage(storage):
+    normalized = str(storage).strip().lower()
+    if normalized in {"hannsdb", "default", ""}:
+        return "hannsdb"
+    if normalized == "lance":
+        return "lance"
+    raise ValueError(f"unsupported storage backend: {storage}")
+
+
+def create_and_open(path, schema, option: CollectionOption | None = None, *, storage="hannsdb"):
+    storage = _normalize_storage(storage)
+    if storage == "lance":
+        return create_lance_collection(path, schema, [])
     core_collection = _native_module.create_and_open(
         path,
         _schema_to_native(schema),
@@ -935,7 +947,12 @@ def create_and_open(path, schema, option: CollectionOption | None = None):
     return Collection._from_core(core_collection, schema=schema)
 
 
-def open(path, option: CollectionOption | None = None):
+def open(path, option: CollectionOption | None = None, *, storage="hannsdb", schema=None):
+    storage = _normalize_storage(storage)
+    if storage == "lance":
+        if schema is None:
+            raise ValueError("schema is required when opening Lance storage")
+        return open_lance_collection(path, schema)
     core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)
 
