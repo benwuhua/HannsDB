@@ -134,3 +134,46 @@ def test_external_lance_dataset_is_readable_by_hannsdb_lance_selector(tmp_path):
     native = hannsdb._native.open(str(tmp_path), storage="lance")
     assert native.name == "docs"
     assert [doc.id for doc in native.fetch(["20"])] == ["20"]
+
+
+def test_external_lance_dataset_supported_scalars_roundtrip_through_hannsdb(tmp_path):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+
+    values = pa.array([1.0, 0.0, 0.0, 1.0], type=pa.float32())
+    table = pa.table(
+        {
+            "id": pa.array([10, 20], type=pa.int64()),
+            "title": pa.array(["alpha", "beta"], type=pa.string()),
+            "i32": pa.array([1, 2], type=pa.int32()),
+            "u32": pa.array([3, 4], type=pa.uint32()),
+            "u64": pa.array([5, 6], type=pa.uint64()),
+            "f32": pa.array([1.5, 2.5], type=pa.float32()),
+            "f64": pa.array([3.5, 4.5], type=pa.float64()),
+            "flag": pa.array([True, False], type=pa.bool_()),
+            "dense": pa.FixedSizeListArray.from_arrays(values, 2),
+        }
+    )
+    uri = tmp_path / "collections" / "docs.lance"
+    uri.parent.mkdir()
+    lance.write_dataset(table, uri)
+
+    collection = hannsdb.open(str(tmp_path), storage="lance")
+
+    assert [(field.name, field.data_type) for field in collection.schema.fields] == [
+        ("title", "string"),
+        ("i32", "int32"),
+        ("u32", "uint32"),
+        ("u64", "uint64"),
+        ("f32", "float"),
+        ("f64", "float64"),
+        ("flag", "bool"),
+    ]
+    doc = collection.fetch(["10"])[0]
+    assert doc.field("title") == "alpha"
+    assert doc.field("i32") == 1
+    assert doc.field("u32") == 3
+    assert doc.field("u64") == 5
+    assert doc.field("f32") == 1.5
+    assert doc.field("f64") == 3.5
+    assert doc.field("flag") is True
