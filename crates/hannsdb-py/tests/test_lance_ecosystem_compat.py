@@ -94,3 +94,43 @@ def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lan
     table = dataset.to_table()
     assert set(table.column_names) >= {"id", "title", "dense"}
     assert table.column("title").to_pylist() == ["alpha", "beta"]
+
+
+def test_external_lance_dataset_is_readable_by_hannsdb_lance_selector(tmp_path):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+
+    values = pa.array([1.0, 0.0, 0.0, 1.0], type=pa.float32())
+    table = pa.table(
+        {
+            "id": pa.array([10, 20], type=pa.int64()),
+            "title": pa.array(["alpha", "beta"], type=pa.string()),
+            "dense": pa.FixedSizeListArray.from_arrays(values, 2),
+        }
+    )
+    uri = tmp_path / "collections" / "docs.lance"
+    uri.parent.mkdir()
+    lance.write_dataset(table, uri)
+
+    collection = hannsdb.open(str(tmp_path), storage="lance")
+
+    assert collection.name == "docs"
+    assert collection.schema.name == "docs"
+    assert [(field.name, field.data_type) for field in collection.schema.fields] == [
+        ("title", "string")
+    ]
+    assert [
+        (vector.name, vector.data_type, vector.dimension)
+        for vector in collection.schema.vectors
+    ] == [
+        ("dense", "vector_fp32", 2)
+    ]
+    assert [doc.id for doc in collection.fetch(["10", "20"])] == ["10", "20"]
+    assert [doc.field("title") for doc in collection.fetch(["10", "20"])] == [
+        "alpha",
+        "beta",
+    ]
+
+    native = hannsdb._native.open(str(tmp_path), storage="lance")
+    assert native.name == "docs"
+    assert [doc.id for doc in native.fetch(["20"])] == ["20"]
