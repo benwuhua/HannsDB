@@ -2511,7 +2511,7 @@ impl CollectionHandle {
         match filter_expr {
             FilterExpr::Clause { field, op, value } => {
                 let index = scalar_cache.get(field)?;
-                let scalar_value = field_value_to_scalar(value);
+                let scalar_value = field_value_to_scalar(value)?;
                 match op {
                     ComparisonOp::Eq => Some(index.lookup_eq(&scalar_value)),
                     ComparisonOp::Ne => Some(index.lookup_range(RangeOp::Ne, &scalar_value)),
@@ -2528,7 +2528,10 @@ impl CollectionHandle {
             } => {
                 let index = scalar_cache.get(field)?;
                 let scalar_values: Vec<ScalarValue> =
-                    values.iter().map(field_value_to_scalar).collect();
+                    values.iter().filter_map(field_value_to_scalar).collect();
+                if scalar_values.is_empty() {
+                    return None;
+                }
                 Some(index.lookup_in(&scalar_values, *negated))
             }
             // AND: intersect candidates from each sub-expression.
