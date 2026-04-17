@@ -1066,7 +1066,7 @@ def _infer_single_lance_collection_name(path) -> str:
             f"cannot infer Lance collection schema: no .lance datasets found under {collections_dir}"
         )
     raise ValueError(
-        "cannot infer Lance collection schema: multiple .lance datasets found; pass schema explicitly"
+        "cannot infer Lance collection schema: multiple .lance datasets found; pass name explicitly"
     )
 
 

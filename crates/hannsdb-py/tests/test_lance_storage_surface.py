@@ -1,3 +1,5 @@
+import pytest
+
 import hannsdb
 
 
@@ -130,6 +132,17 @@ def test_open_storage_lance_can_select_named_collection_without_schema(tmp_path)
     assert direct.name == "docs"
     assert direct.schema.name == "docs"
     assert [doc.id for doc in direct.fetch(["10", "20"])] == ["10"]
+
+
+def test_open_storage_lance_requires_name_when_multiple_collections_exist(tmp_path):
+    hannsdb.create_lance_collection(str(tmp_path), _schema("docs"), _docs()[:1])
+    hannsdb.create_lance_collection(str(tmp_path), _schema("notes"), _docs()[1:])
+
+    with pytest.raises(ValueError, match="pass name explicitly"):
+        hannsdb.open(str(tmp_path), storage="lance")
+
+    with pytest.raises(ValueError, match="pass name explicitly"):
+        hannsdb._native.open(str(tmp_path), storage="lance")
 
 
 def test_native_binding_storage_lance_returns_lance_collection(tmp_path):
