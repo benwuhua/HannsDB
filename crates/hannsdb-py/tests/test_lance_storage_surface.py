@@ -158,3 +158,9 @@ def test_native_binding_storage_lance_returns_lance_collection(tmp_path):
     assert reopened.__class__ is hannsdb._native.LanceCollection
     assert reopened.name == "docs"
     assert [doc.id for doc in reopened.fetch(["10"])] == ["10"]
+
+    inferred = hannsdb._native.open(str(tmp_path), storage="lance")
+
+    assert inferred.__class__ is hannsdb._native.LanceCollection
+    assert inferred.name == "docs"
+    assert [doc.id for doc in inferred.fetch(["10"])] == ["10"]

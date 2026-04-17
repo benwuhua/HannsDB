@@ -1713,6 +1713,42 @@ fn normalize_storage_backend(value: &str) -> PyResult<&'static str> {
     }
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn infer_single_lance_collection_name(path: &str) -> PyResult<String> {
+    let collections_dir = std::path::Path::new(path).join("collections");
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(&collections_dir).map_err(|err| {
+        PyValueError::new_err(format!(
+            "cannot infer Lance collection schema: failed to read {}: {err}",
+            collections_dir.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(io_to_py_err)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(name) = file_name.strip_suffix(".lance") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    match names.as_slice() {
+        [name] => Ok(name.clone()),
+        [] => Err(PyValueError::new_err(format!(
+            "cannot infer Lance collection schema: no .lance datasets found under {}",
+            collections_dir.display()
+        ))),
+        _ => Err(PyValueError::new_err(
+            "cannot infer Lance collection schema: multiple .lance datasets found; pass name explicitly",
+        )),
+    }
+}
+
 #[cfg(feature = "python-binding")]
 fn unsupported_add_column_constant_literal() -> PyErr {
     PyNotImplementedError::new_err("add_column expression supports only constant literals")
@@ -3899,11 +3935,10 @@ fn py_open(
                 ))?;
                 (collection, schema)
             } else {
-                let name = name.ok_or_else(|| {
-                    PyValueError::new_err(
-                        "name is required when opening Lance storage without schema",
-                    )
-                })?;
+                let name = match name {
+                    Some(name) => name,
+                    None => infer_single_lance_collection_name(&path)?,
+                };
                 let collection =
                     block_on_lance(CoreLanceCollection::open_inferred(path, name.clone()))?;
                 let schema =
