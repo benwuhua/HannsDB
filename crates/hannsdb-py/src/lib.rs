@@ -1521,6 +1521,9 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
     let mut out = BTreeMap::new();
     for (key, value) in fields.iter() {
         let key = key.extract::<String>()?;
+        if value.is_none() {
+            continue;
+        }
         let value = if value.is_instance_of::<PyBool>() {
             FieldValue::Bool(value.extract::<bool>()?)
         } else if let Ok(value) = value.extract::<String>() {

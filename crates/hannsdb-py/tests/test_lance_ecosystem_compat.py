@@ -184,6 +184,54 @@ def test_hannsdb_lance_nullable_scalars_are_written_as_lance_nulls(tmp_path):
     assert second.has_field("tags") is False
 
 
+def test_native_lance_nullable_none_fields_are_written_as_lance_nulls(tmp_path):
+    lance = pytest.importorskip("lance")
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        _nullable_schema()._get_native(),
+        storage="lance",
+        name="docs",
+    )
+    collection.insert(
+        [
+            hannsdb._native.Doc(
+                id="10",
+                field_name="dense",
+                fields={"title": "alpha", "tags": ["red", "blue"]},
+                vectors={"dense": [1.0, 0.0]},
+            ),
+            hannsdb._native.Doc(
+                id="20",
+                field_name="dense",
+                fields={"title": None, "tags": None},
+                vectors={"dense": [0.0, 1.0]},
+            ),
+        ]
+    )
+
+    table = lance.dataset(collection.uri).to_table()
+    assert table.column("title").to_pylist() == ["alpha", None]
+    assert table.column("tags").to_pylist() == [["red", "blue"], None]
+
+    with pytest.raises(ValueError, match="missing scalar field title"):
+        hannsdb._native.create_and_open(
+            str(tmp_path / "bad"),
+            _schema()._get_native(),
+            storage="lance",
+            name="docs",
+        ).insert(
+            [
+                hannsdb._native.Doc(
+                    id="10",
+                    field_name="dense",
+                    fields={"title": None},
+                    vectors={"dense": [1.0, 0.0]},
+                )
+            ]
+        )
+
+
 def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lance_python(
     tmp_path,
 ):
