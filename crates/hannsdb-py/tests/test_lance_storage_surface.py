@@ -1,5 +1,4 @@
 import hannsdb
-import pytest
 
 
 def _schema():
@@ -91,6 +90,22 @@ def test_open_storage_lance_requires_schema_and_reopens_collection(tmp_path):
     assert [doc.id for doc in reopened.fetch(["20"])] == ["20"]
 
 
-def test_open_storage_lance_requires_schema(tmp_path):
-    with pytest.raises(ValueError, match="schema is required"):
-        hannsdb.open(str(tmp_path), storage="lance")
+def test_open_storage_lance_infers_schema_and_reopens_collection(tmp_path):
+    created = hannsdb.create_and_open(str(tmp_path), _schema(), storage="lance")
+    created.insert(_docs())
+
+    reopened = hannsdb.open(str(tmp_path), storage="lance")
+
+    assert isinstance(reopened, hannsdb.LanceCollection)
+    assert reopened.schema.name == "docs"
+    assert reopened.schema.primary_vector == "dense"
+    assert [(field.name, field.data_type) for field in reopened.schema.fields] == [
+        ("title", "string")
+    ]
+    assert [
+        (vector.name, vector.data_type, vector.dimension)
+        for vector in reopened.schema.vectors
+    ] == [
+        ("dense", "vector_fp32", 2)
+    ]
+    assert [doc.id for doc in reopened.fetch(["10", "20"])] == ["10", "20"]

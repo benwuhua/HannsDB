@@ -420,6 +420,69 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
     })
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn schema_from_core_schema(
+    name: String,
+    schema: &CoreCollectionSchema,
+) -> std::io::Result<CollectionSchema> {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let data_type = match field.data_type {
+                CoreFieldType::String => DataType::String,
+                CoreFieldType::Int64 => DataType::Int64,
+                CoreFieldType::Int32 => DataType::Int32,
+                CoreFieldType::UInt32 => DataType::UInt32,
+                CoreFieldType::UInt64 => DataType::UInt64,
+                CoreFieldType::Float => DataType::Float,
+                CoreFieldType::Float64 => DataType::Float64,
+                CoreFieldType::Bool => DataType::Bool,
+                CoreFieldType::VectorFp32
+                | CoreFieldType::VectorFp16
+                | CoreFieldType::VectorSparse => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("field '{}' cannot use vector data type", field.name),
+                    ))
+                }
+            };
+            Ok(FieldSchema {
+                name: field.name.clone(),
+                data_type,
+                nullable: field.nullable,
+                array: field.array,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let vectors = schema
+        .vectors
+        .iter()
+        .map(|vector| {
+            if !matches!(vector.data_type, CoreFieldType::VectorFp32) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("vector '{}' is not vector_fp32", vector.name),
+                ));
+            }
+            Ok(VectorSchema {
+                name: vector.name.clone(),
+                data_type: DataType::VectorFp32,
+                dimension: vector.dimension,
+                index_param: None,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    Ok(CollectionSchema {
+        name,
+        primary_vector: schema.primary_vector.clone(),
+        fields,
+        vectors,
+    })
+}
+
 #[cfg(feature = "python-binding")]
 fn parse_query_ids(
     py: Python<'_>,
@@ -3091,6 +3154,13 @@ impl PyLanceCollection {
         Ok(self.inner_ref()?.uri().to_string())
     }
 
+    #[getter]
+    fn schema(&self) -> PyCollectionSchema {
+        PyCollectionSchema {
+            inner: self.schema.clone(),
+        }
+    }
+
     fn insert(&self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
         let docs = docs
             .into_iter()
@@ -3805,6 +3875,21 @@ fn py_open_lance_collection(
     })
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "open_lance_collection_infer_schema")]
+#[pyo3(signature = (path, name))]
+fn py_open_lance_collection_infer_schema(
+    path: String,
+    name: String,
+) -> PyResult<PyLanceCollection> {
+    let collection = block_on_lance(CoreLanceCollection::open_inferred(path, name.clone()))?;
+    let schema = schema_from_core_schema(name, collection.schema()).map_err(io_to_py_err)?;
+    Ok(PyLanceCollection {
+        inner: Some(collection),
+        schema,
+    })
+}
+
 #[cfg(feature = "python-binding")]
 #[pymodule(name = "_native")]
 fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3847,6 +3932,11 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_function(wrap_pyfunction!(py_create_lance_collection, module)?)?;
     #[cfg(feature = "lance-storage")]
     module.add_function(wrap_pyfunction!(py_open_lance_collection, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(
+        py_open_lance_collection_infer_schema,
+        module
+    )?)?;
     Ok(())
 }
 

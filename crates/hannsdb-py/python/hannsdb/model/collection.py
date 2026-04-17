@@ -950,8 +950,6 @@ def create_and_open(path, schema, option: CollectionOption | None = None, *, sto
 def open(path, option: CollectionOption | None = None, *, storage="hannsdb", schema=None):
     storage = _normalize_storage(storage)
     if storage == "lance":
-        if schema is None:
-            raise ValueError("schema is required when opening Lance storage")
         return open_lance_collection(path, schema)
     core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)
@@ -1034,7 +1032,29 @@ def create_lance_collection(path, schema, docs):
     return LanceCollection(core_collection, coerced_schema)
 
 
-def open_lance_collection(path, schema):
+def _infer_single_lance_collection_name(path) -> str:
+    collections_dir = Path(path) / "collections"
+    names = sorted(
+        child.name[: -len(".lance")]
+        for child in collections_dir.glob("*.lance")
+        if child.is_dir()
+    )
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        raise ValueError(
+            f"cannot infer Lance collection schema: no .lance datasets found under {collections_dir}"
+        )
+    raise ValueError(
+        "cannot infer Lance collection schema: multiple .lance datasets found; pass schema explicitly"
+    )
+
+
+def open_lance_collection(path, schema=None):
+    if schema is None:
+        name = _infer_single_lance_collection_name(path)
+        core_collection = _native_module.open_lance_collection_infer_schema(path, name)
+        return LanceCollection(core_collection, core_collection.schema)
     coerced_schema = _coerce_collection_schema(schema)
     core_collection = _native_module.open_lance_collection(
         path,

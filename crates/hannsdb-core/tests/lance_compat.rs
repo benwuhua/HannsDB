@@ -204,6 +204,36 @@ async fn lance_collection_facade_supports_basic_insert_fetch_and_search() {
 }
 
 #[tokio::test]
+async fn lance_collection_can_reopen_with_inferred_schema() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let docs = sample_documents();
+    let created = LanceCollection::create(temp.path(), "docs", sample_schema(), &docs)
+        .await
+        .expect("create lance collection facade");
+
+    let reopened = LanceCollection::open_inferred(temp.path(), "docs")
+        .await
+        .expect("reopen Lance collection with inferred schema");
+
+    assert_eq!(reopened.name(), "docs");
+    assert_eq!(reopened.uri(), created.uri());
+    assert_eq!(reopened.schema().primary_vector_name(), "dense");
+    assert_eq!(reopened.schema().fields.len(), 2);
+    assert_eq!(reopened.schema().vectors[0].dimension, 3);
+    let fetched = reopened
+        .fetch_documents(&[10, 20])
+        .await
+        .expect("fetch rows");
+    assert_eq!(
+        fetched
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        vec![10, 20]
+    );
+}
+
+#[tokio::test]
 async fn lance_collection_delete_documents_hides_rows_from_lance_and_facade() {
     let temp = tempfile::tempdir().expect("tempdir");
     let collection =

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
-use crate::document::{CollectionSchema, FieldType};
+use crate::document::{CollectionSchema, FieldType, ScalarFieldSchema, VectorFieldSchema};
 
 pub(crate) const LANCE_ID_COLUMN: &str = "id";
 
@@ -78,6 +78,55 @@ pub(crate) fn arrow_schema_for_lance(schema: &CollectionSchema) -> io::Result<Ar
     Ok(Arc::new(Schema::new(fields)))
 }
 
+pub(crate) fn collection_schema_from_lance_arrow(arrow: &Schema) -> io::Result<CollectionSchema> {
+    let id = arrow.field_with_name(LANCE_ID_COLUMN).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Lance dataset schema is missing HannsDB id column",
+        )
+    })?;
+    if id.data_type() != &DataType::Int64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Lance dataset id column is not Int64",
+        ));
+    }
+
+    let mut fields = Vec::new();
+    let mut vectors = Vec::new();
+    for field in arrow.fields() {
+        if field.name() == LANCE_ID_COLUMN {
+            continue;
+        }
+        if let Some(dimension) = vector_dimension(field.data_type())? {
+            vectors.push(VectorFieldSchema::new(field.name().clone(), dimension));
+            continue;
+        }
+        fields.push(
+            ScalarFieldSchema::new(field.name().clone(), scalar_field_type(field.data_type())?)
+                .with_flags(field.is_nullable(), false),
+        );
+    }
+
+    let primary_vector = vectors
+        .iter()
+        .find(|vector| vector.name == "dense")
+        .or_else(|| vectors.first())
+        .map(|vector| vector.name.clone())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Lance dataset schema does not contain a supported dense vector column",
+            )
+        })?;
+
+    Ok(CollectionSchema {
+        primary_vector,
+        fields,
+        vectors,
+    })
+}
+
 fn scalar_data_type(data_type: &FieldType) -> io::Result<DataType> {
     match data_type {
         FieldType::String => Ok(DataType::Utf8),
@@ -95,6 +144,44 @@ fn scalar_data_type(data_type: &FieldType) -> io::Result<DataType> {
             ))
         }
     }
+}
+
+fn scalar_field_type(data_type: &DataType) -> io::Result<FieldType> {
+    match data_type {
+        DataType::Utf8 => Ok(FieldType::String),
+        DataType::Int64 => Ok(FieldType::Int64),
+        DataType::Int32 => Ok(FieldType::Int32),
+        DataType::UInt32 => Ok(FieldType::UInt32),
+        DataType::UInt64 => Ok(FieldType::UInt64),
+        DataType::Float32 => Ok(FieldType::Float),
+        DataType::Float64 => Ok(FieldType::Float64),
+        DataType::Boolean => Ok(FieldType::Bool),
+        unsupported => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported Lance scalar column type: {unsupported:?}"),
+        )),
+    }
+}
+
+fn vector_dimension(data_type: &DataType) -> io::Result<Option<usize>> {
+    let DataType::FixedSizeList(item, dimension) = data_type else {
+        return Ok(None);
+    };
+    if item.data_type() != &DataType::Float32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported Lance vector value type: {:?}",
+                item.data_type()
+            ),
+        ));
+    }
+    usize::try_from(*dimension).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative Lance vector dimension",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -164,5 +251,34 @@ mod tests {
         let err = arrow_schema_for_lance(&schema).expect_err("sparse vector rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("sparse vectors are not supported"));
+    }
+
+    #[test]
+    fn lance_schema_can_be_inferred_from_arrow_schema() {
+        let arrow = Schema::new(vec![
+            Field::new(LANCE_ID_COLUMN, DataType::Int64, false),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("year", DataType::Int32, false),
+            Field::new(
+                "dense",
+                DataType::FixedSizeList(
+                    std::sync::Arc::new(Field::new("item", DataType::Float32, false)),
+                    2,
+                ),
+                false,
+            ),
+        ]);
+
+        let schema = collection_schema_from_lance_arrow(&arrow).expect("infer schema");
+
+        assert_eq!(schema.primary_vector, "dense");
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[0].name, "title");
+        assert_eq!(schema.fields[0].data_type, FieldType::String);
+        assert!(schema.fields[0].nullable);
+        assert_eq!(schema.fields[1].data_type, FieldType::Int32);
+        assert_eq!(schema.vectors.len(), 1);
+        assert_eq!(schema.vectors[0].name, "dense");
+        assert_eq!(schema.vectors[0].dimension, 2);
     }
 }

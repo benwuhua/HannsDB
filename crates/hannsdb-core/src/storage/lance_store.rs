@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
 use crate::query::{distance_by_metric, SearchHit};
-use crate::storage::lance_schema::arrow_schema_for_lance;
+use crate::storage::lance_schema::{arrow_schema_for_lance, collection_schema_from_lance_arrow};
 
 pub struct LanceCollection {
     name: String,
@@ -55,12 +55,26 @@ impl LanceCollection {
         Ok(Self { name, store })
     }
 
+    pub async fn open_inferred(
+        root: impl AsRef<Path>,
+        name: impl Into<String>,
+    ) -> io::Result<Self> {
+        let name = name.into();
+        let uri = lance_collection_uri(root.as_ref(), &name);
+        let store = LanceDatasetStore::open_inferred(path_to_uri(&uri)?).await?;
+        Ok(Self { name, store })
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
     pub fn uri(&self) -> &str {
         self.store.uri()
+    }
+
+    pub fn schema(&self) -> &CollectionSchema {
+        self.store.schema()
     }
 
     #[cfg(feature = "hanns-backend")]
@@ -124,6 +138,18 @@ impl LanceDatasetStore {
 
     pub fn uri(&self) -> &str {
         self.uri.as_str()
+    }
+
+    pub fn schema(&self) -> &CollectionSchema {
+        &self.schema
+    }
+
+    pub async fn open_inferred(uri: impl Into<String>) -> io::Result<Self> {
+        let uri = uri.into();
+        let dataset = Dataset::open(uri.as_str()).await.map_err(lance_to_io)?;
+        let arrow_schema: arrow_schema::Schema = dataset.schema().into();
+        let schema = collection_schema_from_lance_arrow(&arrow_schema)?;
+        Ok(Self { uri, schema })
     }
 
     #[cfg(feature = "hanns-backend")]
