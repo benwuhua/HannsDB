@@ -347,6 +347,8 @@ def _coerce_doc_to_collection_schema(doc, schema: CollectionSchema | None):
         except KeyError:
             normalized_fields[name] = value
             continue
+        if value is None and field_schema.nullable:
+            continue
         normalized_fields[name] = _coerce_scalar_value_for_field_schema(value, field_schema)
     return doc._replace(fields=normalized_fields)
 

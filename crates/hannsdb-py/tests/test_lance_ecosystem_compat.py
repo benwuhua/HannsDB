@@ -164,7 +164,11 @@ def test_hannsdb_lance_nullable_scalars_are_written_as_lance_nulls(tmp_path):
                 fields={"title": "alpha", "tags": ["red", "blue"]},
                 vectors={"dense": [1.0, 0.0]},
             ),
-            hannsdb.Doc(id="20", fields={}, vectors={"dense": [0.0, 1.0]}),
+            hannsdb.Doc(
+                id="20",
+                fields={"title": None, "tags": None},
+                vectors={"dense": [0.0, 1.0]},
+            ),
         ],
     )
 
