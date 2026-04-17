@@ -289,3 +289,77 @@ async fn lance_collection_hanns_sidecar_optimize_creates_artifact_and_searches()
     assert_eq!(hits[0].id, 20);
     assert_eq!(hits[0].distance, 0.0);
 }
+
+#[cfg(feature = "hanns-backend")]
+#[tokio::test]
+async fn lance_collection_mutations_invalidate_hanns_sidecar() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let collection =
+        LanceCollection::create(temp.path(), "docs", sample_schema(), &sample_documents())
+            .await
+            .expect("create lance collection facade");
+
+    collection
+        .optimize_hanns("dense", "l2")
+        .await
+        .expect("build Hanns sidecar");
+    assert!(collection.hanns_index_path("dense").exists());
+
+    collection
+        .insert_documents(&[Document::with_primary_vector_name(
+            30,
+            vec![
+                ("title".to_string(), FieldValue::String("gamma".to_string())),
+                ("year".to_string(), FieldValue::Int64(2026)),
+            ],
+            "dense",
+            vec![0.0, 0.0, 0.0],
+        )])
+        .await
+        .expect("insert invalidates sidecar");
+    assert!(
+        !collection.hanns_index_path("dense").exists(),
+        "insert should invalidate stale Hanns sidecar"
+    );
+
+    collection
+        .optimize_hanns("dense", "l2")
+        .await
+        .expect("rebuild Hanns sidecar");
+    assert!(collection.hanns_index_path("dense").exists());
+
+    collection
+        .delete_documents(&[30])
+        .await
+        .expect("delete invalidates sidecar");
+    assert!(
+        !collection.hanns_index_path("dense").exists(),
+        "delete should invalidate stale Hanns sidecar"
+    );
+
+    collection
+        .optimize_hanns("dense", "l2")
+        .await
+        .expect("rebuild Hanns sidecar");
+    assert!(collection.hanns_index_path("dense").exists());
+
+    collection
+        .upsert_documents(&[Document::with_primary_vector_name(
+            20,
+            vec![
+                (
+                    "title".to_string(),
+                    FieldValue::String("beta-v3".to_string()),
+                ),
+                ("year".to_string(), FieldValue::Int64(2027)),
+            ],
+            "dense",
+            vec![9.0, 9.0, 9.0],
+        )])
+        .await
+        .expect("upsert invalidates sidecar");
+    assert!(
+        !collection.hanns_index_path("dense").exists(),
+        "upsert should invalidate stale Hanns sidecar"
+    );
+}

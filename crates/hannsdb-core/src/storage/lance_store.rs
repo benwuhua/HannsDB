@@ -236,6 +236,8 @@ impl LanceDatasetStore {
             .delete(id_predicate(ids).as_str())
             .await
             .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
         usize::try_from(result.num_deleted_rows).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -264,6 +266,8 @@ impl LanceDatasetStore {
             .execute_reader(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
             .await
             .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
         usize::try_from(stats.num_inserted_rows + stats.num_updated_rows)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "upsert count exceeds usize"))
     }
@@ -378,8 +382,10 @@ impl LanceDatasetStore {
         };
         Dataset::write(reader, self.uri.as_str(), Some(params))
             .await
-            .map(|_| ())
-            .map_err(lance_to_io)
+            .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
+        Ok(())
     }
 
     #[cfg(feature = "hanns-backend")]
@@ -392,6 +398,16 @@ impl LanceDatasetStore {
     #[cfg(feature = "hanns-backend")]
     fn hanns_index_metadata_path(&self, field_name: &str) -> PathBuf {
         self.hanns_index_dir().join(format!("{field_name}.json"))
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn invalidate_hanns_sidecars(&self) -> io::Result<()> {
+        let dir = self.hanns_index_dir();
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
