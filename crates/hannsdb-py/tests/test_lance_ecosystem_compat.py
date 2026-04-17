@@ -55,3 +55,42 @@ def test_hannsdb_storage_lance_selector_is_readable_by_external_lance_python(tmp
 
     table = dataset.to_table()
     assert table.column("title").to_pylist() == ["alpha", "beta"]
+
+
+def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lance_python(
+    tmp_path,
+):
+    lance = pytest.importorskip("lance")
+
+    collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        _schema()._get_native(),
+        storage="lance",
+        name="docs",
+    )
+    collection.insert(
+        [
+            hannsdb._native.Doc(
+                id="10",
+                field_name="dense",
+                fields={"title": "alpha"},
+                vectors={"dense": [1.0, 0.0]},
+            ),
+            hannsdb._native.Doc(
+                id="20",
+                field_name="dense",
+                fields={"title": "beta"},
+                vectors={"dense": [0.0, 1.0]},
+            ),
+        ]
+    )
+
+    reopened = hannsdb._native.open(str(tmp_path), storage="lance")
+    assert reopened.name == "docs"
+
+    dataset = lance.dataset(reopened.uri)
+    assert dataset.count_rows() == 2
+
+    table = dataset.to_table()
+    assert set(table.column_names) >= {"id", "title", "dense"}
+    assert table.column("title").to_pylist() == ["alpha", "beta"]
