@@ -935,10 +935,21 @@ def _normalize_storage(storage):
     raise ValueError(f"unsupported storage backend: {storage}")
 
 
-def create_and_open(path, schema, option: CollectionOption | None = None, *, storage="hannsdb"):
+def create_and_open(
+    path,
+    schema,
+    option: CollectionOption | None = None,
+    *,
+    storage="hannsdb",
+    name=None,
+):
     storage = _normalize_storage(storage)
     if storage == "lance":
+        if name is not None and str(name) != _coerce_collection_schema(schema).name:
+            raise ValueError("name must match schema.name when schema is provided")
         return create_lance_collection(path, schema, [])
+    if name is not None:
+        raise ValueError("name is only supported when creating Lance storage")
     core_collection = _native_module.create_and_open(
         path,
         _schema_to_native(schema),

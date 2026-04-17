@@ -72,7 +72,7 @@ def test_lance_collection_surface_exposes_hanns_sidecar_optimize(tmp_path):
 
 
 def test_create_and_open_storage_lance_routes_to_lance_collection(tmp_path):
-    collection = hannsdb.create_and_open(str(tmp_path), _schema(), storage="lance")
+    collection = hannsdb.create_and_open(str(tmp_path), _schema(), storage="lance", name="docs")
 
     assert isinstance(collection, hannsdb.LanceCollection)
     assert collection.name == "docs"
@@ -137,6 +137,7 @@ def test_native_binding_storage_lance_returns_lance_collection(tmp_path):
         str(tmp_path),
         _schema()._get_native(),
         storage="lance",
+        name="docs",
     )
 
     assert native_collection.__class__ is hannsdb._native.LanceCollection

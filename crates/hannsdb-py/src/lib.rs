@@ -3807,19 +3807,27 @@ fn py_init(log_level: &str) -> PyResult<()> {
 
 #[cfg(feature = "python-binding")]
 #[pyfunction(name = "create_and_open")]
-#[pyo3(signature = (path, schema, option=None, *, storage="hannsdb"))]
+#[pyo3(signature = (path, schema, option=None, *, storage="hannsdb", name=None))]
 fn py_create_and_open(
     py: Python<'_>,
     path: String,
     schema: Py<PyCollectionSchema>,
     option: Option<Py<PyCollectionOption>>,
     storage: &str,
+    name: Option<String>,
 ) -> PyResult<Py<PyAny>> {
     let schema = schema.borrow(py).inner.clone();
     let option = option.map(|value| value.borrow(py).inner.clone());
     if normalize_storage_backend(storage)? == "lance" {
         #[cfg(feature = "lance-storage")]
         {
+            if let Some(requested_name) = name.as_deref() {
+                if requested_name != schema.name {
+                    return Err(PyValueError::new_err(
+                        "name must match schema.name when schema is provided",
+                    ));
+                }
+            }
             let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
             let empty_docs: Vec<CoreDocument> = Vec::new();
             let collection = block_on_lance(CoreLanceCollection::create(
@@ -3843,6 +3851,11 @@ fn py_create_and_open(
                 "Lance storage requires the lance-storage feature",
             ));
         }
+    }
+    if name.is_some() {
+        return Err(PyValueError::new_err(
+            "name is only supported when creating Lance storage",
+        ));
     }
     let collection = create_and_open(path, schema, option).map_err(io_to_py_err)?;
     Ok(Py::new(
