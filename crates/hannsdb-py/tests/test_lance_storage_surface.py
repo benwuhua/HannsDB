@@ -130,3 +130,30 @@ def test_open_storage_lance_can_select_named_collection_without_schema(tmp_path)
     assert direct.name == "docs"
     assert direct.schema.name == "docs"
     assert [doc.id for doc in direct.fetch(["10", "20"])] == ["10"]
+
+
+def test_native_binding_storage_lance_returns_lance_collection(tmp_path):
+    native_collection = hannsdb._native.create_and_open(
+        str(tmp_path),
+        _schema()._get_native(),
+        storage="lance",
+    )
+
+    assert native_collection.__class__ is hannsdb._native.LanceCollection
+    assert native_collection.name == "docs"
+    assert native_collection.insert(
+        [
+            hannsdb._native.Doc(
+                id="10",
+                field_name="dense",
+                fields={"title": "alpha"},
+                vectors={"dense": [1.0, 0.0]},
+            )
+        ]
+    ) == 1
+
+    reopened = hannsdb._native.open(str(tmp_path), storage="lance", name="docs")
+
+    assert reopened.__class__ is hannsdb._native.LanceCollection
+    assert reopened.name == "docs"
+    assert [doc.id for doc in reopened.fetch(["10"])] == ["10"]

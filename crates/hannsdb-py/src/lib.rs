@@ -1703,6 +1703,17 @@ fn parse_data_type(value: &str) -> PyResult<DataType> {
 }
 
 #[cfg(feature = "python-binding")]
+fn normalize_storage_backend(value: &str) -> PyResult<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hannsdb" | "default" | "" => Ok("hannsdb"),
+        "lance" => Ok("lance"),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported storage backend: {other}"
+        ))),
+    }
+}
+
+#[cfg(feature = "python-binding")]
 fn unsupported_add_column_constant_literal() -> PyErr {
     PyNotImplementedError::new_err("add_column expression supports only constant literals")
 }
@@ -3796,34 +3807,125 @@ fn py_init(log_level: &str) -> PyResult<()> {
 
 #[cfg(feature = "python-binding")]
 #[pyfunction(name = "create_and_open")]
-#[pyo3(signature = (path, schema, option=None))]
+#[pyo3(signature = (path, schema, option=None, *, storage="hannsdb"))]
 fn py_create_and_open(
     py: Python<'_>,
     path: String,
     schema: Py<PyCollectionSchema>,
     option: Option<Py<PyCollectionOption>>,
-) -> PyResult<PyCollection> {
+    storage: &str,
+) -> PyResult<Py<PyAny>> {
     let schema = schema.borrow(py).inner.clone();
     let option = option.map(|value| value.borrow(py).inner.clone());
+    if normalize_storage_backend(storage)? == "lance" {
+        #[cfg(feature = "lance-storage")]
+        {
+            let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+            let empty_docs: Vec<CoreDocument> = Vec::new();
+            let collection = block_on_lance(CoreLanceCollection::create(
+                path,
+                schema.name.clone(),
+                core_schema,
+                &empty_docs,
+            ))?;
+            return Ok(Py::new(
+                py,
+                PyLanceCollection {
+                    inner: Some(collection),
+                    schema,
+                },
+            )?
+            .into_any());
+        }
+        #[cfg(not(feature = "lance-storage"))]
+        {
+            return Err(PyNotImplementedError::new_err(
+                "Lance storage requires the lance-storage feature",
+            ));
+        }
+    }
     let collection = create_and_open(path, schema, option).map_err(io_to_py_err)?;
-    Ok(PyCollection {
-        inner: Some(collection),
-    })
+    Ok(Py::new(
+        py,
+        PyCollection {
+            inner: Some(collection),
+        },
+    )?
+    .into_any())
 }
 
 #[cfg(feature = "python-binding")]
 #[pyfunction(name = "open")]
-#[pyo3(signature = (path, option=None))]
+#[pyo3(signature = (path, option=None, *, storage="hannsdb", schema=None, name=None))]
 fn py_open(
     py: Python<'_>,
     path: String,
     option: Option<Py<PyCollectionOption>>,
-) -> PyResult<PyCollection> {
+    storage: &str,
+    schema: Option<Py<PyCollectionSchema>>,
+    name: Option<String>,
+) -> PyResult<Py<PyAny>> {
     let option = option.map(|value| value.borrow(py).inner.clone());
+    if normalize_storage_backend(storage)? == "lance" {
+        #[cfg(feature = "lance-storage")]
+        {
+            let (collection, schema) = if let Some(schema) = schema {
+                let schema = schema.borrow(py).inner.clone();
+                if let Some(requested_name) = name.as_deref() {
+                    if requested_name != schema.name {
+                        return Err(PyValueError::new_err(
+                            "name must match schema.name when schema is provided",
+                        ));
+                    }
+                }
+                let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+                let collection = block_on_lance(CoreLanceCollection::open(
+                    path,
+                    schema.name.clone(),
+                    core_schema,
+                ))?;
+                (collection, schema)
+            } else {
+                let name = name.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "name is required when opening Lance storage without schema",
+                    )
+                })?;
+                let collection =
+                    block_on_lance(CoreLanceCollection::open_inferred(path, name.clone()))?;
+                let schema =
+                    schema_from_core_schema(name, collection.schema()).map_err(io_to_py_err)?;
+                (collection, schema)
+            };
+            return Ok(Py::new(
+                py,
+                PyLanceCollection {
+                    inner: Some(collection),
+                    schema,
+                },
+            )?
+            .into_any());
+        }
+        #[cfg(not(feature = "lance-storage"))]
+        {
+            return Err(PyNotImplementedError::new_err(
+                "Lance storage requires the lance-storage feature",
+            ));
+        }
+    }
+    if schema.is_some() || name.is_some() {
+        return Err(PyValueError::new_err(
+            "schema and name are only supported when opening Lance storage",
+        ));
+    }
     let collection = open(path, option).map_err(io_to_py_err)?;
-    Ok(PyCollection {
-        inner: Some(collection),
-    })
+    Ok(Py::new(
+        py,
+        PyCollection {
+            inner: Some(collection),
+        },
+    )?
+    .into_any())
 }
 
 #[cfg(all(feature = "python-binding", feature = "lance-storage"))]
