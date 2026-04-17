@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust workspace, `knowhere-rs`, PyO3, axum, Python 3.11, VectorDBBench
 
+**Storage direction update (2026-04-17):** New experimental storage work targets upstream Lance dataset compatibility. The `lance-storage` path is feature-gated and does not replace the default HannsDB runtime yet, but it now provides a Rust/Python Lance-compatible facade plus optional Hanns sidecar indexing.
+
 ---
 
 ## Current state snapshot
@@ -41,6 +43,12 @@
 - [x] Benchmark-facing revalidation after the WAL/flush/recovery slice with no observed no-filter regression
 - [x] `50K/1536/cosine` release proxy rerun after the durability slice with no observed regression signal
 - [x] `50K/1536/cosine` section 32 stability retest with `REPEATS=3` confirmed the strong target-scale win remains stable
+- [x] Experimental Lance-compatible storage foundation
+  - 2026-04-17: `lance-storage` can write committed rows as real Lance datasets through upstream `lance::Dataset`, append rows, reopen with upstream Lance, and scan/count rows.
+  - 2026-04-17: `LanceCollection` exposes a basic Rust facade over Lance storage: create/open/insert/fetch/search/delete/upsert.
+  - 2026-04-17: Python exposes `create_lance_collection`, `open_lance_collection`, and `LanceCollection`; tests verify insert/fetch/search/delete/upsert/reopen.
+  - 2026-04-17: external Python `pylance==4.0.0` can read HannsDB-written Lance datasets with `lance.dataset(collection.uri)` and materialize Arrow tables.
+  - 2026-04-17: `hanns-backend` can build a Hanns HNSW sidecar under `_hannsdb/ann/`, Python can call `optimize_hanns`, and mutations invalidate stale sidecars.
 
 ### In progress
 
@@ -69,6 +77,7 @@
   - 2026-04-14: active-segment mutation authority is now explicitly split: `SegmentWriter` owns append/rollover/sealing mechanics, `VersionSet` / `SegmentManager` own topology, and `db.rs` keeps WAL / mutation policy / ANN invalidation / compaction triggering
   - 2026-04-14: `flush_collection()` is now segment-aware after rollover as well; active-segment Arrow snapshot materialization no longer mis-targets the root-level legacy path, and Arrow-only reopen works for the active segment after multi-segment flush
   - 2026-04-14: persisted-read authority is now less implicit: segment loads start from `segment.json.storage_format`, so `jsonl` segments prefer JSONL but can fall back to Arrow snapshots when JSONL is absent, while `arrow` segments prefer Arrow. This closes a stale/corrupt-sidecar class of reopen bugs without widening into a full recovery rewrite
+  - 2026-04-17: this track now has a parallel Lance-compatible target. Default HannsDB storage remains the existing segment runtime; the new `lance-storage` facade is the forward path for ecosystem-compatible data.
 - [ ] Compaction/rebuild workflow
   - 2026-04-13: no longer truly "not started" — compaction merge behavior, tombstone filtering, reopen coverage, and daemon/admin hooks exist; remaining work is turning the implemented path into a more complete production workflow story
 
@@ -76,6 +85,12 @@
 
 - [ ] Richer agent-oriented data model beyond the current v1 single-primary-vector slice
 - [ ] Full crash-style recovery semantics and durable flush guarantees
+- [ ] Productionize Lance-compatible storage
+  - Merge the experimental branch stack into the main runtime behind a stable API decision.
+  - Decide whether `create_and_open(..., storage="lance")` or an option-based API becomes the public switch.
+  - Replace local path dependency on the sibling Lance checkout with a durable dependency strategy.
+  - Add string primary key support, fuller schema coverage, daemon routes, and legacy migration.
+  - Evaluate whether Hanns sidecars should remain private `_hannsdb` artifacts or integrate with Lance `IndexMetadata`.
 
 ## Phase 1: Freeze the current source of truth
 
