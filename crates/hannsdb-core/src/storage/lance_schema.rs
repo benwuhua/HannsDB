@@ -102,9 +102,10 @@ pub(crate) fn collection_schema_from_lance_arrow(arrow: &Schema) -> io::Result<C
             vectors.push(VectorFieldSchema::new(field.name().clone(), dimension));
             continue;
         }
+        let (field_type, is_array) = scalar_field_shape(field.data_type())?;
         fields.push(
-            ScalarFieldSchema::new(field.name().clone(), scalar_field_type(field.data_type())?)
-                .with_flags(field.is_nullable(), false),
+            ScalarFieldSchema::new(field.name().clone(), field_type)
+                .with_flags(field.is_nullable(), is_array),
         );
     }
 
@@ -160,6 +161,15 @@ fn scalar_field_type(data_type: &DataType) -> io::Result<FieldType> {
             io::ErrorKind::InvalidData,
             format!("unsupported Lance scalar column type: {unsupported:?}"),
         )),
+    }
+}
+
+fn scalar_field_shape(data_type: &DataType) -> io::Result<(FieldType, bool)> {
+    match data_type {
+        DataType::List(item) => {
+            scalar_field_type(item.data_type()).map(|field_type| (field_type, true))
+        }
+        _ => scalar_field_type(data_type).map(|field_type| (field_type, false)),
     }
 }
 

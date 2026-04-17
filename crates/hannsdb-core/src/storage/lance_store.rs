@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
-    UInt64Array,
+    Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 #[cfg(feature = "hanns-backend")]
@@ -509,7 +509,9 @@ pub fn documents_from_lance_batch(
                     format!("Lance batch missing scalar column {}", scalar.name),
                 )
             })?;
-            if let Some(value) = field_value_from_column(column, row_idx, &scalar.data_type)? {
+            if let Some(value) =
+                field_value_from_column(column, row_idx, &scalar.data_type, scalar.array)?
+            {
                 fields.push((scalar.name.clone(), value));
             }
         }
@@ -719,50 +721,62 @@ fn field_value_from_column(
     column: &ArrayRef,
     row_idx: usize,
     data_type: &FieldType,
+    is_array: bool,
 ) -> io::Result<Option<FieldValue>> {
     if column.is_null(row_idx) {
         return Ok(None);
     }
+    if is_array {
+        return array_field_value_from_column(column, row_idx, data_type).map(Some);
+    }
+    scalar_field_value_from_column(column, row_idx, data_type).map(Some)
+}
+
+fn scalar_field_value_from_column(
+    column: &ArrayRef,
+    row_idx: usize,
+    data_type: &FieldType,
+) -> io::Result<FieldValue> {
     match data_type {
         FieldType::String => column
             .as_any()
             .downcast_ref::<StringArray>()
-            .map(|array| Some(FieldValue::String(array.value(row_idx).to_string())))
+            .map(|array| FieldValue::String(array.value(row_idx).to_string()))
             .ok_or_else(|| column_type_error("String")),
         FieldType::Int64 => column
             .as_any()
             .downcast_ref::<Int64Array>()
-            .map(|array| Some(FieldValue::Int64(array.value(row_idx))))
+            .map(|array| FieldValue::Int64(array.value(row_idx)))
             .ok_or_else(|| column_type_error("Int64")),
         FieldType::Int32 => column
             .as_any()
             .downcast_ref::<Int32Array>()
-            .map(|array| Some(FieldValue::Int32(array.value(row_idx))))
+            .map(|array| FieldValue::Int32(array.value(row_idx)))
             .ok_or_else(|| column_type_error("Int32")),
         FieldType::UInt32 => column
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .map(|array| Some(FieldValue::UInt32(array.value(row_idx))))
+            .map(|array| FieldValue::UInt32(array.value(row_idx)))
             .ok_or_else(|| column_type_error("UInt32")),
         FieldType::UInt64 => column
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .map(|array| Some(FieldValue::UInt64(array.value(row_idx))))
+            .map(|array| FieldValue::UInt64(array.value(row_idx)))
             .ok_or_else(|| column_type_error("UInt64")),
         FieldType::Float => column
             .as_any()
             .downcast_ref::<Float32Array>()
-            .map(|array| Some(FieldValue::Float(array.value(row_idx))))
+            .map(|array| FieldValue::Float(array.value(row_idx)))
             .ok_or_else(|| column_type_error("Float")),
         FieldType::Float64 => column
             .as_any()
             .downcast_ref::<Float64Array>()
-            .map(|array| Some(FieldValue::Float64(array.value(row_idx))))
+            .map(|array| FieldValue::Float64(array.value(row_idx)))
             .ok_or_else(|| column_type_error("Float64")),
         FieldType::Bool => column
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .map(|array| Some(FieldValue::Bool(array.value(row_idx))))
+            .map(|array| FieldValue::Bool(array.value(row_idx)))
             .ok_or_else(|| column_type_error("Bool")),
         FieldType::VectorFp32 | FieldType::VectorFp16 | FieldType::VectorSparse => {
             Err(io::Error::new(
@@ -771,6 +785,28 @@ fn field_value_from_column(
             ))
         }
     }
+}
+
+fn array_field_value_from_column(
+    column: &ArrayRef,
+    row_idx: usize,
+    data_type: &FieldType,
+) -> io::Result<FieldValue> {
+    let list = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| column_type_error("List"))?;
+    let values = list.value(row_idx);
+    let mut items = Vec::new();
+    for item_idx in 0..values.len() {
+        if values.is_null(item_idx) {
+            continue;
+        }
+        items.push(scalar_field_value_from_column(
+            &values, item_idx, data_type,
+        )?);
+    }
+    Ok(FieldValue::Array(items))
 }
 
 fn vector_from_column(column: &ArrayRef, row_idx: usize, dimension: usize) -> io::Result<Vec<f32>> {

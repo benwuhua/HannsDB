@@ -224,3 +224,31 @@ def test_external_lance_dataset_null_vectors_are_rejected_by_hannsdb(tmp_path):
 
     with pytest.raises(RuntimeError, match="null Lance vector values"):
         collection.fetch(["20"])
+
+
+def test_external_lance_dataset_list_scalars_roundtrip_through_hannsdb(tmp_path):
+    lance = pytest.importorskip("lance")
+    pa = pytest.importorskip("pyarrow")
+
+    values = pa.array([1.0, 0.0, 0.0, 1.0], type=pa.float32())
+    table = pa.table(
+        {
+            "id": pa.array([10, 20], type=pa.int64()),
+            "tags": pa.array([["red", "blue"], ["green"]], type=pa.list_(pa.string())),
+            "scores": pa.array([[1, 2], [3]], type=pa.list_(pa.int64())),
+            "dense": pa.FixedSizeListArray.from_arrays(values, 2),
+        }
+    )
+    uri = tmp_path / "collections" / "docs.lance"
+    uri.parent.mkdir()
+    lance.write_dataset(table, uri)
+
+    collection = hannsdb.open(str(tmp_path), storage="lance")
+
+    assert [(field.name, field.data_type, field.array) for field in collection.schema.fields] == [
+        ("tags", "string", True),
+        ("scores", "int64", True),
+    ]
+    doc = collection.fetch(["10"])[0]
+    assert doc.field("tags") == ["red", "blue"]
+    assert doc.field("scores") == [1, 2]
