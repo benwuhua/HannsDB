@@ -563,6 +563,7 @@ pub fn documents_to_lance_batch(
             scalar.name.as_str(),
             &scalar.data_type,
             scalar.array,
+            scalar.nullable,
             documents,
         )?);
     }
@@ -582,82 +583,107 @@ fn scalar_array_for_documents(
     field_name: &str,
     data_type: &FieldType,
     is_array: bool,
+    nullable: bool,
     documents: &[Document],
 ) -> io::Result<ArrayRef> {
     if is_array {
-        return scalar_list_array_for_documents(field_name, data_type, documents);
+        return scalar_list_array_for_documents(field_name, data_type, nullable, documents);
     }
     match data_type {
         FieldType::String => Ok(Arc::new(StringArray::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::String(value) => Ok(value.clone()),
-                    value => type_mismatch(field_name, "String", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::String(value)) => Ok(Some(value.clone())),
+                        Some(value) => type_mismatch(field_name, "String", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::Int64 => Ok(Arc::new(Int64Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::Int64(value) => Ok(*value),
-                    value => type_mismatch(field_name, "Int64", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::Int64(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "Int64", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::Int32 => Ok(Arc::new(Int32Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::Int32(value) => Ok(*value),
-                    value => type_mismatch(field_name, "Int32", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::Int32(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "Int32", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::UInt32 => Ok(Arc::new(UInt32Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::UInt32(value) => Ok(*value),
-                    value => type_mismatch(field_name, "UInt32", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::UInt32(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "UInt32", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::UInt64 => Ok(Arc::new(UInt64Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::UInt64(value) => Ok(*value),
-                    value => type_mismatch(field_name, "UInt64", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::UInt64(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "UInt64", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::Float => Ok(Arc::new(Float32Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::Float(value) => Ok(*value),
-                    value => type_mismatch(field_name, "Float", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::Float(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "Float", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::Float64 => Ok(Arc::new(Float64Array::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::Float64(value) => Ok(*value),
-                    value => type_mismatch(field_name, "Float64", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::Float64(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "Float64", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::Bool => Ok(Arc::new(BooleanArray::from(
             documents
                 .iter()
-                .map(|document| match required_field(document, field_name)? {
-                    FieldValue::Bool(value) => Ok(*value),
-                    value => type_mismatch(field_name, "Bool", value),
-                })
+                .map(
+                    |document| match optional_field(document, field_name, nullable)? {
+                        Some(FieldValue::Bool(value)) => Ok(Some(*value)),
+                        Some(value) => type_mismatch(field_name, "Bool", value),
+                        None => Ok(None),
+                    },
+                )
                 .collect::<io::Result<Vec<_>>>()?,
         ))),
         FieldType::VectorFp32 | FieldType::VectorFp16 | FieldType::VectorSparse => {
@@ -672,17 +698,18 @@ fn scalar_array_for_documents(
 fn scalar_list_array_for_documents(
     field_name: &str,
     data_type: &FieldType,
+    nullable: bool,
     documents: &[Document],
 ) -> io::Result<ArrayRef> {
     match data_type {
-        FieldType::String => string_list_array_for_documents(field_name, documents),
-        FieldType::Int64 => int64_list_array_for_documents(field_name, documents),
-        FieldType::Int32 => int32_list_array_for_documents(field_name, documents),
-        FieldType::UInt32 => uint32_list_array_for_documents(field_name, documents),
-        FieldType::UInt64 => uint64_list_array_for_documents(field_name, documents),
-        FieldType::Float => float32_list_array_for_documents(field_name, documents),
-        FieldType::Float64 => float64_list_array_for_documents(field_name, documents),
-        FieldType::Bool => bool_list_array_for_documents(field_name, documents),
+        FieldType::String => string_list_array_for_documents(field_name, nullable, documents),
+        FieldType::Int64 => int64_list_array_for_documents(field_name, nullable, documents),
+        FieldType::Int32 => int32_list_array_for_documents(field_name, nullable, documents),
+        FieldType::UInt32 => uint32_list_array_for_documents(field_name, nullable, documents),
+        FieldType::UInt64 => uint64_list_array_for_documents(field_name, nullable, documents),
+        FieldType::Float => float32_list_array_for_documents(field_name, nullable, documents),
+        FieldType::Float64 => float64_list_array_for_documents(field_name, nullable, documents),
+        FieldType::Bool => bool_list_array_for_documents(field_name, nullable, documents),
         unsupported => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("array scalar type is not supported by Lance storage yet: {unsupported:?}"),
@@ -692,11 +719,15 @@ fn scalar_list_array_for_documents(
 
 fn string_list_array_for_documents(
     field_name: &str,
+    nullable: bool,
     documents: &[Document],
 ) -> io::Result<ArrayRef> {
     let mut builder = ListBuilder::new(StringBuilder::new());
     for document in documents {
-        let value = required_field(document, field_name)?;
+        let Some(value) = optional_field(document, field_name, nullable)? else {
+            builder.append(false);
+            continue;
+        };
         let FieldValue::Array(items) = value else {
             return type_mismatch(field_name, "Array<String>", value);
         };
@@ -713,10 +744,17 @@ fn string_list_array_for_documents(
 
 macro_rules! scalar_list_array_for_documents {
     ($fn_name:ident, $builder:ident, $variant:ident, $expected:literal, $item_expected:literal) => {
-        fn $fn_name(field_name: &str, documents: &[Document]) -> io::Result<ArrayRef> {
+        fn $fn_name(
+            field_name: &str,
+            nullable: bool,
+            documents: &[Document],
+        ) -> io::Result<ArrayRef> {
             let mut builder = ListBuilder::new($builder::new());
             for document in documents {
-                let value = required_field(document, field_name)?;
+                let Some(value) = optional_field(document, field_name, nullable)? else {
+                    builder.append(false);
+                    continue;
+                };
                 let FieldValue::Array(items) = value else {
                     return type_mismatch(field_name, $expected, value);
                 };
@@ -743,11 +781,15 @@ scalar_list_array_for_documents!(
 
 fn int64_list_array_for_documents(
     field_name: &str,
+    nullable: bool,
     documents: &[Document],
 ) -> io::Result<ArrayRef> {
     let mut builder = ListBuilder::new(Int64Builder::new());
     for document in documents {
-        let value = required_field(document, field_name)?;
+        let Some(value) = optional_field(document, field_name, nullable)? else {
+            builder.append(false);
+            continue;
+        };
         let FieldValue::Array(items) = value else {
             return type_mismatch(field_name, "Array<Int64>", value);
         };
@@ -847,16 +889,22 @@ fn vector_array_for_documents(
     .map_err(arrow_to_io)
 }
 
-fn required_field<'a>(document: &'a Document, field_name: &str) -> io::Result<&'a FieldValue> {
-    document.fields.get(field_name).ok_or_else(|| {
-        io::Error::new(
+fn optional_field<'a>(
+    document: &'a Document,
+    field_name: &str,
+    nullable: bool,
+) -> io::Result<Option<&'a FieldValue>> {
+    match document.fields.get(field_name) {
+        Some(value) => Ok(Some(value)),
+        None if nullable => Ok(None),
+        None => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "document {} is missing scalar field {field_name}",
                 document.id
             ),
-        )
-    })
+        )),
+    }
 }
 
 fn field_value_from_column(

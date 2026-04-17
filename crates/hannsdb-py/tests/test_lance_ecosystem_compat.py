@@ -42,6 +42,26 @@ def _array_schema():
     )
 
 
+def _nullable_schema():
+    return hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="title", data_type="string", nullable=True),
+            hannsdb.FieldSchema(
+                name="tags", data_type="string", nullable=True, array=True
+            ),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+
 def test_hannsdb_lance_collection_is_readable_by_external_lance_python(tmp_path):
     lance = pytest.importorskip("lance")
 
@@ -130,6 +150,34 @@ def test_hannsdb_lance_array_scalars_are_readable_by_external_lance_python(tmp_p
     assert table.column("f32s").to_pylist() == [[1.5, 2.5], [5.5]]
     assert table.column("f64s").to_pylist() == [[3.5, 4.5], [6.5]]
     assert table.column("flags").to_pylist() == [[True, False], [False]]
+
+
+def test_hannsdb_lance_nullable_scalars_are_written_as_lance_nulls(tmp_path):
+    lance = pytest.importorskip("lance")
+
+    collection = hannsdb.create_lance_collection(
+        str(tmp_path),
+        _nullable_schema(),
+        [
+            hannsdb.Doc(
+                id="10",
+                fields={"title": "alpha", "tags": ["red", "blue"]},
+                vectors={"dense": [1.0, 0.0]},
+            ),
+            hannsdb.Doc(id="20", fields={}, vectors={"dense": [0.0, 1.0]}),
+        ],
+    )
+
+    table = lance.dataset(collection.uri).to_table()
+    assert table.column("title").to_pylist() == ["alpha", None]
+    assert table.column("tags").to_pylist() == [["red", "blue"], None]
+
+    reopened = hannsdb.open(str(tmp_path), storage="lance")
+    first, second = reopened.fetch(["10", "20"])
+    assert first.field("title") == "alpha"
+    assert first.field("tags") == ["red", "blue"]
+    assert second.has_field("title") is False
+    assert second.has_field("tags") is False
 
 
 def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lance_python(
