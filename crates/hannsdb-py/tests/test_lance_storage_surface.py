@@ -1,9 +1,9 @@
 import hannsdb
 
 
-def _schema():
+def _schema(name="docs"):
     return hannsdb.CollectionSchema(
-        name="docs",
+        name=name,
         primary_vector="dense",
         fields=[hannsdb.FieldSchema(name="title", data_type="string")],
         vectors=[
@@ -109,3 +109,24 @@ def test_open_storage_lance_infers_schema_and_reopens_collection(tmp_path):
         ("dense", "vector_fp32", 2)
     ]
     assert [doc.id for doc in reopened.fetch(["10", "20"])] == ["10", "20"]
+
+
+def test_open_storage_lance_can_select_named_collection_without_schema(tmp_path):
+    docs = hannsdb.create_lance_collection(str(tmp_path), _schema("docs"), _docs()[:1])
+    notes = hannsdb.create_lance_collection(str(tmp_path), _schema("notes"), _docs()[1:])
+
+    assert docs.name == "docs"
+    assert notes.name == "notes"
+
+    reopened = hannsdb.open(str(tmp_path), storage="lance", name="notes")
+
+    assert isinstance(reopened, hannsdb.LanceCollection)
+    assert reopened.name == "notes"
+    assert reopened.schema.name == "notes"
+    assert [doc.id for doc in reopened.fetch(["10", "20"])] == ["20"]
+
+    direct = hannsdb.open_lance_collection(str(tmp_path), name="docs")
+
+    assert direct.name == "docs"
+    assert direct.schema.name == "docs"
+    assert [doc.id for doc in direct.fetch(["10", "20"])] == ["10"]

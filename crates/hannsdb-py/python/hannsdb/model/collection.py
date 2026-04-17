@@ -947,10 +947,19 @@ def create_and_open(path, schema, option: CollectionOption | None = None, *, sto
     return Collection._from_core(core_collection, schema=schema)
 
 
-def open(path, option: CollectionOption | None = None, *, storage="hannsdb", schema=None):
+def open(
+    path,
+    option: CollectionOption | None = None,
+    *,
+    storage="hannsdb",
+    schema=None,
+    name=None,
+):
     storage = _normalize_storage(storage)
     if storage == "lance":
-        return open_lance_collection(path, schema)
+        return open_lance_collection(path, schema, name=name)
+    if name is not None:
+        raise ValueError("name is only supported when opening Lance storage")
     core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)
 
@@ -1050,12 +1059,18 @@ def _infer_single_lance_collection_name(path) -> str:
     )
 
 
-def open_lance_collection(path, schema=None):
+def open_lance_collection(path, schema=None, *, name=None):
     if schema is None:
-        name = _infer_single_lance_collection_name(path)
-        core_collection = _native_module.open_lance_collection_infer_schema(path, name)
+        collection_name = (
+            str(name) if name is not None else _infer_single_lance_collection_name(path)
+        )
+        core_collection = _native_module.open_lance_collection_infer_schema(
+            path, collection_name
+        )
         return LanceCollection(core_collection, core_collection.schema)
     coerced_schema = _coerce_collection_schema(schema)
+    if name is not None and str(name) != coerced_schema.name:
+        raise ValueError("name must match schema.name when schema is provided")
     core_collection = _native_module.open_lance_collection(
         path,
         _schema_to_native(coerced_schema),
