@@ -25,6 +25,12 @@ def _array_schema():
         fields=[
             hannsdb.FieldSchema(name="tags", data_type="string", array=True),
             hannsdb.FieldSchema(name="scores", data_type="int64", array=True),
+            hannsdb.FieldSchema(name="i32s", data_type="int32", array=True),
+            hannsdb.FieldSchema(name="u32s", data_type="uint32", array=True),
+            hannsdb.FieldSchema(name="u64s", data_type="uint64", array=True),
+            hannsdb.FieldSchema(name="f32s", data_type="float", array=True),
+            hannsdb.FieldSchema(name="f64s", data_type="float64", array=True),
+            hannsdb.FieldSchema(name="flags", data_type="bool", array=True),
         ],
         vectors=[
             hannsdb.VectorSchema(
@@ -84,12 +90,30 @@ def test_hannsdb_lance_array_scalars_are_readable_by_external_lance_python(tmp_p
         [
             hannsdb.Doc(
                 id="10",
-                fields={"tags": ["red", "blue"], "scores": [1, 2]},
+                fields={
+                    "tags": ["red", "blue"],
+                    "scores": [1, 2],
+                    "i32s": [3, 4],
+                    "u32s": [5, 6],
+                    "u64s": [7, 8],
+                    "f32s": [1.5, 2.5],
+                    "f64s": [3.5, 4.5],
+                    "flags": [True, False],
+                },
                 vectors={"dense": [1.0, 0.0]},
             ),
             hannsdb.Doc(
                 id="20",
-                fields={"tags": ["green"], "scores": [3]},
+                fields={
+                    "tags": ["green"],
+                    "scores": [9],
+                    "i32s": [10],
+                    "u32s": [11],
+                    "u64s": [12],
+                    "f32s": [5.5],
+                    "f64s": [6.5],
+                    "flags": [False],
+                },
                 vectors={"dense": [0.0, 1.0]},
             ),
         ],
@@ -99,7 +123,13 @@ def test_hannsdb_lance_array_scalars_are_readable_by_external_lance_python(tmp_p
     table = dataset.to_table()
 
     assert table.column("tags").to_pylist() == [["red", "blue"], ["green"]]
-    assert table.column("scores").to_pylist() == [[1, 2], [3]]
+    assert table.column("scores").to_pylist() == [[1, 2], [9]]
+    assert table.column("i32s").to_pylist() == [[3, 4], [10]]
+    assert table.column("u32s").to_pylist() == [[5, 6], [11]]
+    assert table.column("u64s").to_pylist() == [[7, 8], [12]]
+    assert table.column("f32s").to_pylist() == [[1.5, 2.5], [5.5]]
+    assert table.column("f64s").to_pylist() == [[3.5, 4.5], [6.5]]
+    assert table.column("flags").to_pylist() == [[True, False], [False]]
 
 
 def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lance_python(

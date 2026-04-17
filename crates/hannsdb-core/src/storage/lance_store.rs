@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{Int64Builder, ListBuilder, StringBuilder},
+    builder::{
+        BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder,
+        StringBuilder, UInt32Builder, UInt64Builder,
+    },
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
     Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
     UInt32Array, UInt64Array,
@@ -674,6 +677,12 @@ fn scalar_list_array_for_documents(
     match data_type {
         FieldType::String => string_list_array_for_documents(field_name, documents),
         FieldType::Int64 => int64_list_array_for_documents(field_name, documents),
+        FieldType::Int32 => int32_list_array_for_documents(field_name, documents),
+        FieldType::UInt32 => uint32_list_array_for_documents(field_name, documents),
+        FieldType::UInt64 => uint64_list_array_for_documents(field_name, documents),
+        FieldType::Float => float32_list_array_for_documents(field_name, documents),
+        FieldType::Float64 => float64_list_array_for_documents(field_name, documents),
+        FieldType::Bool => bool_list_array_for_documents(field_name, documents),
         unsupported => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("array scalar type is not supported by Lance storage yet: {unsupported:?}"),
@@ -702,6 +711,36 @@ fn string_list_array_for_documents(
     Ok(Arc::new(builder.finish()))
 }
 
+macro_rules! scalar_list_array_for_documents {
+    ($fn_name:ident, $builder:ident, $variant:ident, $expected:literal, $item_expected:literal) => {
+        fn $fn_name(field_name: &str, documents: &[Document]) -> io::Result<ArrayRef> {
+            let mut builder = ListBuilder::new($builder::new());
+            for document in documents {
+                let value = required_field(document, field_name)?;
+                let FieldValue::Array(items) = value else {
+                    return type_mismatch(field_name, $expected, value);
+                };
+                for item in items {
+                    match item {
+                        FieldValue::$variant(value) => builder.values().append_value(*value),
+                        value => return type_mismatch(field_name, $item_expected, value),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+    };
+}
+
+scalar_list_array_for_documents!(
+    int32_list_array_for_documents,
+    Int32Builder,
+    Int32,
+    "Array<Int32>",
+    "Int32 array item"
+);
+
 fn int64_list_array_for_documents(
     field_name: &str,
     documents: &[Document],
@@ -722,6 +761,46 @@ fn int64_list_array_for_documents(
     }
     Ok(Arc::new(builder.finish()))
 }
+
+scalar_list_array_for_documents!(
+    uint32_list_array_for_documents,
+    UInt32Builder,
+    UInt32,
+    "Array<UInt32>",
+    "UInt32 array item"
+);
+
+scalar_list_array_for_documents!(
+    uint64_list_array_for_documents,
+    UInt64Builder,
+    UInt64,
+    "Array<UInt64>",
+    "UInt64 array item"
+);
+
+scalar_list_array_for_documents!(
+    float32_list_array_for_documents,
+    Float32Builder,
+    Float,
+    "Array<Float>",
+    "Float array item"
+);
+
+scalar_list_array_for_documents!(
+    float64_list_array_for_documents,
+    Float64Builder,
+    Float64,
+    "Array<Float64>",
+    "Float64 array item"
+);
+
+scalar_list_array_for_documents!(
+    bool_list_array_for_documents,
+    BooleanBuilder,
+    Bool,
+    "Array<Bool>",
+    "Bool array item"
+);
 
 fn vector_array_for_documents(
     vector_name: &str,
