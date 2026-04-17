@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{
+    builder::{Int64Builder, ListBuilder, StringBuilder},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
     Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
     UInt32Array, UInt64Array,
@@ -558,6 +559,7 @@ pub fn documents_to_lance_batch(
         arrays.push(scalar_array_for_documents(
             scalar.name.as_str(),
             &scalar.data_type,
+            scalar.array,
             documents,
         )?);
     }
@@ -576,8 +578,12 @@ pub fn documents_to_lance_batch(
 fn scalar_array_for_documents(
     field_name: &str,
     data_type: &FieldType,
+    is_array: bool,
     documents: &[Document],
 ) -> io::Result<ArrayRef> {
+    if is_array {
+        return scalar_list_array_for_documents(field_name, data_type, documents);
+    }
     match data_type {
         FieldType::String => Ok(Arc::new(StringArray::from(
             documents
@@ -658,6 +664,63 @@ fn scalar_array_for_documents(
             ))
         }
     }
+}
+
+fn scalar_list_array_for_documents(
+    field_name: &str,
+    data_type: &FieldType,
+    documents: &[Document],
+) -> io::Result<ArrayRef> {
+    match data_type {
+        FieldType::String => string_list_array_for_documents(field_name, documents),
+        FieldType::Int64 => int64_list_array_for_documents(field_name, documents),
+        unsupported => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("array scalar type is not supported by Lance storage yet: {unsupported:?}"),
+        )),
+    }
+}
+
+fn string_list_array_for_documents(
+    field_name: &str,
+    documents: &[Document],
+) -> io::Result<ArrayRef> {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for document in documents {
+        let value = required_field(document, field_name)?;
+        let FieldValue::Array(items) = value else {
+            return type_mismatch(field_name, "Array<String>", value);
+        };
+        for item in items {
+            match item {
+                FieldValue::String(value) => builder.values().append_value(value),
+                value => return type_mismatch(field_name, "String array item", value),
+            }
+        }
+        builder.append(true);
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn int64_list_array_for_documents(
+    field_name: &str,
+    documents: &[Document],
+) -> io::Result<ArrayRef> {
+    let mut builder = ListBuilder::new(Int64Builder::new());
+    for document in documents {
+        let value = required_field(document, field_name)?;
+        let FieldValue::Array(items) = value else {
+            return type_mismatch(field_name, "Array<Int64>", value);
+        };
+        for item in items {
+            match item {
+                FieldValue::Int64(value) => builder.values().append_value(*value),
+                value => return type_mismatch(field_name, "Int64 array item", value),
+            }
+        }
+        builder.append(true);
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
 fn vector_array_for_documents(

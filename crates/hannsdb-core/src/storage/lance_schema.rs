@@ -12,18 +12,9 @@ pub(crate) fn arrow_schema_for_lance(schema: &CollectionSchema) -> io::Result<Ar
     fields.push(Field::new(LANCE_ID_COLUMN, DataType::Int64, false));
 
     for scalar in &schema.fields {
-        if scalar.array {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "array scalar fields are not supported by Lance storage P0: {}",
-                    scalar.name
-                ),
-            ));
-        }
         fields.push(Field::new(
             scalar.name.clone(),
-            scalar_data_type(&scalar.data_type)?,
+            scalar_data_type_for_lance(&scalar.data_type, scalar.array)?,
             scalar.nullable,
         ));
     }
@@ -144,6 +135,17 @@ fn scalar_data_type(data_type: &FieldType) -> io::Result<DataType> {
                 "vector field type cannot be used as a Lance scalar column",
             ))
         }
+    }
+}
+
+fn scalar_data_type_for_lance(data_type: &FieldType, is_array: bool) -> io::Result<DataType> {
+    let item_type = scalar_data_type(data_type)?;
+    if is_array {
+        Ok(DataType::List(Arc::new(Field::new(
+            "item", item_type, true,
+        ))))
+    } else {
+        Ok(item_type)
     }
 }
 

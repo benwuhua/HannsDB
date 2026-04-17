@@ -18,6 +18,24 @@ def _schema():
     )
 
 
+def _array_schema():
+    return hannsdb.CollectionSchema(
+        name="docs",
+        primary_vector="dense",
+        fields=[
+            hannsdb.FieldSchema(name="tags", data_type="string", array=True),
+            hannsdb.FieldSchema(name="scores", data_type="int64", array=True),
+        ],
+        vectors=[
+            hannsdb.VectorSchema(
+                name="dense",
+                data_type="vector_fp32",
+                dimension=2,
+            )
+        ],
+    )
+
+
 def test_hannsdb_lance_collection_is_readable_by_external_lance_python(tmp_path):
     lance = pytest.importorskip("lance")
 
@@ -55,6 +73,33 @@ def test_hannsdb_storage_lance_selector_is_readable_by_external_lance_python(tmp
 
     table = dataset.to_table()
     assert table.column("title").to_pylist() == ["alpha", "beta"]
+
+
+def test_hannsdb_lance_array_scalars_are_readable_by_external_lance_python(tmp_path):
+    lance = pytest.importorskip("lance")
+
+    collection = hannsdb.create_lance_collection(
+        str(tmp_path),
+        _array_schema(),
+        [
+            hannsdb.Doc(
+                id="10",
+                fields={"tags": ["red", "blue"], "scores": [1, 2]},
+                vectors={"dense": [1.0, 0.0]},
+            ),
+            hannsdb.Doc(
+                id="20",
+                fields={"tags": ["green"], "scores": [3]},
+                vectors={"dense": [0.0, 1.0]},
+            ),
+        ],
+    )
+
+    dataset = lance.dataset(collection.uri)
+    table = dataset.to_table()
+
+    assert table.column("tags").to_pylist() == [["red", "blue"], ["green"]]
+    assert table.column("scores").to_pylist() == [[1, 2], [3]]
 
 
 def test_hannsdb_native_lance_selector_named_dataset_is_readable_by_external_lance_python(
