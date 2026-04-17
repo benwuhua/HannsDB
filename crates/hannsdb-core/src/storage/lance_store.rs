@@ -8,8 +8,14 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field};
+#[cfg(feature = "hanns-backend")]
+use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
+#[cfg(feature = "hanns-backend")]
+use hannsdb_index::factory::DefaultIndexFactory;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::Dataset;
+#[cfg(feature = "hanns-backend")]
+use serde::{Deserialize, Serialize};
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
 use crate::query::{distance_by_metric, SearchHit};
@@ -55,6 +61,16 @@ impl LanceCollection {
 
     pub fn uri(&self) -> &str {
         self.store.uri()
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn hanns_index_path(&self, field_name: &str) -> PathBuf {
+        self.store.hanns_index_path(field_name)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn optimize_hanns(&self, field_name: &str, metric: &str) -> io::Result<()> {
+        self.store.optimize_hanns(field_name, metric).await
     }
 
     pub async fn insert_documents(&self, documents: &[Document]) -> io::Result<()> {
@@ -108,6 +124,99 @@ impl LanceDatasetStore {
 
     pub fn uri(&self) -> &str {
         self.uri.as_str()
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn hanns_index_path(&self, field_name: &str) -> PathBuf {
+        self.hanns_index_dir().join(format!("{field_name}.hanns"))
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn optimize_hanns(&self, field_name: &str, metric: &str) -> io::Result<()> {
+        let vector_schema = self
+            .schema
+            .vectors
+            .iter()
+            .find(|vector| vector.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("vector field not found: {field_name}"),
+                )
+            })?;
+        if !matches!(vector_schema.data_type, FieldType::VectorFp32) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Hanns sidecar supports only dense f32 vectors: {field_name}"),
+            ));
+        }
+
+        let documents = self.read_all_documents().await?;
+        let mut ids = Vec::with_capacity(documents.len());
+        let mut flat_vectors =
+            Vec::with_capacity(documents.len().saturating_mul(vector_schema.dimension));
+        for document in documents {
+            let id = u64::try_from(document.id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Hanns sidecar cannot index negative id {}", document.id),
+                )
+            })?;
+            let vector = document.vectors.get(field_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "document {} is missing vector field {field_name}",
+                        document.id
+                    ),
+                )
+            })?;
+            if vector.len() != vector_schema.dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "document {} vector {field_name} dimension mismatch: expected {}, got {}",
+                        document.id,
+                        vector_schema.dimension,
+                        vector.len()
+                    ),
+                ));
+            }
+            ids.push(id);
+            flat_vectors.extend_from_slice(vector);
+        }
+
+        let descriptor = hanns_hnsw_descriptor(field_name, metric);
+        let mut backend = DefaultIndexFactory::default()
+            .create_vector_index(vector_schema.dimension, &descriptor, None)
+            .map_err(adapter_error_to_io)?;
+        if !flat_vectors.is_empty() {
+            backend
+                .insert_flat(&ids, &flat_vectors, vector_schema.dimension)
+                .map_err(adapter_error_to_io)?;
+        }
+        let bytes = backend.serialize_to_bytes().map_err(adapter_error_to_io)?;
+        let bytes = bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "selected Hanns backend cannot serialize sidecar index",
+            )
+        })?;
+
+        std::fs::create_dir_all(self.hanns_index_dir())?;
+        std::fs::write(self.hanns_index_path(field_name), bytes)?;
+        let meta = HannsSidecarMetadata {
+            field_name: field_name.to_string(),
+            metric: metric.to_ascii_lowercase(),
+            dimension: vector_schema.dimension,
+            row_count: ids.len(),
+        };
+        std::fs::write(
+            self.hanns_index_metadata_path(field_name),
+            serde_json::to_vec_pretty(&meta)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
+        )?;
+        Ok(())
     }
 
     pub async fn create(&self, documents: &[Document]) -> io::Result<()> {
@@ -188,6 +297,11 @@ impl LanceDatasetStore {
         top_k: usize,
         metric: &str,
     ) -> io::Result<Vec<SearchHit>> {
+        #[cfg(feature = "hanns-backend")]
+        if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
+            return Ok(hits);
+        }
+
         let primary_vector = self.schema.primary_vector_name();
         let mut hits = Vec::new();
         for document in self.read_all_documents().await? {
@@ -216,6 +330,44 @@ impl LanceDatasetStore {
         Ok(hits)
     }
 
+    #[cfg(feature = "hanns-backend")]
+    async fn search_hanns_sidecar(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Option<Vec<SearchHit>>> {
+        let field_name = self.schema.primary_vector_name();
+        let index_path = self.hanns_index_path(field_name);
+        let metadata_path = self.hanns_index_metadata_path(field_name);
+        if !index_path.exists() || !metadata_path.exists() {
+            return Ok(None);
+        }
+        let metadata: HannsSidecarMetadata = serde_json::from_slice(&std::fs::read(metadata_path)?)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if metadata.metric != metric.to_ascii_lowercase() || metadata.field_name != field_name {
+            return Ok(None);
+        }
+        let descriptor = hanns_hnsw_descriptor(field_name, metric);
+        let bytes = std::fs::read(index_path)?;
+        let backend = DefaultIndexFactory::default()
+            .create_vector_index(metadata.dimension, &descriptor, Some(&bytes))
+            .map_err(adapter_error_to_io)?;
+        let hits = backend
+            .search(query, top_k, 32)
+            .map_err(adapter_error_to_io)?;
+        Ok(Some(
+            hits.into_iter()
+                .filter_map(|hit| {
+                    i64::try_from(hit.id).ok().map(|id| SearchHit {
+                        id,
+                        distance: public_distance(metadata.metric.as_str(), hit.distance),
+                    })
+                })
+                .collect(),
+        ))
+    }
+
     async fn write(&self, documents: &[Document], mode: WriteMode) -> io::Result<()> {
         let batch = documents_to_lance_batch(&self.schema, documents)?;
         let schema = batch.schema();
@@ -228,6 +380,53 @@ impl LanceDatasetStore {
             .await
             .map(|_| ())
             .map_err(lance_to_io)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn hanns_index_dir(&self) -> PathBuf {
+        PathBuf::from(self.uri.as_str())
+            .join("_hannsdb")
+            .join("ann")
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn hanns_index_metadata_path(&self, field_name: &str) -> PathBuf {
+        self.hanns_index_dir().join(format!("{field_name}.json"))
+    }
+}
+
+#[cfg(feature = "hanns-backend")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HannsSidecarMetadata {
+    field_name: String,
+    metric: String,
+    dimension: usize,
+    row_count: usize,
+}
+
+#[cfg(feature = "hanns-backend")]
+fn hanns_hnsw_descriptor(field_name: &str, metric: &str) -> VectorIndexDescriptor {
+    VectorIndexDescriptor {
+        field_name: field_name.to_string(),
+        kind: VectorIndexKind::Hnsw,
+        metric: Some(metric.to_ascii_lowercase()),
+        params: serde_json::json!({
+            "m": 16,
+            "ef_construction": 128,
+        }),
+    }
+}
+
+#[cfg(feature = "hanns-backend")]
+fn adapter_error_to_io(err: hannsdb_index::adapter::AdapterError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+}
+
+#[cfg(feature = "hanns-backend")]
+fn public_distance(metric: &str, backend_distance: f32) -> f32 {
+    match metric {
+        "ip" => -backend_distance,
+        _ => backend_distance,
     }
 }
 

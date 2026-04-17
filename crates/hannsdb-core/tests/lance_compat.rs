@@ -260,3 +260,32 @@ async fn lance_collection_upsert_replaces_existing_and_inserts_new_documents() {
         .expect("open facade data with upstream Lance");
     assert_eq!(external.count_rows(None).await.expect("count live rows"), 3);
 }
+
+#[cfg(feature = "hanns-backend")]
+#[tokio::test]
+async fn lance_collection_hanns_sidecar_optimize_creates_artifact_and_searches() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let collection =
+        LanceCollection::create(temp.path(), "docs", sample_schema(), &sample_documents())
+            .await
+            .expect("create lance collection facade");
+
+    collection
+        .optimize_hanns("dense", "l2")
+        .await
+        .expect("build Hanns sidecar");
+
+    assert!(
+        collection.hanns_index_path("dense").exists(),
+        "Hanns sidecar artifact should exist after optimize_hanns"
+    );
+
+    let hits = collection
+        .search(&[4.0, 5.0, 6.0], 1, "l2")
+        .await
+        .expect("search with Hanns sidecar");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 20);
+    assert_eq!(hits[0].distance, 0.0);
+}
