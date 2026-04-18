@@ -6,6 +6,8 @@ use hannsdb_core::document::{
 use hannsdb_core::segment::{
     append_payloads, append_record_ids, append_records, SegmentMetadata, SegmentSet, TombstoneMask,
 };
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::storage::lance_store::LanceCollection;
 use hannsdb_core::HannsDb;
 use hannsdb_daemon::routes::build_router;
 use serde_json::Value;
@@ -841,6 +843,72 @@ async fn lance_storage_typed_search_query_by_id_routes_to_lance() {
         .await
         .expect("send multi-id search request");
     assert_eq!(multi_id.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_projects_output_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: vec![
+            ScalarFieldSchema::new("title", FieldType::String),
+            ScalarFieldSchema::new("group", FieldType::Int64),
+        ],
+        vectors: vec![VectorFieldSchema::new("dense", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_primary_vector_name(
+                42,
+                [
+                    ("title".to_string(), FieldValue::String("alpha".to_string())),
+                    ("group".to_string(), FieldValue::Int64(7)),
+                ],
+                "dense",
+                vec![0.0, 0.0],
+            ),
+            Document::with_primary_vector_name(
+                84,
+                [
+                    ("title".to_string(), FieldValue::String("beta".to_string())),
+                    ("group".to_string(), FieldValue::Int64(9)),
+                ],
+                "dense",
+                vec![1.0, 1.0],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"output_fields":["title"]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "42");
+    assert_eq!(
+        json["hits"][0]["fields"],
+        serde_json::json!({"title":"alpha"})
+    );
 }
 
 #[cfg(feature = "lance-storage")]
