@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "lance-storage")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "lance-storage")]
+use tokio::sync::Mutex as AsyncMutex;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -41,6 +43,8 @@ pub(crate) struct DaemonState {
     #[cfg_attr(not(feature = "lance-storage"), allow(dead_code))]
     pub(crate) root: PathBuf,
     pub(crate) db: Arc<Mutex<HannsDb>>,
+    #[cfg(feature = "lance-storage")]
+    pub(crate) lance_insert_lock: Arc<AsyncMutex<()>>,
 }
 
 #[cfg(feature = "lance-storage")]
@@ -54,6 +58,8 @@ pub fn build_router(root: &Path) -> io::Result<Router> {
     let state = DaemonState {
         root: root.to_path_buf(),
         db: Arc::new(Mutex::new(db)),
+        #[cfg(feature = "lance-storage")]
+        lance_insert_lock: Arc::new(AsyncMutex::new(())),
     };
 
     Ok(Router::new()

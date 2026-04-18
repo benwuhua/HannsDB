@@ -1281,6 +1281,89 @@ async fn lance_storage_insert_rejects_duplicate_ids_and_fields() {
     assert_eq!(sparse_vector_insert.status(), StatusCode::BAD_REQUEST);
 }
 
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_concurrent_insert_rejects_duplicate_ids() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let attempts = 8usize;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(attempts));
+    let mut handles = Vec::with_capacity(attempts);
+    for attempt in 0..attempts {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let body = format!(r#"{{"ids":["42"],"vectors":[[{attempt}.0,{attempt}.0]]}}"#);
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/docs/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send concurrent insert")
+            .status()
+        }));
+    }
+
+    let mut statuses = Vec::with_capacity(attempts);
+    for handle in handles {
+        statuses.push(handle.await.expect("join concurrent insert"));
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::BAD_REQUEST)
+            .count(),
+        attempts - 1
+    );
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"].as_array().expect("documents").len(), 1);
+}
+
 #[tokio::test]
 async fn delete_by_filter_route_deletes_matching_rows() {
     let tempdir = tempfile::tempdir().expect("create tempdir");

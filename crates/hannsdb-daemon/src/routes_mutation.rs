@@ -35,6 +35,7 @@ pub(crate) async fn insert_records(
         if let Err(error) = validate_lance_daemon_documents(&documents, true) {
             return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
         }
+        let _insert_guard = state.lance_insert_lock.lock().await;
         let result = match super::routes::open_lance_collection(&state, &collection).await {
             Ok(collection) => {
                 let ids = documents
