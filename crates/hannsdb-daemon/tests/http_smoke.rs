@@ -914,6 +914,52 @@ async fn lance_storage_typed_search_projects_output_fields() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_fetch_uses_lance_primary_vector_name() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: Vec::new(),
+        vectors: vec![VectorFieldSchema::new("dense", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[Document::with_primary_vector_name(
+            42,
+            Vec::new(),
+            "dense",
+            vec![0.0, 1.0],
+        )],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(
+        json["documents"][0]["vector"],
+        serde_json::json!([0.0, 1.0])
+    );
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_create_rejects_native_name_collision() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

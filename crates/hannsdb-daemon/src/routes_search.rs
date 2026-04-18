@@ -31,11 +31,18 @@ pub(crate) async fn fetch_records(
 
     #[cfg(feature = "lance-storage")]
     if super::routes::lance_collection_exists(&state, &collection) {
-        let result = match super::routes::open_lance_collection(&state, &collection).await {
-            Ok(collection) => collection.fetch_documents(&external_ids).await,
-            Err(error) => Err(error),
-        };
-        return fetch_response(result, output_fields);
+        let (result, primary_vector_name) =
+            match super::routes::open_lance_collection(&state, &collection).await {
+                Ok(collection) => {
+                    let primary_vector_name = collection.schema().primary_vector_name().to_string();
+                    (
+                        collection.fetch_documents(&external_ids).await,
+                        primary_vector_name,
+                    )
+                }
+                Err(error) => (Err(error), "vector".to_string()),
+            };
+        return fetch_response(result, output_fields, &primary_vector_name);
     }
 
     let result = state
@@ -44,12 +51,13 @@ pub(crate) async fn fetch_records(
         .expect("daemon state mutex poisoned")
         .fetch_documents(&collection, &external_ids);
 
-    fetch_response(result, output_fields)
+    fetch_response(result, output_fields, "vector")
 }
 
 fn fetch_response(
     result: io::Result<Vec<hannsdb_core::document::Document>>,
     output_fields: Option<&[String]>,
+    primary_vector_name: &str,
 ) -> Response {
     match result {
         Ok(documents) => (
@@ -60,7 +68,11 @@ fn fetch_response(
                     .map(|document| FetchRecordResponse {
                         id: document.id.to_string(),
                         fields: select_fetch_output_fields(&document.fields, output_fields),
-                        vector: document.vectors.get("vector").cloned().unwrap_or_default(),
+                        vector: document
+                            .vectors
+                            .get(primary_vector_name)
+                            .cloned()
+                            .unwrap_or_default(),
                     })
                     .collect(),
             }),
