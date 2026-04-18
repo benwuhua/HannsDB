@@ -206,8 +206,10 @@ async fn search_records_legacy(
             ));
         }
         let lance = super::routes::open_lance_collection(state, collection).await?;
+        let metric =
+            super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
         let hits = lance
-            .search(&request.vector, request.top_k, lance.schema().metric())
+            .search(&request.vector, request.top_k, &metric)
             .await?;
         let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
         let scores = hits

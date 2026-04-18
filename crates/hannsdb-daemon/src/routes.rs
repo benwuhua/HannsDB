@@ -350,6 +350,17 @@ fn read_lance_daemon_metadata(
     }
 }
 
+#[cfg(feature = "lance-storage")]
+pub(crate) fn lance_collection_metric(
+    state: &DaemonState,
+    collection: &str,
+    fallback: &str,
+) -> io::Result<String> {
+    Ok(read_lance_daemon_metadata(state, collection)?
+        .map(|metadata| metadata.metric)
+        .unwrap_or_else(|| fallback.to_string()))
+}
+
 async fn list_collections(State(state): State<DaemonState>) -> Response {
     let result = state
         .db
@@ -507,9 +518,7 @@ async fn lance_collection_info(
 ) -> io::Result<hannsdb_core::CollectionInfo> {
     let lance = open_lance_collection(state, collection).await?;
     let live_count = lance.count_rows().await?;
-    let metric = read_lance_daemon_metadata(state, collection)?
-        .map(|metadata| metadata.metric)
-        .unwrap_or_else(|| lance.schema().metric().to_string());
+    let metric = lance_collection_metric(state, collection, lance.schema().metric())?;
     Ok(hannsdb_core::CollectionInfo {
         name: collection.to_string(),
         dimension: lance.schema().dimension(),
