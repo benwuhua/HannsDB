@@ -695,6 +695,82 @@ async fn lance_storage_legacy_search_uses_daemon_metric_metadata() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_typed_search_routes_to_lance() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"include_vector":true,"output_fields":[]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "42");
+    assert_eq!(json["hits"][0]["vector"], serde_json::json!([0.0, 0.0]));
+
+    let unsupported = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"filter":"id == 42"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send unsupported search request");
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_create_rejects_native_name_collision() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

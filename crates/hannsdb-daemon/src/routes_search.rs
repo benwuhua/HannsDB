@@ -116,7 +116,7 @@ pub(crate) async fn search_records(
 
     let result = match request {
         SearchRequest::Legacy(request) => search_records_legacy(&state, &collection, request).await,
-        SearchRequest::Typed(request) => search_records_typed(&state, &collection, request),
+        SearchRequest::Typed(request) => search_records_typed(&state, &collection, request).await,
     };
 
     match result {
@@ -298,7 +298,7 @@ async fn search_records_legacy(
         })
 }
 
-fn search_records_typed(
+async fn search_records_typed(
     state: &DaemonState,
     collection: &str,
     request: TypedSearchRequest,
@@ -306,6 +306,12 @@ fn search_records_typed(
     let include_vector = request.include_vector;
     let include_fields =
         matches!(request.output_fields.as_deref(), Some(fields) if !fields.is_empty());
+
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(state, collection) {
+        return search_records_typed_lance(state, collection, request).await;
+    }
+
     let context = build_query_context(request)?;
 
     state
@@ -355,4 +361,79 @@ fn search_records_typed(
                 })
                 .collect()
         })
+}
+
+#[cfg(feature = "lance-storage")]
+async fn search_records_typed_lance(
+    state: &DaemonState,
+    collection: &str,
+    request: TypedSearchRequest,
+) -> io::Result<Vec<SearchHitResponse>> {
+    if request
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|filter| !filter.is_empty())
+        || request.query_by_id.is_some()
+        || request.query_by_id_field_name.is_some()
+        || request.group_by.is_some()
+        || request.reranker.is_some()
+        || request.order_by.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search supports only a single dense vector query",
+        ));
+    }
+
+    let [query] = request.queries.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search requires exactly one query",
+        ));
+    };
+    if query.field_name != "vector" || query.sparse_vector.is_some() || query.param.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search supports only the primary dense vector",
+        ));
+    }
+    let vector = query.vector.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Lance daemon typed search requires a dense vector",
+        )
+    })?;
+
+    let output_fields = request.output_fields.as_deref();
+    let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
+    let lance = super::routes::open_lance_collection(state, collection).await?;
+    let metric =
+        super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
+    let hits = lance.search(vector, request.top_k, &metric).await?;
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    let scores = hits
+        .iter()
+        .map(|hit| (hit.id, hit.distance))
+        .collect::<BTreeMap<_, _>>();
+    let docs = lance.fetch_documents(&ids).await?;
+    Ok(docs
+        .into_iter()
+        .map(|document| SearchHitResponse {
+            id: document.id.to_string(),
+            distance: scores.get(&document.id).copied().unwrap_or_default(),
+            fields: if include_fields {
+                select_output_fields(&document.fields, output_fields)
+            } else {
+                BTreeMap::new()
+            },
+            vector: if request.include_vector {
+                document.vectors.get("vector").cloned()
+            } else {
+                None
+            },
+            sparse_vectors: None,
+            group_key: None,
+        })
+        .collect())
 }
