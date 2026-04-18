@@ -374,7 +374,6 @@ async fn search_records_typed_lance(
         .as_deref()
         .map(str::trim)
         .is_some_and(|filter| !filter.is_empty())
-        || request.query_by_id.is_some()
         || request.query_by_id_field_name.is_some()
         || request.group_by.is_some()
         || request.reranker.is_some()
@@ -382,35 +381,17 @@ async fn search_records_typed_lance(
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only a single dense vector query",
+            "Lance daemon typed search supports only a single dense vector query or query_by_id",
         ));
     }
-
-    let [query] = request.queries.as_slice() else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search requires exactly one query",
-        ));
-    };
-    if query.field_name != "vector" || query.sparse_vector.is_some() || query.param.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only the primary dense vector",
-        ));
-    }
-    let vector = query.vector.as_ref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Lance daemon typed search requires a dense vector",
-        )
-    })?;
 
     let output_fields = request.output_fields.as_deref();
     let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
     let lance = super::routes::open_lance_collection(state, collection).await?;
     let metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
-    let hits = lance.search(vector, request.top_k, &metric).await?;
+    let vector = lance_typed_query_vector(&lance, &request).await?;
+    let hits = lance.search(&vector, request.top_k, &metric).await?;
     let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     let scores = hits
         .iter()
@@ -436,4 +417,67 @@ async fn search_records_typed_lance(
             group_key: None,
         })
         .collect())
+}
+
+#[cfg(feature = "lance-storage")]
+async fn lance_typed_query_vector(
+    lance: &hannsdb_core::storage::lance_store::LanceCollection,
+    request: &TypedSearchRequest,
+) -> io::Result<Vec<f32>> {
+    if let Some(ids) = request.query_by_id.as_ref() {
+        if !request.queries.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Lance daemon typed search cannot mix queries with query_by_id",
+            ));
+        }
+        let [id] = ids.as_slice() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Lance daemon typed search supports exactly one query_by_id",
+            ));
+        };
+        let id = id.parse::<i64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid id, expected i64 string: {id}"),
+            )
+        })?;
+        let docs = lance.fetch_documents(&[id]).await?;
+        let document = docs.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("document not found for query_by_id: {id}"),
+            )
+        })?;
+        return document
+            .vectors
+            .get(lance.schema().primary_vector_name())
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "query_by_id document is missing primary vector",
+                )
+            });
+    }
+
+    let [query] = request.queries.as_slice() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search requires exactly one query",
+        ));
+    };
+    if query.field_name != "vector" || query.sparse_vector.is_some() || query.param.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search supports only the primary dense vector",
+        ));
+    }
+    query.vector.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Lance daemon typed search requires a dense vector",
+        )
+    })
 }
