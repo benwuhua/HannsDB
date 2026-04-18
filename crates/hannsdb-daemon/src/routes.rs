@@ -534,6 +534,12 @@ async fn get_collection_stats(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_info(&state, &collection).await;
+        return collection_info_response(result);
+    }
+
     let result = state
         .db
         .lock()
