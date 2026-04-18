@@ -409,7 +409,10 @@ async fn search_records_typed_lance(
                 BTreeMap::new()
             },
             vector: if request.include_vector {
-                document.vectors.get("vector").cloned()
+                document
+                    .vectors
+                    .get(lance.schema().primary_vector_name())
+                    .cloned()
             } else {
                 None
             },
@@ -468,7 +471,10 @@ async fn lance_typed_query_vector(
             "Lance daemon typed search requires exactly one query",
         ));
     };
-    if query.field_name != "vector" || query.sparse_vector.is_some() || query.param.is_some() {
+    if query.field_name != lance.schema().primary_vector_name()
+        || query.sparse_vector.is_some()
+        || query.param.is_some()
+    {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Lance daemon typed search supports only the primary dense vector",

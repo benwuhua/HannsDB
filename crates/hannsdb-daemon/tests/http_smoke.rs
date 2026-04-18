@@ -893,7 +893,7 @@ async fn lance_storage_typed_search_projects_output_fields() {
                 .uri("/collections/docs/search")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"output_fields":["title"]}"#,
+                    r#"{"top_k":1,"queries":[{"field_name":"dense","vector":[0.0,0.0]}],"output_fields":["title"],"include_vector":true}"#,
                 ))
                 .expect("build request"),
         )
@@ -909,6 +909,7 @@ async fn lance_storage_typed_search_projects_output_fields() {
         json["hits"][0]["fields"],
         serde_json::json!({"title":"alpha"})
     );
+    assert_eq!(json["hits"][0]["vector"], serde_json::json!([0.0, 0.0]));
 }
 
 #[cfg(feature = "lance-storage")]
