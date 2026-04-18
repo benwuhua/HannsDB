@@ -119,6 +119,18 @@ impl LanceCollection {
     ) -> io::Result<Vec<SearchHit>> {
         self.store.search(query, top_k, metric).await
     }
+
+    pub async fn search_vector_field(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.store
+            .search_vector_field(field_name, query, top_k, metric)
+            .await
+    }
 }
 
 fn lance_collection_uri(root: &Path, name: &str) -> PathBuf {
@@ -346,19 +358,53 @@ impl LanceDatasetStore {
         top_k: usize,
         metric: &str,
     ) -> io::Result<Vec<SearchHit>> {
-        #[cfg(feature = "hanns-backend")]
-        if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
-            return Ok(hits);
+        self.search_vector_field(self.schema.primary_vector_name(), query, top_k, metric)
+            .await
+    }
+
+    pub async fn search_vector_field(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        let vector_schema = self
+            .schema
+            .vectors
+            .iter()
+            .find(|vector| vector.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("vector field not found: {field_name}"),
+                )
+            })?;
+        if query.len() != vector_schema.dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "query vector dimension mismatch for field '{field_name}': expected {}, got {}",
+                    vector_schema.dimension,
+                    query.len()
+                ),
+            ));
         }
 
-        let primary_vector = self.schema.primary_vector_name();
+        #[cfg(feature = "hanns-backend")]
+        if field_name == self.schema.primary_vector_name() {
+            if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
+                return Ok(hits);
+            }
+        }
+
         let mut hits = Vec::new();
         for document in self.read_all_documents().await? {
-            let vector = document.primary_vector_for(primary_vector).ok_or_else(|| {
+            let vector = document.vectors.get(field_name).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "document {} is missing primary vector {primary_vector}",
+                        "document {} is missing vector field {field_name}",
                         document.id
                     ),
                 )

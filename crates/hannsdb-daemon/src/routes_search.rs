@@ -386,7 +386,6 @@ async fn search_records_typed_lance(
         .as_deref()
         .map(str::trim)
         .is_some_and(|filter| !filter.is_empty())
-        || request.query_by_id_field_name.is_some()
         || request.group_by.is_some()
         || request.reranker.is_some()
         || request.order_by.is_some()
@@ -402,8 +401,10 @@ async fn search_records_typed_lance(
     let lance = super::routes::open_lance_collection(state, collection).await?;
     let metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
-    let vector = lance_typed_query_vector(&lance, &request).await?;
-    let hits = lance.search(&vector, request.top_k, &metric).await?;
+    let query = lance_typed_query_vector(&lance, &request).await?;
+    let hits = lance
+        .search_vector_field(&query.field_name, &query.vector, request.top_k, &metric)
+        .await?;
     let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     let scores = hits
         .iter()
@@ -435,10 +436,16 @@ async fn search_records_typed_lance(
 }
 
 #[cfg(feature = "lance-storage")]
+struct LanceTypedQueryVector {
+    field_name: String,
+    vector: Vec<f32>,
+}
+
+#[cfg(feature = "lance-storage")]
 async fn lance_typed_query_vector(
     lance: &hannsdb_core::storage::lance_store::LanceCollection,
     request: &TypedSearchRequest,
-) -> io::Result<Vec<f32>> {
+) -> io::Result<LanceTypedQueryVector> {
     if let Some(ids) = request.query_by_id.as_ref() {
         if !request.queries.is_empty() {
             return Err(io::Error::new(
@@ -458,6 +465,30 @@ async fn lance_typed_query_vector(
                 format!("invalid id, expected i64 string: {id}"),
             )
         })?;
+        let field_name = match request.query_by_id_field_name.as_deref() {
+            Some(field_name) => {
+                let field_name = field_name.trim();
+                if field_name.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "query_by_id_field_name must not be empty",
+                    ));
+                }
+                field_name.to_string()
+            }
+            None => lance.schema().primary_vector_name().to_string(),
+        };
+        let vector_schema = lance
+            .schema()
+            .vectors
+            .iter()
+            .find(|vector| vector.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("query_by_id field '{field_name}' is not defined"),
+                )
+            })?;
         let docs = lance.fetch_documents(&[id]).await?;
         let document = docs.first().ok_or_else(|| {
             io::Error::new(
@@ -465,16 +496,30 @@ async fn lance_typed_query_vector(
                 format!("document not found for query_by_id: {id}"),
             )
         })?;
-        return document
-            .vectors
-            .get(lance.schema().primary_vector_name())
-            .cloned()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "query_by_id document is missing primary vector",
-                )
-            });
+        let vector = document.vectors.get(&field_name).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("query_by_id document is missing vector field '{field_name}'"),
+            )
+        })?;
+        if vector.len() != vector_schema.dimension {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "query_by_id vector dimension mismatch for field '{field_name}': expected {}, got {}",
+                    vector_schema.dimension,
+                    vector.len()
+                ),
+            ));
+        }
+        return Ok(LanceTypedQueryVector { field_name, vector });
+    }
+
+    if request.query_by_id_field_name.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query_by_id_field_name requires query_by_id",
+        ));
     }
 
     let [query] = request.queries.as_slice() else {
@@ -492,10 +537,14 @@ async fn lance_typed_query_vector(
             "Lance daemon typed search supports only the primary dense vector",
         ));
     }
-    query.vector.clone().ok_or_else(|| {
+    let vector = query.vector.clone().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "Lance daemon typed search requires a dense vector",
         )
+    })?;
+    Ok(LanceTypedQueryVector {
+        field_name: query.field_name.clone(),
+        vector,
     })
 }

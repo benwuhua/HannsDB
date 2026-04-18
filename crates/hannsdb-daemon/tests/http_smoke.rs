@@ -909,6 +909,81 @@ async fn lance_storage_typed_search_query_by_id_routes_to_lance() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_typed_search_query_by_id_field_name_routes_to_lance() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                42,
+                Vec::new(),
+                vec![0.0, 0.0],
+                [("title".to_string(), vec![10.0, 10.0])],
+            ),
+            Document::with_vectors(
+                43,
+                Vec::new(),
+                vec![0.1, 0.0],
+                [("title".to_string(), vec![50.0, 50.0])],
+            ),
+            Document::with_vectors(
+                44,
+                Vec::new(),
+                vec![0.2, 0.0],
+                [("title".to_string(), vec![60.0, 60.0])],
+            ),
+            Document::with_vectors(
+                84,
+                Vec::new(),
+                vec![50.0, 50.0],
+                [("title".to_string(), vec![10.0, 10.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":3,"query_by_id":["42"],"query_by_id_field_name":"title"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    let hit_ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("hit id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec!["42", "84", "43"]);
+    assert!(!hit_ids.iter().any(|id| id == "44"));
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_typed_search_projects_output_fields() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let schema = CollectionSchema {
