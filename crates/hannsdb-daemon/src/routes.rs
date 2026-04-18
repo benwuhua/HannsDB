@@ -3,6 +3,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "lance-storage")]
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use axum::extract::{Path as AxumPath, State};
@@ -39,6 +41,12 @@ pub(crate) struct DaemonState {
     #[cfg_attr(not(feature = "lance-storage"), allow(dead_code))]
     pub(crate) root: PathBuf,
     pub(crate) db: Arc<Mutex<HannsDb>>,
+}
+
+#[cfg(feature = "lance-storage")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LanceDaemonCollectionMetadata {
+    metric: String,
 }
 
 pub fn build_router(root: &Path) -> io::Result<Router> {
@@ -226,15 +234,24 @@ async fn create_lance_collection(state: DaemonState, request: CreateCollectionRe
     let schema = CollectionSchema::new(
         "vector",
         request.dimension,
-        request.metric,
+        request.metric.clone(),
         Vec::<ScalarFieldSchema>::new(),
     );
     match LanceCollection::create(&state.root, request.name.clone(), schema, &[]).await {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(CreateCollectionResponse { name: request.name }),
-        )
-            .into_response(),
+        Ok(_) => match write_lance_daemon_metadata(&state, &request.name, &request.metric) {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(CreateCollectionResponse { name: request.name }),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        },
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
             StatusCode::CONFLICT,
             Json(ErrorResponse {
@@ -290,6 +307,49 @@ pub(crate) async fn open_lance_collection(
     LanceCollection::open_inferred(&state.root, collection).await
 }
 
+#[cfg(feature = "lance-storage")]
+fn lance_daemon_metadata_path(state: &DaemonState, collection: &str) -> PathBuf {
+    state
+        .root
+        .join("collections")
+        .join(format!("{collection}.lance"))
+        .join("_hannsdb")
+        .join("collection.json")
+}
+
+#[cfg(feature = "lance-storage")]
+fn write_lance_daemon_metadata(
+    state: &DaemonState,
+    collection: &str,
+    metric: &str,
+) -> io::Result<()> {
+    let path = lance_daemon_metadata_path(state, collection);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let metadata = LanceDaemonCollectionMetadata {
+        metric: metric.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    std::fs::write(path, bytes)
+}
+
+#[cfg(feature = "lance-storage")]
+fn read_lance_daemon_metadata(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<Option<LanceDaemonCollectionMetadata>> {
+    let path = lance_daemon_metadata_path(state, collection);
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 async fn list_collections(State(state): State<DaemonState>) -> Response {
     let result = state
         .db
@@ -298,11 +358,28 @@ async fn list_collections(State(state): State<DaemonState>) -> Response {
         .list_collections();
 
     match result {
-        Ok(collections) => (
-            StatusCode::OK,
-            Json(ListCollectionsResponse { collections }),
-        )
-            .into_response(),
+        Ok(mut collections) => {
+            #[cfg(feature = "lance-storage")]
+            match list_lance_collections(&state) {
+                Ok(lance_collections) => collections.extend(lance_collections),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+            collections.sort();
+            collections.dedup();
+            (
+                StatusCode::OK,
+                Json(ListCollectionsResponse { collections }),
+            )
+                .into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -313,10 +390,66 @@ async fn list_collections(State(state): State<DaemonState>) -> Response {
     }
 }
 
+#[cfg(feature = "lance-storage")]
+fn list_lance_collections(state: &DaemonState) -> io::Result<Vec<String>> {
+    let collections_dir = state.root.join("collections");
+    let entries = match std::fs::read_dir(&collections_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(name) = file_name.strip_suffix(".lance") {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 async fn drop_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let path = state
+            .root
+            .join("collections")
+            .join(format!("{collection}.lance"));
+        return match std::fs::remove_dir_all(path) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(DropCollectionResponse {
+                    dropped: collection,
+                }),
+            )
+                .into_response(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+
     let result = state
         .db
         .lock()
@@ -352,6 +485,12 @@ async fn get_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_info(&state, &collection).await;
+        return collection_info_response(result);
+    }
+
     let result = state
         .db
         .lock()
@@ -359,6 +498,27 @@ async fn get_collection(
         .get_collection_info(&collection);
 
     collection_info_response(result)
+}
+
+#[cfg(feature = "lance-storage")]
+async fn lance_collection_info(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<hannsdb_core::CollectionInfo> {
+    let lance = open_lance_collection(state, collection).await?;
+    let live_count = lance.count_rows().await?;
+    let metric = read_lance_daemon_metadata(state, collection)?
+        .map(|metadata| metadata.metric)
+        .unwrap_or_else(|| lance.schema().metric().to_string());
+    Ok(hannsdb_core::CollectionInfo {
+        name: collection.to_string(),
+        dimension: lance.schema().dimension(),
+        metric,
+        record_count: live_count,
+        deleted_count: 0,
+        live_count,
+        index_completeness: BTreeMap::new(),
+    })
 }
 
 async fn get_collection_stats(

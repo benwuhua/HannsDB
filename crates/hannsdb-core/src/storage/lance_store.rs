@@ -107,6 +107,10 @@ impl LanceCollection {
         self.store.fetch(ids).await
     }
 
+    pub async fn count_rows(&self) -> io::Result<usize> {
+        self.store.count_rows().await
+    }
+
     pub async fn search(
         &self,
         query: &[f32],
@@ -304,6 +308,17 @@ impl LanceDatasetStore {
 
     pub async fn open_lance(&self) -> io::Result<Dataset> {
         Dataset::open(self.uri.as_str()).await.map_err(lance_to_io)
+    }
+
+    pub async fn count_rows(&self) -> io::Result<usize> {
+        let dataset = self.open_lance().await?;
+        let rows = dataset.count_rows(None).await.map_err(lance_to_io)?;
+        usize::try_from(rows).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Lance row count exceeds usize: {rows}"),
+            )
+        })
     }
 
     pub async fn read_all_documents(&self) -> io::Result<Vec<Document>> {

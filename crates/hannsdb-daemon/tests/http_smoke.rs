@@ -421,7 +421,7 @@ async fn lance_storage_records_insert_fetch_search_delete_flow_works() {
                 .uri("/collections")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                    r#"{"name":"docs","dimension":2,"metric":"cosine","storage":"lance"}"#,
                 ))
                 .expect("build request"),
         )
@@ -521,6 +521,119 @@ async fn lance_storage_records_insert_fetch_search_delete_flow_works() {
     let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
     assert_eq!(json["documents"].as_array().unwrap().len(), 1);
     assert_eq!(json["documents"][0]["id"], "84");
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_admin_routes_list_get_and_drop_collection() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"cosine","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"vectors":[[0.0,0.0]]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send list request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = to_bytes(list.into_body(), usize::MAX)
+        .await
+        .expect("read list body");
+    let list_json: Value = serde_json::from_slice(&list_body).expect("parse list json");
+    assert_eq!(list_json["collections"], serde_json::json!(["docs"]));
+
+    let info = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send info request");
+    assert_eq!(info.status(), StatusCode::OK);
+    let info_body = to_bytes(info.into_body(), usize::MAX)
+        .await
+        .expect("read info body");
+    let info_json: Value = serde_json::from_slice(&info_body).expect("parse info json");
+    assert_eq!(info_json["name"], "docs");
+    assert_eq!(info_json["dimension"], 2);
+    assert_eq!(info_json["metric"], "cosine");
+    assert_eq!(info_json["record_count"], 1);
+    assert_eq!(info_json["deleted_count"], 0);
+    assert_eq!(info_json["live_count"], 1);
+
+    let drop = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send drop request");
+    assert_eq!(drop.status(), StatusCode::OK);
+    assert!(!tempdir
+        .path()
+        .join("collections")
+        .join("docs.lance")
+        .exists());
+
+    let list_after_drop = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send list request");
+    assert_eq!(list_after_drop.status(), StatusCode::OK);
+    let body = to_bytes(list_after_drop.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["collections"], serde_json::json!([]));
 }
 
 #[cfg(feature = "lance-storage")]
