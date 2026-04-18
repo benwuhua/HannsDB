@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "lance-storage")]
+use std::collections::HashSet;
 use std::io;
 
 use axum::extract::{rejection::JsonRejection, Path as AxumPath, State};
@@ -28,12 +30,44 @@ pub(crate) async fn insert_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        if let Err(error) = validate_lance_daemon_documents(&documents, true) {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => {
+                let ids = documents
+                    .iter()
+                    .map(|document| document.id)
+                    .collect::<Vec<_>>();
+                match collection.fetch_documents(&ids).await {
+                    Ok(existing) if !existing.is_empty() => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate document id for Lance insert",
+                    )),
+                    Ok(_) => collection
+                        .insert_documents(&documents)
+                        .await
+                        .map(|_| documents.len()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        return insert_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .insert_documents(&collection, &documents);
 
+    insert_response(result)
+}
+
+fn insert_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(inserted) => (
             StatusCode::OK,
@@ -78,12 +112,28 @@ pub(crate) async fn upsert_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        if let Err(error) = validate_lance_daemon_documents(&documents, false) {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
+        }
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => collection.upsert_documents(&documents).await,
+            Err(error) => Err(error),
+        };
+        return upsert_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .upsert_documents(&collection, &documents);
 
+    upsert_response(result)
+}
+
+fn upsert_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(upserted) => (
             StatusCode::OK,
@@ -114,6 +164,46 @@ pub(crate) async fn upsert_records(
         )
             .into_response(),
     }
+}
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_daemon_documents(
+    documents: &[hannsdb_core::document::Document],
+    reject_duplicate_ids: bool,
+) -> Result<(), String> {
+    if reject_duplicate_ids {
+        let mut seen = HashSet::with_capacity(documents.len());
+        for document in documents {
+            if !seen.insert(document.id) {
+                return Err(format!(
+                    "duplicate document id for Lance insert: {}",
+                    document.id
+                ));
+            }
+        }
+    }
+
+    for document in documents {
+        if !document.fields.is_empty() {
+            return Err(
+                "daemon Lance collections created through this API do not support scalar fields yet"
+                    .to_string(),
+            );
+        }
+        if !document.sparse_vectors.is_empty() {
+            return Err(
+                "daemon Lance collections created through this API do not support sparse vectors yet"
+                    .to_string(),
+            );
+        }
+        if document.vectors.keys().any(|name| name != "vector") {
+            return Err(
+                "daemon Lance collections created through this API support only the primary vector"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn update_records(
@@ -226,12 +316,25 @@ pub(crate) async fn delete_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => collection.delete_documents(&external_ids).await,
+            Err(error) => Err(error),
+        };
+        return delete_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .delete(&collection, &external_ids);
 
+    delete_response(result)
+}
+
+fn delete_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(deleted) => (
             StatusCode::OK,

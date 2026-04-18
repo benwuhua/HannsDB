@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [features]
 hanns-backend = ["hannsdb-core/hanns-backend"]
+lance-storage = ["hannsdb-core/lance-storage"]
 
 [dependencies]
 axum = { version = "0.7", features = ["json"] }

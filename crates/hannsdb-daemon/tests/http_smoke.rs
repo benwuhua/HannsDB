@@ -407,6 +407,308 @@ async fn records_insert_search_delete_flow_works() {
     assert_eq!(json["hits"][0]["id"], "84");
 }
 
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_records_insert_fetch_search_delete_flow_works() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    assert!(tempdir
+        .path()
+        .join("collections")
+        .join("docs.lance")
+        .exists());
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let fetch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","84"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let fetch_body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let fetch_json: Value = serde_json::from_slice(&fetch_body).expect("parse fetch json");
+    assert_eq!(fetch_json["documents"][0]["id"], "42");
+    assert_eq!(fetch_json["documents"][1]["id"], "84");
+
+    let search = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"vector":[0.0,0.0],"top_k":1}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let search_json: Value = serde_json::from_slice(&search_body).expect("parse search json");
+    assert_eq!(search_json["hits"][0]["id"], "42");
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete request");
+    assert_eq!(delete.status(), StatusCode::OK);
+
+    let fetch_after_delete = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","84"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch_after_delete.status(), StatusCode::OK);
+    let body = to_bytes(fetch_after_delete.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(json["documents"][0]["id"], "84");
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_create_rejects_native_name_collision() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let native = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send native create");
+    assert_eq!(native.status(), StatusCode::CREATED);
+
+    let lance = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send lance create");
+    assert_eq!(lance.status(), StatusCode::CONFLICT);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn native_create_rejects_lance_name_collision() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let lance = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send lance create");
+    assert_eq!(lance.status(), StatusCode::CREATED);
+
+    let native = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"docs","dimension":2,"metric":"l2"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send native create");
+    assert_eq!(native.status(), StatusCode::CONFLICT);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_insert_rejects_duplicate_ids_and_fields() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let first_insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"vectors":[[0.0,0.0]]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send first insert");
+    assert_eq!(first_insert.status(), StatusCode::OK);
+
+    let duplicate_insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"vectors":[[1.0,1.0]]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send duplicate insert");
+    assert_eq!(duplicate_insert.status(), StatusCode::BAD_REQUEST);
+
+    let duplicate_batch_insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["100","100"],"vectors":[[1.0,1.0],[2.0,2.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send duplicate batch insert");
+    assert_eq!(duplicate_batch_insert.status(), StatusCode::BAD_REQUEST);
+
+    let field_insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["84"],"vectors":[[1.0,1.0]],"fields":[{"title":"lost"}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send field insert");
+    assert_eq!(field_insert.status(), StatusCode::BAD_REQUEST);
+
+    let extra_named_vector_insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["85"],"vectors":[[1.0,1.0]],"named_vectors":[{"extra":[2.0,2.0]}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send named vector insert");
+    assert_eq!(extra_named_vector_insert.status(), StatusCode::BAD_REQUEST);
+
+    let sparse_vector_insert = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["86"],"vectors":[[1.0,1.0]],"sparse_vectors":[{"sparse":{"indices":[1],"values":[1.0]}}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send sparse vector insert");
+    assert_eq!(sparse_vector_insert.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn delete_by_filter_route_deletes_matching_rows() {
     let tempdir = tempfile::tempdir().expect("create tempdir");

@@ -29,12 +29,28 @@ pub(crate) async fn fetch_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => collection.fetch_documents(&external_ids).await,
+            Err(error) => Err(error),
+        };
+        return fetch_response(result, output_fields);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .fetch_documents(&collection, &external_ids);
 
+    fetch_response(result, output_fields)
+}
+
+fn fetch_response(
+    result: io::Result<Vec<hannsdb_core::document::Document>>,
+    output_fields: Option<&[String]>,
+) -> Response {
     match result {
         Ok(documents) => (
             StatusCode::OK,
@@ -99,7 +115,7 @@ pub(crate) async fn search_records(
     };
 
     let result = match request {
-        SearchRequest::Legacy(request) => search_records_legacy(&state, &collection, request),
+        SearchRequest::Legacy(request) => search_records_legacy(&state, &collection, request).await,
         SearchRequest::Typed(request) => search_records_typed(&state, &collection, request),
     };
 
@@ -168,13 +184,53 @@ fn classify_search_request(payload: serde_json::Value) -> Result<SearchRequest, 
         .map_err(|error| error.to_string())
 }
 
-fn search_records_legacy(
+async fn search_records_legacy(
     state: &DaemonState,
     collection: &str,
     request: LegacySearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
     let output_fields = request.output_fields.as_deref();
     let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
+
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(state, collection) {
+        if request
+            .filter
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|filter| !filter.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Lance daemon legacy search does not support filters yet",
+            ));
+        }
+        let lance = super::routes::open_lance_collection(state, collection).await?;
+        let hits = lance
+            .search(&request.vector, request.top_k, lance.schema().metric())
+            .await?;
+        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let scores = hits
+            .iter()
+            .map(|hit| (hit.id, hit.distance))
+            .collect::<BTreeMap<_, _>>();
+        let docs = lance.fetch_documents(&ids).await?;
+        return Ok(docs
+            .into_iter()
+            .map(|document| SearchHitResponse {
+                id: document.id.to_string(),
+                distance: scores.get(&document.id).copied().unwrap_or_default(),
+                fields: if include_fields {
+                    select_output_fields(&document.fields, output_fields)
+                } else {
+                    BTreeMap::new()
+                },
+                vector: None,
+                sparse_vectors: None,
+                group_key: None,
+            })
+            .collect());
+    }
 
     if let Some(filter) = request
         .filter

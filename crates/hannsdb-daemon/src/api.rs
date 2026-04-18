@@ -8,6 +8,8 @@ pub struct CreateCollectionRequest {
     pub name: String,
     pub dimension: usize,
     pub metric: String,
+    #[serde(default)]
+    pub storage: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -18,6 +18,8 @@ use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, QueryVector, VectorQuery, VectorQueryParam,
 };
 use hannsdb_core::HannsDb;
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::{storage::lance_store::LanceCollection, CollectionSchema};
 
 use crate::api::{
     AddColumnRequest, AddColumnResponse, AddVectorFieldRequest, AddVectorFieldResponse,
@@ -34,12 +36,15 @@ use super::routes_search;
 
 #[derive(Clone)]
 pub(crate) struct DaemonState {
+    #[cfg_attr(not(feature = "lance-storage"), allow(dead_code))]
+    pub(crate) root: PathBuf,
     pub(crate) db: Arc<Mutex<HannsDb>>,
 }
 
 pub fn build_router(root: &Path) -> io::Result<Router> {
     let db = HannsDb::open(root)?;
     let state = DaemonState {
+        root: root.to_path_buf(),
         db: Arc::new(Mutex::new(db)),
     };
 
@@ -137,6 +142,31 @@ async fn create_collection(
     State(state): State<DaemonState>,
     Json(request): Json<CreateCollectionRequest>,
 ) -> Response {
+    match request
+        .storage
+        .as_deref()
+        .map(normalize_storage_backend)
+        .transpose()
+    {
+        Ok(Some("lance")) => return create_lance_collection(state, request).await,
+        Ok(Some("hannsdb")) | Ok(None) => {}
+        Ok(Some(_)) => unreachable!("normalize_storage_backend returns known values"),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    }
+
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &request.name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("collection already exists: {}", request.name),
+            }),
+        )
+            .into_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -164,6 +194,100 @@ async fn create_collection(
         )
             .into_response(),
     }
+}
+
+fn normalize_storage_backend(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hannsdb" | "default" | "" => Ok("hannsdb"),
+        "lance" => Ok("lance"),
+        other => Err(format!("unsupported storage backend: {other}")),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+async fn create_lance_collection(state: DaemonState, request: CreateCollectionRequest) -> Response {
+    let native_exists = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .list_collections()
+        .map(|collections| collections.iter().any(|name| name == &request.name))
+        .unwrap_or(false);
+    if native_exists {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("collection already exists: {}", request.name),
+            }),
+        )
+            .into_response();
+    }
+
+    let schema = CollectionSchema::new(
+        "vector",
+        request.dimension,
+        request.metric,
+        Vec::<ScalarFieldSchema>::new(),
+    );
+    match LanceCollection::create(&state.root, request.name.clone(), schema, &[]).await {
+        Ok(_) => (
+            StatusCode::CREATED,
+            Json(CreateCollectionResponse { name: request.name }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(not(feature = "lance-storage"))]
+async fn create_lance_collection(
+    _state: DaemonState,
+    _request: CreateCollectionRequest,
+) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Lance storage requires the lance-storage feature".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "lance-storage")]
+pub(crate) fn lance_collection_exists(state: &DaemonState, collection: &str) -> bool {
+    state
+        .root
+        .join("collections")
+        .join(format!("{collection}.lance"))
+        .exists()
+}
+
+#[cfg(feature = "lance-storage")]
+pub(crate) async fn open_lance_collection(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<LanceCollection> {
+    LanceCollection::open_inferred(&state.root, collection).await
 }
 
 async fn list_collections(State(state): State<DaemonState>) -> Response {
