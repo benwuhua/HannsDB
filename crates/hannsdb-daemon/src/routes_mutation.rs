@@ -8,6 +8,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::document::CollectionSchema;
 use hannsdb_core::document::DocumentUpdate;
 
 use crate::api::{
@@ -32,12 +34,15 @@ pub(crate) async fn insert_records(
 
     #[cfg(feature = "lance-storage")]
     if super::routes::lance_collection_exists(&state, &collection) {
-        if let Err(error) = validate_lance_daemon_documents(&documents, true) {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
-        }
         let _insert_guard = state.lance_insert_lock.lock().await;
         let result = match super::routes::open_lance_collection(&state, &collection).await {
             Ok(collection) => {
+                if let Err(error) =
+                    validate_lance_daemon_documents(&documents, collection.schema(), true)
+                {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
                 let ids = documents
                     .iter()
                     .map(|document| document.id)
@@ -115,11 +120,13 @@ pub(crate) async fn upsert_records(
 
     #[cfg(feature = "lance-storage")]
     if super::routes::lance_collection_exists(&state, &collection) {
-        if let Err(error) = validate_lance_daemon_documents(&documents, false) {
-            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response();
-        }
         let result = match super::routes::open_lance_collection(&state, &collection).await {
-            Ok(collection) => collection.upsert_documents(&documents).await,
+            Ok(collection) => {
+                match validate_lance_daemon_documents(&documents, collection.schema(), false) {
+                    Ok(()) => collection.upsert_documents(&documents).await,
+                    Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+                }
+            }
             Err(error) => Err(error),
         };
         return upsert_response(result);
@@ -170,6 +177,7 @@ fn upsert_response(result: io::Result<usize>) -> Response {
 #[cfg(feature = "lance-storage")]
 fn validate_lance_daemon_documents(
     documents: &[hannsdb_core::document::Document],
+    schema: &CollectionSchema,
     reject_duplicate_ids: bool,
 ) -> Result<(), String> {
     if reject_duplicate_ids {
@@ -184,24 +192,39 @@ fn validate_lance_daemon_documents(
         }
     }
 
+    let scalar_fields = schema
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<HashSet<_>>();
+    let vector_fields = schema
+        .vectors
+        .iter()
+        .map(|vector| vector.name.as_str())
+        .collect::<HashSet<_>>();
+
     for document in documents {
-        if !document.fields.is_empty() {
-            return Err(
-                "daemon Lance collections created through this API do not support scalar fields yet"
-                    .to_string(),
-            );
-        }
         if !document.sparse_vectors.is_empty() {
             return Err(
                 "daemon Lance collections created through this API do not support sparse vectors yet"
                     .to_string(),
             );
         }
-        if document.vectors.keys().any(|name| name != "vector") {
-            return Err(
-                "daemon Lance collections created through this API support only the primary vector"
-                    .to_string(),
-            );
+        for field_name in document.fields.keys() {
+            if !scalar_fields.contains(field_name.as_str()) {
+                return Err(format!(
+                    "document scalar field '{}' is not defined in Lance schema",
+                    field_name
+                ));
+            }
+        }
+        for vector_name in document.vectors.keys() {
+            if !vector_fields.contains(vector_name.as_str()) {
+                return Err(format!(
+                    "document vector '{}' is not defined in Lance schema",
+                    vector_name
+                ));
+            }
         }
     }
     Ok(())

@@ -640,6 +640,112 @@ async fn lance_storage_admin_routes_list_get_and_drop_collection() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_create_accepts_schema_fields_and_vectors() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "name":"docs",
+                        "dimension":2,
+                        "metric":"l2",
+                        "storage":"lance",
+                        "schema":{
+                            "primary_vector":"vector",
+                            "fields":[{"name":"title","data_type":"String"}],
+                            "vectors":[
+                                {"name":"vector","data_type":"VectorFp32","dimension":2},
+                                {"name":"title_vec","data_type":"VectorFp32","dimension":2}
+                            ]
+                        }
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42","84"],
+                        "vectors":[[0.0,0.0],[50.0,50.0]],
+                        "fields":[{"title":"alpha"},{"title":"beta"}],
+                        "named_vectors":[
+                            {"title_vec":[10.0,10.0]},
+                            {"title_vec":[10.0,10.0]}
+                        ]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let fetch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42"],"output_fields":["title"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(
+        json["documents"][0]["fields"],
+        serde_json::json!({"title":"alpha"})
+    );
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":2,"queries":[{"field_name":"title_vec","vector":[10.0,10.0]}],"output_fields":["title"]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send typed search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    assert_eq!(json["hits"][0]["id"], "42");
+    assert_eq!(
+        json["hits"][0]["fields"],
+        serde_json::json!({"title":"alpha"})
+    );
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_stats_route_returns_lance_collection_info() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
