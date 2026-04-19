@@ -22,7 +22,7 @@ use lance::Dataset;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
-use crate::query::{distance_by_metric, SearchHit};
+use crate::query::{distance_by_metric, FilterExpr, SearchHit};
 use crate::storage::lance_schema::{arrow_schema_for_lance, collection_schema_from_lance_arrow};
 
 pub struct LanceCollection {
@@ -129,6 +129,18 @@ impl LanceCollection {
     ) -> io::Result<Vec<SearchHit>> {
         self.store
             .search_vector_field(field_name, query, top_k, metric)
+            .await
+    }
+
+    pub async fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.store
+            .search_filtered(query, top_k, metric, filter)
             .await
     }
 }
@@ -358,8 +370,24 @@ impl LanceDatasetStore {
         top_k: usize,
         metric: &str,
     ) -> io::Result<Vec<SearchHit>> {
-        self.search_vector_field(self.schema.primary_vector_name(), query, top_k, metric)
-            .await
+        self.search_filtered(query, top_k, metric, None).await
+    }
+
+    pub async fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.search_vector_field_filtered(
+            self.schema.primary_vector_name(),
+            query,
+            top_k,
+            metric,
+            filter,
+        )
+        .await
     }
 
     pub async fn search_vector_field(
@@ -368,6 +396,18 @@ impl LanceDatasetStore {
         query: &[f32],
         top_k: usize,
         metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.search_vector_field_filtered(field_name, query, top_k, metric, None)
+            .await
+    }
+
+    async fn search_vector_field_filtered(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
     ) -> io::Result<Vec<SearchHit>> {
         let vector_schema = self
             .schema
@@ -392,7 +432,7 @@ impl LanceDatasetStore {
         }
 
         #[cfg(feature = "hanns-backend")]
-        if field_name == self.schema.primary_vector_name() {
+        if field_name == self.schema.primary_vector_name() && filter.is_none() {
             if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
                 return Ok(hits);
             }
@@ -400,6 +440,9 @@ impl LanceDatasetStore {
 
         let mut hits = Vec::new();
         for document in self.read_all_documents().await? {
+            if filter.is_some_and(|filter| !filter.matches(&document.fields)) {
+                continue;
+            }
             let vector = document.vectors.get(field_name).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,

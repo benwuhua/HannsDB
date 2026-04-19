@@ -206,22 +206,18 @@ async fn search_records_legacy(
 
     #[cfg(feature = "lance-storage")]
     if super::routes::lance_collection_exists(state, collection) {
-        if request
+        let filter = request
             .filter
             .as_deref()
             .map(str::trim)
-            .is_some_and(|filter| !filter.is_empty())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Lance daemon legacy search does not support filters yet",
-            ));
-        }
+            .filter(|filter| !filter.is_empty())
+            .map(hannsdb_core::query::parse_filter)
+            .transpose()?;
         let lance = super::routes::open_lance_collection(state, collection).await?;
         let metric =
             super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
         let hits = lance
-            .search(&request.vector, request.top_k, &metric)
+            .search_filtered(&request.vector, request.top_k, &metric, filter.as_ref())
             .await?;
         let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
         let scores = hits
