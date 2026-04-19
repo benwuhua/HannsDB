@@ -700,6 +700,65 @@ async fn lance_storage_stats_route_returns_lance_collection_info() {
     assert!(json.get("index_completeness").is_none());
 }
 
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+#[tokio::test]
+async fn lance_storage_admin_optimize_builds_hanns_sidecar() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let optimize = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/admin/optimize")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send optimize request");
+    assert_eq!(optimize.status(), StatusCode::OK);
+    assert!(tempdir
+        .path()
+        .join("collections")
+        .join("docs.lance")
+        .join("_hannsdb")
+        .join("ann")
+        .join("vector.hanns")
+        .exists());
+}
+
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
 async fn lance_storage_legacy_search_uses_daemon_metric_metadata() {

@@ -663,9 +663,40 @@ async fn optimize_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+    if lance_collection_exists(&state, &collection) {
+        let result = match open_lance_collection(&state, &collection).await {
+            Ok(lance) => {
+                let field_name = lance.schema().primary_vector_name().to_string();
+                let metric = lance_collection_metric(&state, &collection, lance.schema().metric());
+                match metric {
+                    Ok(metric) => lance.optimize_hanns(&field_name, &metric).await,
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        return optimize_collection_response(result, collection);
+    }
+
+    #[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+    if lance_collection_exists(&state, &collection) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Lance optimize requires the hanns-backend feature".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     let db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.optimize_collection(&collection);
 
+    optimize_collection_response(result, collection)
+}
+
+fn optimize_collection_response(result: io::Result<()>, collection: String) -> Response {
     match result {
         Ok(()) => (
             StatusCode::OK,
