@@ -640,6 +640,69 @@ async fn lance_storage_admin_routes_list_get_and_drop_collection() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_admin_segments_returns_logical_lance_segment() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let segments = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/admin/segments")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send segments request");
+    assert_eq!(segments.status(), StatusCode::OK);
+    let body = to_bytes(segments.into_body(), usize::MAX)
+        .await
+        .expect("read segments body");
+    let json: Value = serde_json::from_slice(&body).expect("parse segments json");
+    assert_eq!(
+        json["segments"].as_array().expect("segments array").len(),
+        1
+    );
+    assert_eq!(json["segments"][0]["id"], "lance");
+    assert_eq!(json["segments"][0]["live"], 2);
+    assert_eq!(json["segments"][0]["dead"], 0);
+    assert_eq!(json["segments"][0]["ann_ready"], false);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_create_accepts_schema_fields_and_vectors() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

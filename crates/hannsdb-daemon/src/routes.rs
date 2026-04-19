@@ -795,28 +795,62 @@ async fn get_collection_segments(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_segments(&state, &collection).await;
+        return collection_segments_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .list_collection_segments(&collection);
 
+    collection_segments_response(result.map(|segments| {
+        segments
+            .into_iter()
+            .map(|segment| crate::api::SegmentInfoResponse {
+                id: segment.id,
+                live: segment.live_count,
+                dead: segment.dead_count,
+                ann_ready: segment.ann_ready,
+            })
+            .collect()
+    }))
+}
+
+#[cfg(feature = "lance-storage")]
+async fn lance_collection_segments(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<Vec<crate::api::SegmentInfoResponse>> {
+    let lance = open_lance_collection(state, collection).await?;
+    let live = lance.count_rows().await?;
+    Ok(vec![crate::api::SegmentInfoResponse {
+        id: "lance".to_string(),
+        live,
+        dead: 0,
+        ann_ready: lance_primary_ann_ready(&lance),
+    }])
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+fn lance_primary_ann_ready(lance: &LanceCollection) -> bool {
+    let field_name = lance.schema().primary_vector_name();
+    lance.hanns_index_path(field_name).exists()
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+fn lance_primary_ann_ready(_lance: &LanceCollection) -> bool {
+    false
+}
+
+fn collection_segments_response(
+    result: io::Result<Vec<crate::api::SegmentInfoResponse>>,
+) -> Response {
     match result {
-        Ok(segments) => (
-            StatusCode::OK,
-            Json(SegmentsResponse {
-                segments: segments
-                    .into_iter()
-                    .map(|segment| crate::api::SegmentInfoResponse {
-                        id: segment.id,
-                        live: segment.live_count,
-                        dead: segment.dead_count,
-                        ann_ready: segment.ann_ready,
-                    })
-                    .collect(),
-            }),
-        )
-            .into_response(),
+        Ok(segments) => (StatusCode::OK, Json(SegmentsResponse { segments })).into_response(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
