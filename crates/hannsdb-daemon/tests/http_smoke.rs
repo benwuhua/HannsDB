@@ -1034,6 +1034,68 @@ async fn lance_storage_typed_search_groups_by_scalar_field() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_typed_search_orders_by_scalar_field() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("rank", FieldType::Int64)],
+        vectors: vec![VectorFieldSchema::new("vector", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::new(
+                42,
+                [("rank".to_string(), FieldValue::Int64(3))],
+                vec![0.0, 0.0],
+            ),
+            Document::new(
+                43,
+                [("rank".to_string(), FieldValue::Int64(2))],
+                vec![0.1, 0.0],
+            ),
+            Document::new(
+                84,
+                [("rank".to_string(), FieldValue::Int64(1))],
+                vec![10.0, 10.0],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":2,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"order_by":{"field_name":"rank"}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send ordered typed search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    let hit_ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("hit id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec!["84", "43"]);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_typed_search_query_by_id_routes_to_lance() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

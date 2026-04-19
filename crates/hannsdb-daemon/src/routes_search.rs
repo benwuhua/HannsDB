@@ -1,3 +1,5 @@
+#[cfg(feature = "lance-storage")]
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 #[cfg(feature = "lance-storage")]
 use std::collections::HashMap;
@@ -379,10 +381,10 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    if request.reranker.is_some() || request.order_by.is_some() {
+    if request.reranker.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search does not support reranker or order_by yet",
+            "Lance daemon typed search does not support reranker yet",
         ));
     }
 
@@ -399,7 +401,7 @@ async fn search_records_typed_lance(
     let metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
     let query = lance_typed_query_vector(&lance, &request).await?;
-    let raw_top_k = if request.group_by.is_some() {
+    let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
         lance.count_rows().await?
     } else {
         request.top_k
@@ -419,7 +421,7 @@ async fn search_records_typed_lance(
         .map(|hit| (hit.id, hit.distance))
         .collect::<BTreeMap<_, _>>();
     let docs = lance.fetch_documents(&ids).await?;
-    let scored_documents = docs
+    let mut scored_documents = docs
         .into_iter()
         .map(|document| LanceScoredDocument {
             distance: scores.get(&document.id).copied().unwrap_or_default(),
@@ -427,12 +429,20 @@ async fn search_records_typed_lance(
             group_key: None,
         })
         .collect::<Vec<_>>();
-    let scored_documents = apply_lance_group_by(
+    apply_lance_order_by(
+        &mut scored_documents,
+        lance.schema(),
+        request.order_by.as_ref(),
+    )?;
+    let mut scored_documents = apply_lance_group_by(
         scored_documents,
         lance.schema(),
         request.group_by.as_ref(),
         request.top_k,
     )?;
+    if request.group_by.is_none() && scored_documents.len() > request.top_k {
+        scored_documents.truncate(request.top_k);
+    }
 
     Ok(scored_documents
         .into_iter()
@@ -464,6 +474,121 @@ struct LanceScoredDocument {
     document: hannsdb_core::document::Document,
     distance: f32,
     group_key: Option<hannsdb_core::document::FieldValue>,
+}
+
+#[cfg(feature = "lance-storage")]
+fn apply_lance_order_by(
+    documents: &mut [LanceScoredDocument],
+    schema: &hannsdb_core::document::CollectionSchema,
+    order_by: Option<&crate::api::TypedQueryOrderByRequest>,
+) -> io::Result<()> {
+    let Some(order_by) = order_by else {
+        return Ok(());
+    };
+    let field_name = order_by.field_name.trim();
+    if field_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "order_by field name must not be empty",
+        ));
+    }
+    if schema
+        .vectors
+        .iter()
+        .any(|vector| vector.name == field_name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "order_by field '{field_name}' must reference a scalar field, not a vector field"
+            ),
+        ));
+    }
+    if schema
+        .fields
+        .iter()
+        .any(|field| field.name == field_name && field.array)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("order_by field '{field_name}' must reference a scalar field, not an array"),
+        ));
+    }
+
+    documents.sort_by(|left, right| {
+        let left_value = left.document.fields.get(field_name);
+        let right_value = right.document.fields.get(field_name);
+        let ordering = match (left_value, right_value) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(left), Some(right)) => compare_lance_field_value_for_sort(left, right),
+        };
+        if order_by.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+        .then_with(|| compare_lance_scored_documents(left, right))
+    });
+    Ok(())
+}
+
+#[cfg(feature = "lance-storage")]
+fn compare_lance_scored_documents(
+    left: &LanceScoredDocument,
+    right: &LanceScoredDocument,
+) -> Ordering {
+    left.distance
+        .total_cmp(&right.distance)
+        .then_with(|| left.document.id.cmp(&right.document.id))
+}
+
+#[cfg(feature = "lance-storage")]
+fn compare_lance_field_value_for_sort(
+    left: &hannsdb_core::document::FieldValue,
+    right: &hannsdb_core::document::FieldValue,
+) -> Ordering {
+    use hannsdb_core::document::FieldValue;
+
+    match (left, right) {
+        (FieldValue::String(left), FieldValue::String(right)) => left.cmp(right),
+        (FieldValue::Null, FieldValue::Null) => Ordering::Equal,
+        (FieldValue::Null, _) => Ordering::Less,
+        (_, FieldValue::Null) => Ordering::Greater,
+        (FieldValue::Int64(left), FieldValue::Int64(right)) => left.cmp(right),
+        (FieldValue::Int32(left), FieldValue::Int32(right)) => left.cmp(right),
+        (FieldValue::UInt32(left), FieldValue::UInt32(right)) => left.cmp(right),
+        (FieldValue::UInt64(left), FieldValue::UInt64(right)) => left.cmp(right),
+        (FieldValue::Float(left), FieldValue::Float(right)) => left.total_cmp(right),
+        (FieldValue::Float64(left), FieldValue::Float64(right)) => left.total_cmp(right),
+        (FieldValue::Bool(left), FieldValue::Bool(right)) => left.cmp(right),
+        (FieldValue::Int64(left), FieldValue::Float64(right)) => (*left as f64).total_cmp(right),
+        (FieldValue::Float64(left), FieldValue::Int64(right)) => left.total_cmp(&(*right as f64)),
+        (FieldValue::Int32(left), FieldValue::Float64(right)) => (*left as f64).total_cmp(right),
+        (FieldValue::Float64(left), FieldValue::Int32(right)) => left.total_cmp(&(*right as f64)),
+        (FieldValue::UInt64(left), FieldValue::Float64(right)) => (*left as f64).total_cmp(right),
+        (FieldValue::Float64(left), FieldValue::UInt64(right)) => left.total_cmp(&(*right as f64)),
+        (FieldValue::Int64(left), FieldValue::Int32(right)) => left.cmp(&(*right as i64)),
+        (FieldValue::Int32(left), FieldValue::Int64(right)) => (*left as i64).cmp(right),
+        (FieldValue::Int64(left), FieldValue::UInt32(right)) => left.cmp(&(*right as i64)),
+        (FieldValue::UInt32(left), FieldValue::Int64(right)) => (*left as i64).cmp(right),
+        (FieldValue::Int64(left), FieldValue::UInt64(right)) => {
+            if *left < 0 {
+                Ordering::Less
+            } else {
+                (*left as u64).cmp(right)
+            }
+        }
+        (FieldValue::UInt64(left), FieldValue::Int64(right)) => {
+            if *right < 0 {
+                Ordering::Greater
+            } else {
+                left.cmp(&(*right as u64))
+            }
+        }
+        _ => format!("{left:?}").cmp(&format!("{right:?}")),
+    }
 }
 
 #[cfg(feature = "lance-storage")]
