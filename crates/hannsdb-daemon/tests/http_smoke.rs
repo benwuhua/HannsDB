@@ -703,6 +703,49 @@ async fn lance_storage_admin_segments_returns_logical_lance_segment() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_admin_compact_returns_unsupported() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let compact = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/admin/compact")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send compact request");
+    assert_eq!(compact.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(compact.into_body(), usize::MAX)
+        .await
+        .expect("read compact body");
+    let json: Value = serde_json::from_slice(&body).expect("parse compact json");
+    assert!(json["error"]
+        .as_str()
+        .expect("error")
+        .contains("Lance compact"));
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_create_accepts_schema_fields_and_vectors() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

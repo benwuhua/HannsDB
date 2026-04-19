@@ -695,6 +695,17 @@ async fn compact_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Lance compact is not supported by this daemon route yet".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     let mut db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.compact_collection(&collection);
 
