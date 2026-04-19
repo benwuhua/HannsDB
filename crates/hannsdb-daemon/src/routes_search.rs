@@ -377,21 +377,20 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    if request
-        .filter
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|filter| !filter.is_empty())
-        || request.group_by.is_some()
-        || request.reranker.is_some()
-        || request.order_by.is_some()
-    {
+    if request.group_by.is_some() || request.reranker.is_some() || request.order_by.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Lance daemon typed search supports only a single dense vector query or query_by_id",
         ));
     }
 
+    let filter = request
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+        .map(hannsdb_core::query::parse_filter)
+        .transpose()?;
     let output_fields = request.output_fields.as_deref();
     let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
     let lance = super::routes::open_lance_collection(state, collection).await?;
@@ -399,7 +398,13 @@ async fn search_records_typed_lance(
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
     let query = lance_typed_query_vector(&lance, &request).await?;
     let hits = lance
-        .search_vector_field(&query.field_name, &query.vector, request.top_k, &metric)
+        .search_vector_field_filtered(
+            &query.field_name,
+            &query.vector,
+            request.top_k,
+            &metric,
+            filter.as_ref(),
+        )
         .await?;
     let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     let scores = hits

@@ -132,6 +132,19 @@ impl LanceCollection {
             .await
     }
 
+    pub async fn search_vector_field_filtered(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.store
+            .search_vector_field_filtered(field_name, query, top_k, metric, filter)
+            .await
+    }
+
     pub async fn search_filtered(
         &self,
         query: &[f32],
@@ -401,7 +414,7 @@ impl LanceDatasetStore {
             .await
     }
 
-    async fn search_vector_field_filtered(
+    pub async fn search_vector_field_filtered(
         &self,
         field_name: &str,
         query: &[f32],
