@@ -1199,6 +1199,11 @@ async fn add_column_to_collection(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<AddColumnRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_schema_mutation_unsupported_response();
+    }
+
     let data_type = match parse_daemon_field_type(&request.data_type) {
         Ok(dt) => dt,
         Err(error) => {
@@ -1250,6 +1255,11 @@ async fn drop_column_from_collection(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_schema_mutation_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1286,6 +1296,11 @@ async fn alter_column_in_collection(
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
     Json(request): Json<AlterColumnRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_schema_mutation_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1330,6 +1345,11 @@ async fn add_vector_field_to_collection(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<AddVectorFieldRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_schema_mutation_unsupported_response();
+    }
+
     let data_type = match parse_daemon_vector_field_type(&request.data_type) {
         Ok(dt) => dt,
         Err(error) => {
@@ -1399,6 +1419,11 @@ async fn drop_vector_field_from_collection(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_schema_mutation_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1435,6 +1460,17 @@ async fn drop_vector_field_from_collection(
         )
             .into_response(),
     }
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_schema_mutation_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Lance schema mutation is not supported by this daemon route yet".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
