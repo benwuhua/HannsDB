@@ -746,6 +746,83 @@ async fn lance_storage_admin_compact_returns_unsupported() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_index_ddl_returns_unsupported() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    for request in [
+        Request::builder()
+            .method("POST")
+            .uri("/collections/docs/indexes/vector")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"field_name":"vector","kind":"hnsw","metric":"l2","params":{}}"#,
+            ))
+            .expect("build request"),
+        Request::builder()
+            .method("GET")
+            .uri("/collections/docs/indexes/vector")
+            .body(Body::empty())
+            .expect("build request"),
+        Request::builder()
+            .method("DELETE")
+            .uri("/collections/docs/indexes/vector/vector")
+            .body(Body::empty())
+            .expect("build request"),
+        Request::builder()
+            .method("POST")
+            .uri("/collections/docs/indexes/scalar")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"field_name":"title","kind":"inverted","params":{}}"#,
+            ))
+            .expect("build request"),
+        Request::builder()
+            .method("GET")
+            .uri("/collections/docs/indexes/scalar")
+            .body(Body::empty())
+            .expect("build request"),
+        Request::builder()
+            .method("DELETE")
+            .uri("/collections/docs/indexes/scalar/title")
+            .body(Body::empty())
+            .expect("build request"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("send index ddl request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read index ddl body");
+        let json: Value = serde_json::from_slice(&body).expect("parse index ddl json");
+        assert!(json["error"]
+            .as_str()
+            .expect("error")
+            .contains("Lance index DDL"));
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_create_accepts_schema_fields_and_vectors() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");

@@ -884,6 +884,11 @@ async fn create_vector_index(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<VectorIndexRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let VectorIndexRequest {
         field_name,
         kind,
@@ -948,6 +953,11 @@ async fn list_vector_indexes(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -986,6 +996,11 @@ async fn drop_vector_index(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1022,6 +1037,11 @@ async fn create_scalar_index(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<ScalarIndexRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let ScalarIndexRequest {
         field_name,
         kind,
@@ -1084,6 +1104,11 @@ async fn list_scalar_indexes(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1122,6 +1147,11 @@ async fn drop_scalar_index(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_index_ddl_unsupported_response();
+    }
+
     let result = state
         .db
         .lock()
@@ -1151,6 +1181,17 @@ async fn drop_scalar_index(
         )
             .into_response(),
     }
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_index_ddl_unsupported_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Lance index DDL is not supported by this daemon route yet".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn add_column_to_collection(
