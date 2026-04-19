@@ -181,11 +181,30 @@ async fn create_collection(
             .into_response();
     }
 
+    let Some(dimension) = request.dimension else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "dimension is required for native collection create".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let Some(metric) = request.metric.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "metric is required for native collection create".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
-        .create_collection(&request.name, request.dimension, &request.metric);
+        .create_collection(&request.name, dimension, metric);
 
     match result {
         Ok(()) => (
@@ -240,16 +259,40 @@ async fn create_lance_collection(state: DaemonState, request: CreateCollectionRe
     let metric = request
         .schema
         .as_ref()
-        .map(|schema| schema.metric().to_string())
-        .unwrap_or_else(|| request.metric.clone());
-    let schema = request.schema.unwrap_or_else(|| {
-        CollectionSchema::new(
-            "vector",
-            request.dimension,
-            request.metric.clone(),
-            Vec::<ScalarFieldSchema>::new(),
-        )
-    });
+        .map(|schema| schema.metric().to_string());
+    let metric = match (metric, request.metric.as_deref()) {
+        (Some(metric), _) => metric,
+        (None, Some(metric)) => metric.to_string(),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "metric is required for Lance create without schema".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let schema = match request.schema {
+        Some(schema) => schema,
+        None => {
+            let Some(dimension) = request.dimension else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "dimension is required for Lance create without schema".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            CollectionSchema::new(
+                "vector",
+                dimension,
+                metric.clone(),
+                Vec::<ScalarFieldSchema>::new(),
+            )
+        }
+    };
     match LanceCollection::create(&state.root, request.name.clone(), schema, &[]).await {
         Ok(_) => match write_lance_daemon_metadata(&state, &request.name, &metric) {
             Ok(()) => (

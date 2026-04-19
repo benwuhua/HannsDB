@@ -8,8 +8,10 @@ use hannsdb_core::CollectionSchema;
 #[derive(Debug, Deserialize)]
 pub struct CreateCollectionRequest {
     pub name: String,
-    pub dimension: usize,
-    pub metric: String,
+    #[serde(default)]
+    pub dimension: Option<usize>,
+    #[serde(default)]
+    pub metric: Option<String>,
     #[serde(default)]
     pub storage: Option<String>,
     #[serde(default)]

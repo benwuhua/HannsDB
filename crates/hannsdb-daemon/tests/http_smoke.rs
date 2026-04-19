@@ -746,6 +746,67 @@ async fn lance_storage_create_accepts_schema_fields_and_vectors() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_create_accepts_schema_without_legacy_dimension_metric() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "name":"docs",
+                        "storage":"lance",
+                        "schema":{
+                            "primary_vector":"dense",
+                            "fields":[],
+                            "vectors":[
+                                {
+                                    "name":"dense",
+                                    "data_type":"VectorFp32",
+                                    "dimension":3,
+                                    "index_param":{
+                                        "kind":"hnsw",
+                                        "metric":"cosine",
+                                        "m":16,
+                                        "ef_construction":128
+                                    }
+                                }
+                            ]
+                        }
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let info = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send info request");
+    assert_eq!(info.status(), StatusCode::OK);
+    let body = to_bytes(info.into_body(), usize::MAX)
+        .await
+        .expect("read info body");
+    let json: Value = serde_json::from_slice(&body).expect("parse info json");
+    assert_eq!(json["dimension"], 3);
+    assert_eq!(json["metric"], "cosine");
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_stats_route_returns_lance_collection_info() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
