@@ -99,6 +99,10 @@ impl LanceCollection {
         self.store.delete(ids).await
     }
 
+    pub async fn delete_by_filter(&self, filter: &FilterExpr) -> io::Result<usize> {
+        self.store.delete_by_filter(filter).await
+    }
+
     pub async fn upsert_documents(&self, documents: &[Document]) -> io::Result<usize> {
         self.store.upsert(documents).await
     }
@@ -315,6 +319,17 @@ impl LanceDatasetStore {
                 format!("delete count exceeds usize: {}", result.num_deleted_rows),
             )
         })
+    }
+
+    pub async fn delete_by_filter(&self, filter: &FilterExpr) -> io::Result<usize> {
+        let ids = self
+            .read_all_documents()
+            .await?
+            .into_iter()
+            .filter(|document| filter.matches(&document.fields))
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        self.delete(&ids).await
     }
 
     pub async fn upsert(&self, documents: &[Document]) -> io::Result<usize> {

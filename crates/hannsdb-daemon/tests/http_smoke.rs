@@ -1492,6 +1492,80 @@ async fn lance_storage_concurrent_insert_rejects_duplicate_ids() {
     assert_eq!(json["documents"].as_array().expect("documents").len(), 1);
 }
 
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_delete_by_filter_deletes_matching_rows() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+        vectors: vec![VectorFieldSchema::new("vector", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::new(
+                42,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0, 0.0],
+            ),
+            Document::new(
+                43,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.1, 0.0],
+            ),
+            Document::new(
+                84,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![1.0, 1.0],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/delete_by_filter")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"filter":"group == 1"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send delete-by-filter request");
+    assert_eq!(delete.status(), StatusCode::OK);
+    let body = to_bytes(delete.into_body(), usize::MAX)
+        .await
+        .expect("read delete body");
+    let json: Value = serde_json::from_slice(&body).expect("parse delete json");
+    assert_eq!(json["deleted"], 2);
+
+    let fetch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ids":["42","43","84"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"].as_array().expect("documents").len(), 1);
+    assert_eq!(json["documents"][0]["id"], "84");
+}
+
 #[tokio::test]
 async fn delete_by_filter_route_deletes_matching_rows() {
     let tempdir = tempfile::tempdir().expect("create tempdir");

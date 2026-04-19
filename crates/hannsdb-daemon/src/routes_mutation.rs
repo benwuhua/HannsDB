@@ -386,9 +386,32 @@ pub(crate) async fn delete_records_by_filter(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match hannsdb_core::query::parse_filter(&request.filter) {
+            Ok(filter) => match super::routes::open_lance_collection(&state, &collection).await {
+                Ok(collection) => collection.delete_by_filter(&filter).await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        return delete_by_filter_response(result, None);
+    }
+
     let mut db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.delete_by_filter(&collection, &request.filter);
+    let collection_missing = db
+        .list_collections()
+        .map(|collections| !collections.iter().any(|name| name == &collection))
+        .unwrap_or(false);
 
+    delete_by_filter_response(result, collection_missing.then_some(collection))
+}
+
+fn delete_by_filter_response(
+    result: io::Result<usize>,
+    missing_collection: Option<String>,
+) -> Response {
     match result {
         Ok(deleted) => (
             StatusCode::OK,
@@ -397,30 +420,22 @@ pub(crate) async fn delete_records_by_filter(
             }),
         )
             .into_response(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let collection_missing = db
-                .list_collections()
-                .map(|collections| !collections.iter().any(|name| name == &collection))
-                .unwrap_or(false);
-
-            if collection_missing {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("collection not found: {collection}"),
-                    }),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: error.to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match missing_collection {
+            Some(collection) => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("collection not found: {collection}"),
+                }),
+            )
+                .into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        },
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
