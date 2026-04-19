@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "lance-storage")]
+use std::collections::HashMap;
 use std::io;
 
 use axum::extract::{rejection::JsonRejection, Path as AxumPath, State};
@@ -377,10 +379,10 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    if request.group_by.is_some() || request.reranker.is_some() || request.order_by.is_some() {
+    if request.reranker.is_some() || request.order_by.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only a single dense vector query or query_by_id",
+            "Lance daemon typed search does not support reranker or order_by yet",
         ));
     }
 
@@ -397,11 +399,16 @@ async fn search_records_typed_lance(
     let metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
     let query = lance_typed_query_vector(&lance, &request).await?;
+    let raw_top_k = if request.group_by.is_some() {
+        lance.count_rows().await?
+    } else {
+        request.top_k
+    };
     let hits = lance
         .search_vector_field_filtered(
             &query.field_name,
             &query.vector,
-            request.top_k,
+            raw_top_k,
             &metric,
             filter.as_ref(),
         )
@@ -412,18 +419,34 @@ async fn search_records_typed_lance(
         .map(|hit| (hit.id, hit.distance))
         .collect::<BTreeMap<_, _>>();
     let docs = lance.fetch_documents(&ids).await?;
-    Ok(docs
+    let scored_documents = docs
+        .into_iter()
+        .map(|document| LanceScoredDocument {
+            distance: scores.get(&document.id).copied().unwrap_or_default(),
+            document,
+            group_key: None,
+        })
+        .collect::<Vec<_>>();
+    let scored_documents = apply_lance_group_by(
+        scored_documents,
+        lance.schema(),
+        request.group_by.as_ref(),
+        request.top_k,
+    )?;
+
+    Ok(scored_documents
         .into_iter()
         .map(|document| SearchHitResponse {
-            id: document.id.to_string(),
-            distance: scores.get(&document.id).copied().unwrap_or_default(),
+            id: document.document.id.to_string(),
+            distance: document.distance,
             fields: if include_fields {
-                select_output_fields(&document.fields, output_fields)
+                select_output_fields(&document.document.fields, output_fields)
             } else {
                 BTreeMap::new()
             },
             vector: if request.include_vector {
                 document
+                    .document
                     .vectors
                     .get(lance.schema().primary_vector_name())
                     .cloned()
@@ -431,9 +454,135 @@ async fn search_records_typed_lance(
                 None
             },
             sparse_vectors: None,
-            group_key: None,
+            group_key: document.group_key.map(super::routes::field_value_to_json),
         })
         .collect())
+}
+
+#[cfg(feature = "lance-storage")]
+struct LanceScoredDocument {
+    document: hannsdb_core::document::Document,
+    distance: f32,
+    group_key: Option<hannsdb_core::document::FieldValue>,
+}
+
+#[cfg(feature = "lance-storage")]
+fn apply_lance_group_by(
+    documents: Vec<LanceScoredDocument>,
+    schema: &hannsdb_core::document::CollectionSchema,
+    group_by: Option<&crate::api::TypedQueryGroupByRequest>,
+    top_k: usize,
+) -> io::Result<Vec<LanceScoredDocument>> {
+    let Some(group_by) = group_by else {
+        return Ok(documents);
+    };
+    let field_name = group_by.field_name.trim();
+    if field_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "group_by field name must not be empty",
+        ));
+    }
+    let group_field = schema
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("group_by field '{field_name}' is not defined"),
+            )
+        })?;
+    if group_field.array {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("group_by field '{field_name}' must reference a scalar field, not an array"),
+        ));
+    }
+
+    let per_group_limit = group_by.group_topk.unwrap_or(0).max(1);
+    let group_count = group_by.group_count.unwrap_or(0);
+    let mut per_group_count = HashMap::<LanceGroupByValueKey, usize>::new();
+    let mut groups_seen = 0usize;
+    let mut grouped = Vec::new();
+
+    for mut document in documents {
+        let group_key = document.document.fields.get(field_name).cloned();
+        let group_key_lookup = group_key
+            .as_ref()
+            .map(LanceGroupByValueKey::from_field_value)
+            .unwrap_or(LanceGroupByValueKey::Missing);
+        let count = per_group_count.entry(group_key_lookup).or_insert(0);
+        if *count == 0 {
+            if group_count > 0 && groups_seen >= group_count {
+                continue;
+            }
+            groups_seen += 1;
+        }
+        if *count >= per_group_limit {
+            continue;
+        }
+        *count += 1;
+        document.group_key = group_key;
+        grouped.push(document);
+        if grouped.len() >= top_k {
+            break;
+        }
+    }
+    Ok(grouped)
+}
+
+#[cfg(feature = "lance-storage")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LanceGroupByValueKey {
+    Missing,
+    String(String),
+    Int64(i64),
+    Float64(LanceFloatGroupKey),
+    Bool(bool),
+}
+
+#[cfg(feature = "lance-storage")]
+impl LanceGroupByValueKey {
+    fn from_field_value(value: &hannsdb_core::document::FieldValue) -> Self {
+        match value {
+            hannsdb_core::document::FieldValue::Null => Self::Missing,
+            hannsdb_core::document::FieldValue::String(value) => Self::String(value.clone()),
+            hannsdb_core::document::FieldValue::Int64(value) => Self::Int64(*value),
+            hannsdb_core::document::FieldValue::Int32(value) => Self::Int64(*value as i64),
+            hannsdb_core::document::FieldValue::UInt32(value) => Self::Int64(*value as i64),
+            hannsdb_core::document::FieldValue::UInt64(value) => Self::Int64(*value as i64),
+            hannsdb_core::document::FieldValue::Float(value) => {
+                Self::Float64(LanceFloatGroupKey::new(*value as f64))
+            }
+            hannsdb_core::document::FieldValue::Float64(value) => {
+                Self::Float64(LanceFloatGroupKey::new(*value))
+            }
+            hannsdb_core::document::FieldValue::Bool(value) => Self::Bool(*value),
+            hannsdb_core::document::FieldValue::Array(_) => Self::Missing,
+        }
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LanceFloatGroupKey {
+    Nan,
+    Zero,
+    Exact(u64),
+}
+
+#[cfg(feature = "lance-storage")]
+impl LanceFloatGroupKey {
+    fn new(value: f64) -> Self {
+        if value.is_nan() {
+            Self::Nan
+        } else if value == 0.0 {
+            Self::Zero
+        } else {
+            Self::Exact(value.to_bits())
+        }
+    }
 }
 
 #[cfg(feature = "lance-storage")]

@@ -963,6 +963,77 @@ async fn lance_storage_typed_search_applies_filter() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_typed_search_groups_by_scalar_field() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+        vectors: vec![VectorFieldSchema::new("vector", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::new(
+                42,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.0, 0.0],
+            ),
+            Document::new(
+                43,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.01, 0.0],
+            ),
+            Document::new(
+                84,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.02, 0.0],
+            ),
+            Document::new(
+                85,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.03, 0.0],
+            ),
+            Document::new(
+                126,
+                [("group".to_string(), FieldValue::Int64(3))],
+                vec![0.04, 0.0],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":2,"queries":[{"field_name":"vector","vector":[0.0,0.0]}],"group_by":{"field_name":"group","group_topk":1,"group_count":2}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send grouped typed search request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read search body");
+    let json: Value = serde_json::from_slice(&body).expect("parse search json");
+    let hits = json["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["id"], "42");
+    assert_eq!(hits[0]["group_key"], serde_json::json!(1));
+    assert_eq!(hits[1]["id"], "84");
+    assert_eq!(hits[1]["group_key"], serde_json::json!(2));
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_typed_search_query_by_id_routes_to_lance() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
