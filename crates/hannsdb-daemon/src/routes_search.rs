@@ -529,13 +529,10 @@ async fn lance_typed_query_vector(
             "Lance daemon typed search requires exactly one query",
         ));
     };
-    if query.field_name != lance.schema().primary_vector_name()
-        || query.sparse_vector.is_some()
-        || query.param.is_some()
-    {
+    if query.sparse_vector.is_some() || query.param.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only the primary dense vector",
+            "Lance daemon typed search supports only dense vectors without query params",
         ));
     }
     let vector = query.vector.clone().ok_or_else(|| {
@@ -544,6 +541,28 @@ async fn lance_typed_query_vector(
             "Lance daemon typed search requires a dense vector",
         )
     })?;
+    let vector_schema = lance
+        .schema()
+        .vectors
+        .iter()
+        .find(|vector| vector.name == query.field_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("query vector field '{}' is not defined", query.field_name),
+            )
+        })?;
+    if vector.len() != vector_schema.dimension {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query vector dimension mismatch for field '{}': expected {}, got {}",
+                query.field_name,
+                vector_schema.dimension,
+                vector.len()
+            ),
+        ));
+    }
     Ok(LanceTypedQueryVector {
         field_name: query.field_name.clone(),
         vector,
