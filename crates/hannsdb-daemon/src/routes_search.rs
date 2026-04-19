@@ -381,12 +381,7 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    if request.reranker.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search does not support reranker yet",
-        ));
-    }
+    validate_lance_single_recall_reranker(request.reranker.as_ref())?;
 
     let filter = request
         .filter
@@ -467,6 +462,22 @@ async fn search_records_typed_lance(
             group_key: document.group_key.map(super::routes::field_value_to_json),
         })
         .collect())
+}
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_single_recall_reranker(
+    reranker: Option<&crate::api::TypedQueryRerankerRequest>,
+) -> io::Result<()> {
+    let Some(reranker) = reranker else {
+        return Ok(());
+    };
+    if !reranker.weights.is_empty() || reranker.metric.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search supports only RRF reranker on a single recall source",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "lance-storage")]
