@@ -697,6 +697,9 @@ async fn lance_storage_stats_route_returns_lance_collection_info() {
     assert_eq!(json["record_count"], 2);
     assert_eq!(json["deleted_count"], 0);
     assert_eq!(json["live_count"], 2);
+    #[cfg(feature = "hanns-backend")]
+    assert_eq!(json["index_completeness"]["vector"], serde_json::json!(0.0));
+    #[cfg(not(feature = "hanns-backend"))]
     assert!(json.get("index_completeness").is_none());
 }
 
@@ -738,7 +741,26 @@ async fn lance_storage_admin_optimize_builds_hanns_sidecar() {
         .expect("send insert request");
     assert_eq!(insert.status(), StatusCode::OK);
 
+    let info_before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send info request before optimize");
+    assert_eq!(info_before.status(), StatusCode::OK);
+    let body = to_bytes(info_before.into_body(), usize::MAX)
+        .await
+        .expect("read info before body");
+    let json: Value = serde_json::from_slice(&body).expect("parse info before json");
+    assert_eq!(json["index_completeness"]["vector"], serde_json::json!(0.0));
+
     let optimize = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -757,6 +779,23 @@ async fn lance_storage_admin_optimize_builds_hanns_sidecar() {
         .join("ann")
         .join("vector.hanns")
         .exists());
+
+    let info_after = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send info request after optimize");
+    assert_eq!(info_after.status(), StatusCode::OK);
+    let body = to_bytes(info_after.into_body(), usize::MAX)
+        .await
+        .expect("read info after body");
+    let json: Value = serde_json::from_slice(&body).expect("parse info after json");
+    assert_eq!(json["index_completeness"]["vector"], serde_json::json!(1.0));
 }
 
 #[cfg(feature = "lance-storage")]

@@ -525,6 +525,7 @@ async fn lance_collection_info(
     let lance = open_lance_collection(state, collection).await?;
     let live_count = lance.count_rows().await?;
     let metric = lance_collection_metric(state, collection, lance.schema().metric())?;
+    let index_completeness = lance_index_completeness(&lance, live_count);
     Ok(hannsdb_core::CollectionInfo {
         name: collection.to_string(),
         dimension: lance.schema().dimension(),
@@ -532,8 +533,26 @@ async fn lance_collection_info(
         record_count: live_count,
         deleted_count: 0,
         live_count,
-        index_completeness: BTreeMap::new(),
+        index_completeness,
     })
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+fn lance_index_completeness(lance: &LanceCollection, live_count: usize) -> BTreeMap<String, f64> {
+    let mut index_completeness = BTreeMap::new();
+    let field_name = lance.schema().primary_vector_name().to_string();
+    let completeness = if live_count == 0 || lance.hanns_index_path(&field_name).exists() {
+        1.0
+    } else {
+        0.0
+    };
+    index_completeness.insert(field_name, completeness);
+    index_completeness
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+fn lance_index_completeness(_lance: &LanceCollection, _live_count: usize) -> BTreeMap<String, f64> {
+    BTreeMap::new()
 }
 
 async fn get_collection_stats(
