@@ -384,7 +384,7 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    validate_lance_single_recall_reranker(request.reranker.as_ref())?;
+    validate_lance_rrf_reranker(request.reranker.as_ref())?;
 
     let filter = request
         .filter
@@ -398,59 +398,167 @@ async fn search_records_typed_lance(
     let lance = super::routes::open_lance_collection(state, collection).await?;
     let metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
-    let query = lance_typed_query_vector(&lance, &request).await?;
-    let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
-        lance.count_rows().await?
-    } else {
-        request.top_k
-    };
-    let projection = lance_search_projection(
-        lance.schema(),
-        output_fields,
-        request
-            .group_by
-            .as_ref()
-            .map(|group_by| group_by.field_name.as_str()),
-        request
-            .order_by
-            .as_ref()
-            .map(|order_by| order_by.field_name.as_str()),
-        if request.include_vector {
-            Some(lance.schema().primary_vector_name())
+    let mut scored_documents = if request.query_by_id.is_some() {
+        let query = lance_typed_query_vector(&lance, &request).await?;
+        let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
+            lance.count_rows().await?
         } else {
-            None
-        },
-    );
-    let result = lance
-        .search_vector_field_filtered_projected(
-            &query.field_name,
-            &query.vector,
-            raw_top_k,
-            &metric,
-            filter.as_ref(),
-            projection,
-        )
-        .await?;
-    let mut scored_documents = result
-        .documents
-        .into_iter()
-        .map(|document| LanceScoredDocument {
-            distance: document.distance,
-            document: document.document,
-            group_key: None,
-        })
-        .collect::<Vec<_>>();
-    apply_lance_order_by(
-        &mut scored_documents,
-        lance.schema(),
-        request.order_by.as_ref(),
-    )?;
-    let mut scored_documents = apply_lance_group_by(
-        scored_documents,
-        lance.schema(),
-        request.group_by.as_ref(),
-        request.top_k,
-    )?;
+            request.top_k
+        };
+        let projection = lance_search_projection(
+            lance.schema(),
+            output_fields,
+            request
+                .group_by
+                .as_ref()
+                .map(|group_by| group_by.field_name.as_str()),
+            request
+                .order_by
+                .as_ref()
+                .map(|order_by| order_by.field_name.as_str()),
+            if request.include_vector {
+                Some(lance.schema().primary_vector_name())
+            } else {
+                None
+            },
+        );
+        let result = lance
+            .search_vector_field_filtered_projected(
+                &query.field_name,
+                &query.vector,
+                raw_top_k,
+                &metric,
+                filter.as_ref(),
+                projection,
+            )
+            .await?;
+        let mut scored_documents = result
+            .documents
+            .into_iter()
+            .map(|document| LanceScoredDocument {
+                distance: document.distance,
+                document: document.document,
+                group_key: None,
+            })
+            .collect::<Vec<_>>();
+        apply_lance_order_by(
+            &mut scored_documents,
+            lance.schema(),
+            request.order_by.as_ref(),
+        )?;
+        apply_lance_group_by(
+            scored_documents,
+            lance.schema(),
+            request.group_by.as_ref(),
+            request.top_k,
+        )?
+    } else {
+        let queries = lance_typed_query_vectors(&lance, &request)?;
+        if queries.len() > 1 {
+            if request.group_by.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Lance daemon typed multi-query search does not support group_by yet",
+                ));
+            }
+            if request.order_by.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Lance daemon typed multi-query search does not support order_by yet",
+                ));
+            }
+            let projection = lance_search_projection(
+                lance.schema(),
+                output_fields,
+                None,
+                None,
+                if request.include_vector {
+                    Some(lance.schema().primary_vector_name())
+                } else {
+                    None
+                },
+            );
+            let mut recall_lists = Vec::with_capacity(queries.len());
+            for query in &queries {
+                let result = lance
+                    .search_vector_field_filtered_projected(
+                        &query.field_name,
+                        &query.vector,
+                        request.top_k,
+                        &metric,
+                        filter.as_ref(),
+                        projection.clone(),
+                    )
+                    .await?;
+                recall_lists.push(result.documents);
+            }
+            fuse_lance_rrf(
+                recall_lists,
+                request
+                    .reranker
+                    .as_ref()
+                    .and_then(|reranker| reranker.rank_constant)
+                    .unwrap_or(DEFAULT_LANCE_RRF_RANK_CONSTANT),
+                request.top_k,
+            )
+        } else {
+            let [query] = queries.as_slice() else {
+                unreachable!("lance_typed_query_vectors returns at least one query")
+            };
+            let projection = lance_search_projection(
+                lance.schema(),
+                output_fields,
+                request
+                    .group_by
+                    .as_ref()
+                    .map(|group_by| group_by.field_name.as_str()),
+                request
+                    .order_by
+                    .as_ref()
+                    .map(|order_by| order_by.field_name.as_str()),
+                if request.include_vector {
+                    Some(lance.schema().primary_vector_name())
+                } else {
+                    None
+                },
+            );
+            let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
+                lance.count_rows().await?
+            } else {
+                request.top_k
+            };
+            let result = lance
+                .search_vector_field_filtered_projected(
+                    &query.field_name,
+                    &query.vector,
+                    raw_top_k,
+                    &metric,
+                    filter.as_ref(),
+                    projection,
+                )
+                .await?;
+            let mut scored_documents = result
+                .documents
+                .into_iter()
+                .map(|document| LanceScoredDocument {
+                    distance: document.distance,
+                    document: document.document,
+                    group_key: None,
+                })
+                .collect::<Vec<_>>();
+            apply_lance_order_by(
+                &mut scored_documents,
+                lance.schema(),
+                request.order_by.as_ref(),
+            )?;
+            apply_lance_group_by(
+                scored_documents,
+                lance.schema(),
+                request.group_by.as_ref(),
+                request.top_k,
+            )?
+        }
+    };
     if request.group_by.is_none() && scored_documents.len() > request.top_k {
         scored_documents.truncate(request.top_k);
     }
@@ -511,7 +619,47 @@ fn lance_search_projection(
 }
 
 #[cfg(feature = "lance-storage")]
-fn validate_lance_single_recall_reranker(
+fn fuse_lance_rrf(
+    recall_lists: Vec<Vec<hannsdb_core::storage::lance_store::LanceSearchDocument>>,
+    rank_constant: u64,
+    top_k: usize,
+) -> Vec<LanceScoredDocument> {
+    let rank_constant = rank_constant as f32;
+    let mut by_id =
+        std::collections::BTreeMap::<i64, (f32, hannsdb_core::document::Document)>::new();
+    for recall_list in recall_lists {
+        for (rank, document) in recall_list.into_iter().enumerate() {
+            let contribution = 1.0 / (rank_constant + rank as f32 + 1.0);
+            let entry = by_id
+                .entry(document.document.id)
+                .or_insert_with(|| (0.0, document.document.clone()));
+            entry.0 += contribution;
+        }
+    }
+    let mut fused = by_id
+        .into_iter()
+        .map(|(_id, (score, document))| LanceScoredDocument {
+            document,
+            distance: -score,
+            group_key: None,
+        })
+        .collect::<Vec<_>>();
+    fused.sort_by(|left, right| {
+        left.distance
+            .total_cmp(&right.distance)
+            .then_with(|| left.document.id.cmp(&right.document.id))
+    });
+    if fused.len() > top_k {
+        fused.truncate(top_k);
+    }
+    fused
+}
+
+#[cfg(feature = "lance-storage")]
+const DEFAULT_LANCE_RRF_RANK_CONSTANT: u64 = 60;
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_rrf_reranker(
     reranker: Option<&crate::api::TypedQueryRerankerRequest>,
 ) -> io::Result<()> {
     let Some(reranker) = reranker else {
@@ -520,7 +668,7 @@ fn validate_lance_single_recall_reranker(
     if !reranker.weights.is_empty() || reranker.metric.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only RRF reranker on a single recall source",
+            "Lance daemon typed search supports only RRF reranker",
         ));
     }
     Ok(())
@@ -774,6 +922,75 @@ struct LanceTypedQueryVector {
 }
 
 #[cfg(feature = "lance-storage")]
+fn lance_typed_query_vectors(
+    lance: &hannsdb_core::storage::lance_store::LanceCollection,
+    request: &TypedSearchRequest,
+) -> io::Result<Vec<LanceTypedQueryVector>> {
+    if request.query_by_id_field_name.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query_by_id_field_name requires query_by_id",
+        ));
+    }
+    if request.queries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search requires at least one query",
+        ));
+    }
+    request
+        .queries
+        .iter()
+        .map(|query| lance_typed_query_from_request(lance, query))
+        .collect()
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_typed_query_from_request(
+    lance: &hannsdb_core::storage::lance_store::LanceCollection,
+    query: &crate::api::TypedVectorQueryRequest,
+) -> io::Result<LanceTypedQueryVector> {
+    if query.sparse_vector.is_some() || query.param.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Lance daemon typed search supports only dense vectors without query params",
+        ));
+    }
+    let vector = query.vector.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Lance daemon typed search requires a dense vector",
+        )
+    })?;
+    let vector_schema = lance
+        .schema()
+        .vectors
+        .iter()
+        .find(|vector| vector.name == query.field_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("query vector field '{}' is not defined", query.field_name),
+            )
+        })?;
+    if vector.len() != vector_schema.dimension {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query vector dimension mismatch for field '{}': expected {}, got {}",
+                query.field_name,
+                vector_schema.dimension,
+                vector.len()
+            ),
+        ));
+    }
+    Ok(LanceTypedQueryVector {
+        field_name: query.field_name.clone(),
+        vector,
+    })
+}
+
+#[cfg(feature = "lance-storage")]
 async fn lance_typed_query_vector(
     lance: &hannsdb_core::storage::lance_store::LanceCollection,
     request: &TypedSearchRequest,
@@ -860,42 +1077,5 @@ async fn lance_typed_query_vector(
             "Lance daemon typed search requires exactly one query",
         ));
     };
-    if query.sparse_vector.is_some() || query.param.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only dense vectors without query params",
-        ));
-    }
-    let vector = query.vector.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Lance daemon typed search requires a dense vector",
-        )
-    })?;
-    let vector_schema = lance
-        .schema()
-        .vectors
-        .iter()
-        .find(|vector| vector.name == query.field_name)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("query vector field '{}' is not defined", query.field_name),
-            )
-        })?;
-    if vector.len() != vector_schema.dimension {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "query vector dimension mismatch for field '{}': expected {}, got {}",
-                query.field_name,
-                vector_schema.dimension,
-                vector.len()
-            ),
-        ));
-    }
-    Ok(LanceTypedQueryVector {
-        field_name: query.field_name.clone(),
-        vector,
-    })
+    lance_typed_query_from_request(lance, query)
 }

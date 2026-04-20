@@ -1608,6 +1608,280 @@ async fn lance_storage_typed_search_routes_to_lance() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
+async fn lance_storage_typed_search_multi_query_defaults_to_rrf() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("title", FieldType::String)],
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            // id=1 is rank 2 in both recall lists; RRF should boost it to rank 1.
+            Document::with_vectors(
+                1,
+                [("title".to_string(), FieldValue::String("alpha".to_string()))],
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![0.1, 0.0])],
+            ),
+            // id=2 is rank 1 only for the first recall source.
+            Document::with_vectors(
+                2,
+                [("title".to_string(), FieldValue::String("beta".to_string()))],
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![10.0, 10.0])],
+            ),
+            // id=3 is rank 1 only for the second recall source.
+            Document::with_vectors(
+                3,
+                [("title".to_string(), FieldValue::String("gamma".to_string()))],
+                vec![10.0, 10.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+            // id=4 is rank 3 in both recall lists; it should beat single-source rank-1 docs.
+            Document::with_vectors(
+                4,
+                [("title".to_string(), FieldValue::String("delta".to_string()))],
+                vec![0.2, 0.0],
+                [("title_vec".to_string(), vec![0.2, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":3,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "output_fields":["title"]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multi query search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let hits = json["hits"].as_array().expect("hits array");
+    let ids = hits
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["1", "4", "2"]);
+    assert_ne!(
+        ids,
+        vec!["2", "1", "4"],
+        "must not be first-query passthrough"
+    );
+    assert_eq!(hits[0]["fields"], serde_json::json!({"title":"alpha"}));
+    let first_distance = hits[0]["distance"].as_f64().expect("distance");
+    let second_distance = hits[1]["distance"].as_f64().expect("distance");
+    let third_distance = hits[2]["distance"].as_f64().expect("distance");
+    assert!(first_distance < second_distance);
+    assert!(second_distance < third_distance);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_accepts_rrf_rank_constant() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[Document::with_vectors(
+            1,
+            Vec::new(),
+            vec![0.0, 0.0],
+            [("title_vec".to_string(), vec![0.0, 0.0])],
+        )],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "reranker":{"rank_constant":1}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multi query search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "1");
+    let distance = json["hits"][0]["distance"].as_f64().expect("distance");
+    assert!((distance + 1.0).abs() < 1e-6);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_uses_top_k_per_recall_source() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                1,
+                Vec::new(),
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![9.9, 10.0])],
+            ),
+            Document::with_vectors(
+                2,
+                Vec::new(),
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![50.0, 50.0])],
+            ),
+            Document::with_vectors(
+                3,
+                Vec::new(),
+                vec![50.0, 50.0],
+                [("title_vec".to_string(), vec![10.0, 10.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":1,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[10.0,10.0]}
+                        ]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multi query search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    // id=1 is second in both recall lists and would win if the implementation over-fetched.
+    assert_eq!(json["hits"][0]["id"], "2");
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_rejects_unsupported_combinations() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("group", FieldType::Int64)],
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[Document::with_vectors(
+            1,
+            [("group".to_string(), FieldValue::Int64(1))],
+            vec![0.0, 0.0],
+            [("title_vec".to_string(), vec![0.0, 0.0])],
+        )],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    for body in [
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"reranker":{"weights":{"vector":1.0}}}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"reranker":{"metric":"l2"}}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"group_by":{"field_name":"group"}}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"order_by":{"field_name":"group"}}"#,
+        r#"{"top_k":1,"query_by_id":["1"],"queries":[{"field_name":"vector","vector":[0.0,0.0]}]}"#,
+        r#"{"top_k":1,"query_by_id":["1","2"]}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":10}},{"field_name":"title_vec","vector":[0.0,0.0]}]}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","sparse_vector":{"indices":[1],"values":[1.0]}},{"field_name":"title_vec","vector":[0.0,0.0]}]}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/docs/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send unsupported multi-query request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
 async fn lance_storage_typed_search_accepts_single_recall_reranker() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
