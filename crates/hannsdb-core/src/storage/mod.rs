@@ -1,8 +1,14 @@
 pub(crate) mod compaction;
+#[cfg(feature = "lance-storage")]
+pub mod lance_schema;
+#[cfg(feature = "lance-storage")]
+pub mod lance_store;
 pub(crate) mod paths;
 pub(crate) mod persist;
 pub(crate) mod primary_keys;
 pub(crate) mod recovery;
 pub(crate) mod segment_io;
+#[cfg(feature = "lance-storage")]
+pub mod selector;
 pub(crate) mod tombstone;
 pub mod wal;

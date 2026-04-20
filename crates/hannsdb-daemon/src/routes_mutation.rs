@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "lance-storage")]
+use std::collections::HashSet;
 use std::io;
 
 use axum::extract::{rejection::JsonRejection, Path as AxumPath, State};
@@ -6,6 +8,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::document::CollectionSchema;
 use hannsdb_core::document::DocumentUpdate;
 
 use crate::api::{
@@ -28,12 +32,48 @@ pub(crate) async fn insert_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let _insert_guard = state.lance_insert_lock.lock().await;
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => {
+                if let Err(error) =
+                    validate_lance_daemon_documents(&documents, collection.schema(), true)
+                {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
+                        .into_response();
+                }
+                let ids = documents
+                    .iter()
+                    .map(|document| document.id)
+                    .collect::<Vec<_>>();
+                match collection.fetch_documents(&ids).await {
+                    Ok(existing) if !existing.is_empty() => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate document id for Lance insert",
+                    )),
+                    Ok(_) => collection
+                        .insert_documents(&documents)
+                        .await
+                        .map(|_| documents.len()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        return insert_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .insert_documents(&collection, &documents);
 
+    insert_response(result)
+}
+
+fn insert_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(inserted) => (
             StatusCode::OK,
@@ -78,12 +118,30 @@ pub(crate) async fn upsert_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => {
+                match validate_lance_daemon_documents(&documents, collection.schema(), false) {
+                    Ok(()) => collection.upsert_documents(&documents).await,
+                    Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        return upsert_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .upsert_documents(&collection, &documents);
 
+    upsert_response(result)
+}
+
+fn upsert_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(upserted) => (
             StatusCode::OK,
@@ -114,6 +172,62 @@ pub(crate) async fn upsert_records(
         )
             .into_response(),
     }
+}
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_daemon_documents(
+    documents: &[hannsdb_core::document::Document],
+    schema: &CollectionSchema,
+    reject_duplicate_ids: bool,
+) -> Result<(), String> {
+    if reject_duplicate_ids {
+        let mut seen = HashSet::with_capacity(documents.len());
+        for document in documents {
+            if !seen.insert(document.id) {
+                return Err(format!(
+                    "duplicate document id for Lance insert: {}",
+                    document.id
+                ));
+            }
+        }
+    }
+
+    let scalar_fields = schema
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<HashSet<_>>();
+    let vector_fields = schema
+        .vectors
+        .iter()
+        .map(|vector| vector.name.as_str())
+        .collect::<HashSet<_>>();
+
+    for document in documents {
+        if !document.sparse_vectors.is_empty() {
+            return Err(
+                "daemon Lance collections created through this API do not support sparse vectors yet"
+                    .to_string(),
+            );
+        }
+        for field_name in document.fields.keys() {
+            if !scalar_fields.contains(field_name.as_str()) {
+                return Err(format!(
+                    "document scalar field '{}' is not defined in Lance schema",
+                    field_name
+                ));
+            }
+        }
+        for vector_name in document.vectors.keys() {
+            if !vector_fields.contains(vector_name.as_str()) {
+                return Err(format!(
+                    "document vector '{}' is not defined in Lance schema",
+                    vector_name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn update_records(
@@ -226,12 +340,25 @@ pub(crate) async fn delete_records(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match super::routes::open_lance_collection(&state, &collection).await {
+            Ok(collection) => collection.delete_documents(&external_ids).await,
+            Err(error) => Err(error),
+        };
+        return delete_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .delete(&collection, &external_ids);
 
+    delete_response(result)
+}
+
+fn delete_response(result: io::Result<usize>) -> Response {
     match result {
         Ok(deleted) => (
             StatusCode::OK,
@@ -282,9 +409,32 @@ pub(crate) async fn delete_records_by_filter(
         }
     };
 
+    #[cfg(feature = "lance-storage")]
+    if super::routes::lance_collection_exists(&state, &collection) {
+        let result = match hannsdb_core::query::parse_filter(&request.filter) {
+            Ok(filter) => match super::routes::open_lance_collection(&state, &collection).await {
+                Ok(collection) => collection.delete_by_filter(&filter).await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        return delete_by_filter_response(result, None);
+    }
+
     let mut db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.delete_by_filter(&collection, &request.filter);
+    let collection_missing = db
+        .list_collections()
+        .map(|collections| !collections.iter().any(|name| name == &collection))
+        .unwrap_or(false);
 
+    delete_by_filter_response(result, collection_missing.then_some(collection))
+}
+
+fn delete_by_filter_response(
+    result: io::Result<usize>,
+    missing_collection: Option<String>,
+) -> Response {
     match result {
         Ok(deleted) => (
             StatusCode::OK,
@@ -293,30 +443,22 @@ pub(crate) async fn delete_records_by_filter(
             }),
         )
             .into_response(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let collection_missing = db
-                .list_collections()
-                .map(|collections| !collections.iter().any(|name| name == &collection))
-                .unwrap_or(false);
-
-            if collection_missing {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: format!("collection not found: {collection}"),
-                    }),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: error.to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match missing_collection {
+            Some(collection) => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("collection not found: {collection}"),
+                }),
+            )
+                .into_response(),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        },
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {

@@ -58,6 +58,7 @@ impl SparseVector {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
+    Null,
     String(String),
     Int64(i64),
     Int32(i32),
@@ -985,26 +986,27 @@ pub(crate) fn validate_schema_secondary_vector_descriptors(
 }
 
 /// Convert a core `FieldValue` into the index crate's `ScalarValue`.
-pub(crate) fn field_value_to_scalar(value: &FieldValue) -> ScalarValue {
+pub(crate) fn field_value_to_scalar(value: &FieldValue) -> Option<ScalarValue> {
     match value {
-        FieldValue::String(s) => ScalarValue::String(s.clone()),
-        FieldValue::Int64(v) => ScalarValue::Int64(*v),
-        FieldValue::Int32(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::UInt32(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::UInt64(v) => ScalarValue::Int64(*v as i64),
-        FieldValue::Float(v) => ScalarValue::Float64(*v as f64),
-        FieldValue::Float64(v) => ScalarValue::Float64(*v),
-        FieldValue::Bool(b) => ScalarValue::Bool(*b),
-        FieldValue::Array(items) => match items.first() {
-            Some(first) => field_value_to_scalar(first),
-            None => ScalarValue::String("[]".to_string()),
-        },
+        FieldValue::Null => None,
+        FieldValue::String(s) => Some(ScalarValue::String(s.clone())),
+        FieldValue::Int64(v) => Some(ScalarValue::Int64(*v)),
+        FieldValue::Int32(v) => Some(ScalarValue::Int64(*v as i64)),
+        FieldValue::UInt32(v) => Some(ScalarValue::Int64(*v as i64)),
+        FieldValue::UInt64(v) => Some(ScalarValue::Int64(*v as i64)),
+        FieldValue::Float(v) => Some(ScalarValue::Float64(*v as f64)),
+        FieldValue::Float64(v) => Some(ScalarValue::Float64(*v)),
+        FieldValue::Bool(b) => Some(ScalarValue::Bool(*b)),
+        FieldValue::Array(items) => items.iter().find_map(field_value_to_scalar),
     }
 }
 
 pub(crate) fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Ordering {
     match (a, b) {
         (FieldValue::String(sa), FieldValue::String(sb)) => sa.cmp(sb),
+        (FieldValue::Null, FieldValue::Null) => Ordering::Equal,
+        (FieldValue::Null, _) => Ordering::Less,
+        (_, FieldValue::Null) => Ordering::Greater,
         (FieldValue::Int64(va), FieldValue::Int64(vb)) => va.cmp(vb),
         (FieldValue::Int32(va), FieldValue::Int32(vb)) => va.cmp(vb),
         (FieldValue::UInt32(va), FieldValue::UInt32(vb)) => va.cmp(vb),
@@ -1037,5 +1039,26 @@ pub(crate) fn compare_field_value_for_sort(a: &FieldValue, b: &FieldValue) -> Or
             }
         }
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_value_to_scalar_skips_null_values() {
+        assert_eq!(field_value_to_scalar(&FieldValue::Null), None);
+        assert_eq!(
+            field_value_to_scalar(&FieldValue::Array(vec![
+                FieldValue::Null,
+                FieldValue::String("visible".to_string()),
+            ])),
+            Some(ScalarValue::String("visible".to_string()))
+        );
+        assert_eq!(
+            field_value_to_scalar(&FieldValue::Array(vec![FieldValue::Null])),
+            None
+        );
     }
 }

@@ -22,6 +22,8 @@ use hannsdb_core::query::{
     QueryReranker as CoreQueryReranker, VectorQuery as CoreVectorQuery,
     VectorQueryParam as CoreVectorQueryParam,
 };
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+use hannsdb_core::storage::lance_store::LanceCollection as CoreLanceCollection;
 #[cfg(feature = "python-binding")]
 use hannsdb_core::wal::{AddColumnBackfill, AlterColumnMigration};
 
@@ -418,6 +420,69 @@ fn core_schema_from_schema(schema: &CollectionSchema) -> std::io::Result<CoreCol
     })
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn schema_from_core_schema(
+    name: String,
+    schema: &CoreCollectionSchema,
+) -> std::io::Result<CollectionSchema> {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| {
+            let data_type = match field.data_type {
+                CoreFieldType::String => DataType::String,
+                CoreFieldType::Int64 => DataType::Int64,
+                CoreFieldType::Int32 => DataType::Int32,
+                CoreFieldType::UInt32 => DataType::UInt32,
+                CoreFieldType::UInt64 => DataType::UInt64,
+                CoreFieldType::Float => DataType::Float,
+                CoreFieldType::Float64 => DataType::Float64,
+                CoreFieldType::Bool => DataType::Bool,
+                CoreFieldType::VectorFp32
+                | CoreFieldType::VectorFp16
+                | CoreFieldType::VectorSparse => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("field '{}' cannot use vector data type", field.name),
+                    ))
+                }
+            };
+            Ok(FieldSchema {
+                name: field.name.clone(),
+                data_type,
+                nullable: field.nullable,
+                array: field.array,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let vectors = schema
+        .vectors
+        .iter()
+        .map(|vector| {
+            if !matches!(vector.data_type, CoreFieldType::VectorFp32) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("vector '{}' is not vector_fp32", vector.name),
+                ));
+            }
+            Ok(VectorSchema {
+                name: vector.name.clone(),
+                data_type: DataType::VectorFp32,
+                dimension: vector.dimension,
+                index_param: None,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    Ok(CollectionSchema {
+        name,
+        primary_vector: schema.primary_vector.clone(),
+        fields,
+        vectors,
+    })
+}
+
 #[cfg(feature = "python-binding")]
 fn parse_query_ids(
     py: Python<'_>,
@@ -770,7 +835,13 @@ fn coerce_field_value_for_schema(
                 .with_flags(schema.nullable, false);
         return items
             .iter()
-            .map(|item| coerce_field_value_for_schema(field_name, item, &element_schema))
+            .map(|item| {
+                if matches!(item, FieldValue::Null) {
+                    Ok(FieldValue::Null)
+                } else {
+                    coerce_field_value_for_schema(field_name, item, &element_schema)
+                }
+            })
             .collect::<std::io::Result<Vec<_>>>()
             .map(FieldValue::Array);
     }
@@ -1456,6 +1527,9 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
     let mut out = BTreeMap::new();
     for (key, value) in fields.iter() {
         let key = key.extract::<String>()?;
+        if value.is_none() {
+            continue;
+        }
         let value = if value.is_instance_of::<PyBool>() {
             FieldValue::Bool(value.extract::<bool>()?)
         } else if let Ok(value) = value.extract::<String>() {
@@ -1476,7 +1550,9 @@ fn py_dict_to_fields(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, Fi
             let items: Vec<FieldValue> = list
                 .iter()
                 .map(|item| {
-                    if item.is_instance_of::<PyBool>() {
+                    if item.is_none() {
+                        Ok(FieldValue::Null)
+                    } else if item.is_instance_of::<PyBool>() {
                         Ok(FieldValue::Bool(item.extract::<bool>()?))
                     } else if let Ok(v) = item.extract::<String>() {
                         Ok(FieldValue::String(v))
@@ -1526,6 +1602,7 @@ fn py_dict_to_vectors(fields: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, V
 #[cfg(feature = "python-binding")]
 fn field_value_to_py<'py>(py: Python<'py>, value: &FieldValue) -> PyResult<Bound<'py, PyAny>> {
     match value {
+        FieldValue::Null => Ok(py.None().into_bound(py).into_any()),
         FieldValue::String(v) => Ok(v.clone().into_pyobject(py)?.into_any()),
         FieldValue::Int64(v) => Ok(v.into_pyobject(py)?.into_any()),
         FieldValue::Int32(v) => Ok(v.into_pyobject(py)?.into_any()),
@@ -1555,6 +1632,7 @@ fn fields_to_py_dict<'py>(
     let dict = PyDict::new(py);
     for (name, value) in fields {
         match value {
+            FieldValue::Null => dict.set_item(name, py.None())?,
             FieldValue::String(value) => dict.set_item(name, value)?,
             FieldValue::Int64(value) => dict.set_item(name, *value)?,
             FieldValue::Int32(value) => dict.set_item(name, *value)?,
@@ -1634,6 +1712,53 @@ fn parse_data_type(value: &str) -> PyResult<DataType> {
         other => Err(PyValueError::new_err(format!(
             "unsupported DataType value: {other}"
         ))),
+    }
+}
+
+#[cfg(feature = "python-binding")]
+fn normalize_storage_backend(value: &str) -> PyResult<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hannsdb" | "default" | "" => Ok("hannsdb"),
+        "lance" => Ok("lance"),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported storage backend: {other}"
+        ))),
+    }
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn infer_single_lance_collection_name(path: &str) -> PyResult<String> {
+    let collections_dir = std::path::Path::new(path).join("collections");
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(&collections_dir).map_err(|err| {
+        PyValueError::new_err(format!(
+            "cannot infer Lance collection schema: failed to read {}: {err}",
+            collections_dir.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(io_to_py_err)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(name) = file_name.strip_suffix(".lance") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    match names.as_slice() {
+        [name] => Ok(name.clone()),
+        [] => Err(PyValueError::new_err(format!(
+            "cannot infer Lance collection schema: no .lance datasets found under {}",
+            collections_dir.display()
+        ))),
+        _ => Err(PyValueError::new_err(
+            "cannot infer Lance collection schema: multiple .lance datasets found; pass name explicitly",
+        )),
     }
 }
 
@@ -3007,11 +3132,189 @@ struct PyCollection {
     inner: Option<Collection>,
 }
 
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyclass(name = "LanceCollection", module = "hannsdb")]
+struct PyLanceCollection {
+    inner: Option<CoreLanceCollection>,
+    schema: CollectionSchema,
+}
+
 #[cfg(feature = "python-binding")]
 #[pyclass(name = "CollectionStats", module = "hannsdb")]
 #[derive(Clone)]
 struct PyCollectionStats {
     inner: CollectionStats,
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn block_on_lance<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> PyResult<T> {
+    tokio::runtime::Runtime::new()
+        .map_err(|err| PyRuntimeError::new_err(format!("failed to create tokio runtime: {err}")))?
+        .block_on(f)
+        .map_err(io_to_py_err)
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn core_documents_from_lance_docs(
+    docs: &[Doc],
+    schema: &CollectionSchema,
+) -> std::io::Result<Vec<CoreDocument>> {
+    let core_schema = core_schema_from_schema(schema)?;
+    let metadata = CollectionMetadata::new_with_schema(schema.name.clone(), core_schema);
+    docs.iter()
+        .map(|doc| {
+            let doc = normalize_doc_fields_for_collection(doc, &metadata)?;
+            let id = doc.id.parse::<i64>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Lance collection P4 requires numeric document ids, got '{}'",
+                        doc.id
+                    ),
+                )
+            })?;
+            core_document_from_doc(&doc, &schema.primary_vector, id)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+fn py_docs_from_lance_core_documents(
+    documents: Vec<CoreDocument>,
+    primary_vector_name: &str,
+) -> Vec<Doc> {
+    documents
+        .into_iter()
+        .map(|document| {
+            let public_id = document.id.to_string();
+            doc_from_core_document(document, primary_vector_name, public_id)
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+impl PyLanceCollection {
+    fn inner_ref(&self) -> PyResult<&CoreLanceCollection> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Lance collection already destroyed"))
+    }
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pymethods]
+impl PyLanceCollection {
+    #[getter]
+    fn name(&self) -> PyResult<String> {
+        Ok(self.inner_ref()?.name().to_string())
+    }
+
+    #[getter]
+    fn uri(&self) -> PyResult<String> {
+        Ok(self.inner_ref()?.uri().to_string())
+    }
+
+    #[getter]
+    fn schema(&self) -> PyCollectionSchema {
+        PyCollectionSchema {
+            inner: self.schema.clone(),
+        }
+    }
+
+    fn insert(&self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
+        let docs = docs
+            .into_iter()
+            .map(|doc| doc.borrow(py).inner.clone())
+            .collect::<Vec<_>>();
+        let docs = core_documents_from_lance_docs(&docs, &self.schema).map_err(io_to_py_err)?;
+        block_on_lance(self.inner_ref()?.insert_documents(&docs)).map(|_| docs.len())
+    }
+
+    fn upsert(&self, py: Python<'_>, docs: Vec<Py<PyDoc>>) -> PyResult<usize> {
+        let docs = docs
+            .into_iter()
+            .map(|doc| doc.borrow(py).inner.clone())
+            .collect::<Vec<_>>();
+        let docs = core_documents_from_lance_docs(&docs, &self.schema).map_err(io_to_py_err)?;
+        block_on_lance(self.inner_ref()?.upsert_documents(&docs))
+    }
+
+    fn fetch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<Vec<Py<PyDoc>>> {
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<i64>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Lance collection P4 requires numeric document ids, got '{id}'"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let docs = block_on_lance(self.inner_ref()?.fetch_documents(&ids))?;
+        py_docs_from_lance_core_documents(docs, &self.schema.primary_vector)
+            .into_iter()
+            .map(|inner| Py::new(py, PyDoc { inner }))
+            .collect()
+    }
+
+    fn delete(&self, ids: Vec<String>) -> PyResult<usize> {
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.parse::<i64>().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "Lance collection P4 requires numeric document ids, got '{id}'"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        block_on_lance(self.inner_ref()?.delete_documents(&ids))
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn hanns_index_path(&self, field_name: &str) -> PyResult<String> {
+        Ok(self
+            .inner_ref()?
+            .hanns_index_path(field_name)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    #[pyo3(signature = (field_name, metric="l2"))]
+    fn optimize_hanns(&self, field_name: &str, metric: &str) -> PyResult<()> {
+        block_on_lance(self.inner_ref()?.optimize_hanns(field_name, metric))
+    }
+
+    #[pyo3(signature = (vector, topk=10, metric="l2"))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        vector: Vec<f32>,
+        topk: usize,
+        metric: &str,
+    ) -> PyResult<Vec<Py<PyDoc>>> {
+        let hits = block_on_lance(self.inner_ref()?.search(&vector, topk, metric))?;
+        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let scores = hits
+            .iter()
+            .map(|hit| (hit.id, hit.distance))
+            .collect::<BTreeMap<_, _>>();
+        let docs = block_on_lance(self.inner_ref()?.fetch_documents(&ids))?;
+        py_docs_from_lance_core_documents(docs, &self.schema.primary_vector)
+            .into_iter()
+            .map(|mut inner| {
+                if let Ok(id) = inner.id.parse::<i64>() {
+                    inner.score = scores.get(&id).copied();
+                }
+                Py::new(py, PyDoc { inner })
+            })
+            .collect()
+    }
+
+    fn destroy(&mut self) {
+        self.inner = None;
+    }
 }
 
 #[cfg(feature = "python-binding")]
@@ -3553,33 +3856,200 @@ fn py_init(log_level: &str) -> PyResult<()> {
 
 #[cfg(feature = "python-binding")]
 #[pyfunction(name = "create_and_open")]
-#[pyo3(signature = (path, schema, option=None))]
+#[pyo3(signature = (path, schema, option=None, *, storage="hannsdb", name=None))]
 fn py_create_and_open(
     py: Python<'_>,
     path: String,
     schema: Py<PyCollectionSchema>,
     option: Option<Py<PyCollectionOption>>,
-) -> PyResult<PyCollection> {
+    storage: &str,
+    name: Option<String>,
+) -> PyResult<Py<PyAny>> {
     let schema = schema.borrow(py).inner.clone();
     let option = option.map(|value| value.borrow(py).inner.clone());
+    if normalize_storage_backend(storage)? == "lance" {
+        #[cfg(feature = "lance-storage")]
+        {
+            if let Some(requested_name) = name.as_deref() {
+                if requested_name != schema.name {
+                    return Err(PyValueError::new_err(
+                        "name must match schema.name when schema is provided",
+                    ));
+                }
+            }
+            let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+            let empty_docs: Vec<CoreDocument> = Vec::new();
+            let collection = block_on_lance(CoreLanceCollection::create(
+                path,
+                schema.name.clone(),
+                core_schema,
+                &empty_docs,
+            ))?;
+            return Ok(Py::new(
+                py,
+                PyLanceCollection {
+                    inner: Some(collection),
+                    schema,
+                },
+            )?
+            .into_any());
+        }
+        #[cfg(not(feature = "lance-storage"))]
+        {
+            return Err(PyNotImplementedError::new_err(
+                "Lance storage requires the lance-storage feature",
+            ));
+        }
+    }
+    if name.is_some() {
+        return Err(PyValueError::new_err(
+            "name is only supported when creating Lance storage",
+        ));
+    }
     let collection = create_and_open(path, schema, option).map_err(io_to_py_err)?;
-    Ok(PyCollection {
-        inner: Some(collection),
-    })
+    Ok(Py::new(
+        py,
+        PyCollection {
+            inner: Some(collection),
+        },
+    )?
+    .into_any())
 }
 
 #[cfg(feature = "python-binding")]
 #[pyfunction(name = "open")]
-#[pyo3(signature = (path, option=None))]
+#[pyo3(signature = (path, option=None, *, storage="hannsdb", schema=None, name=None))]
 fn py_open(
     py: Python<'_>,
     path: String,
     option: Option<Py<PyCollectionOption>>,
-) -> PyResult<PyCollection> {
+    storage: &str,
+    schema: Option<Py<PyCollectionSchema>>,
+    name: Option<String>,
+) -> PyResult<Py<PyAny>> {
     let option = option.map(|value| value.borrow(py).inner.clone());
+    if normalize_storage_backend(storage)? == "lance" {
+        #[cfg(feature = "lance-storage")]
+        {
+            let (collection, schema) = if let Some(schema) = schema {
+                let schema = schema.borrow(py).inner.clone();
+                if let Some(requested_name) = name.as_deref() {
+                    if requested_name != schema.name {
+                        return Err(PyValueError::new_err(
+                            "name must match schema.name when schema is provided",
+                        ));
+                    }
+                }
+                let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+                let collection = block_on_lance(CoreLanceCollection::open(
+                    path,
+                    schema.name.clone(),
+                    core_schema,
+                ))?;
+                (collection, schema)
+            } else {
+                let name = match name {
+                    Some(name) => name,
+                    None => infer_single_lance_collection_name(&path)?,
+                };
+                let collection =
+                    block_on_lance(CoreLanceCollection::open_inferred(path, name.clone()))?;
+                let schema =
+                    schema_from_core_schema(name, collection.schema()).map_err(io_to_py_err)?;
+                (collection, schema)
+            };
+            return Ok(Py::new(
+                py,
+                PyLanceCollection {
+                    inner: Some(collection),
+                    schema,
+                },
+            )?
+            .into_any());
+        }
+        #[cfg(not(feature = "lance-storage"))]
+        {
+            return Err(PyNotImplementedError::new_err(
+                "Lance storage requires the lance-storage feature",
+            ));
+        }
+    }
+    if schema.is_some() || name.is_some() {
+        return Err(PyValueError::new_err(
+            "schema and name are only supported when opening Lance storage",
+        ));
+    }
     let collection = open(path, option).map_err(io_to_py_err)?;
-    Ok(PyCollection {
+    Ok(Py::new(
+        py,
+        PyCollection {
+            inner: Some(collection),
+        },
+    )?
+    .into_any())
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "create_lance_collection")]
+#[pyo3(signature = (path, schema, docs))]
+fn py_create_lance_collection(
+    py: Python<'_>,
+    path: String,
+    schema: Py<PyCollectionSchema>,
+    docs: Vec<Py<PyDoc>>,
+) -> PyResult<PyLanceCollection> {
+    let schema = schema.borrow(py).inner.clone();
+    let docs = docs
+        .into_iter()
+        .map(|doc| doc.borrow(py).inner.clone())
+        .collect::<Vec<_>>();
+    let core_documents = core_documents_from_lance_docs(&docs, &schema).map_err(io_to_py_err)?;
+    let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+    let collection = block_on_lance(CoreLanceCollection::create(
+        path,
+        schema.name.clone(),
+        core_schema,
+        &core_documents,
+    ))?;
+    Ok(PyLanceCollection {
         inner: Some(collection),
+        schema,
+    })
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "open_lance_collection")]
+#[pyo3(signature = (path, schema))]
+fn py_open_lance_collection(
+    py: Python<'_>,
+    path: String,
+    schema: Py<PyCollectionSchema>,
+) -> PyResult<PyLanceCollection> {
+    let schema = schema.borrow(py).inner.clone();
+    let core_schema = core_schema_from_schema(&schema).map_err(io_to_py_err)?;
+    let collection = block_on_lance(CoreLanceCollection::open(
+        path,
+        schema.name.clone(),
+        core_schema,
+    ))?;
+    Ok(PyLanceCollection {
+        inner: Some(collection),
+        schema,
+    })
+}
+
+#[cfg(all(feature = "python-binding", feature = "lance-storage"))]
+#[pyfunction(name = "open_lance_collection_infer_schema")]
+#[pyo3(signature = (path, name))]
+fn py_open_lance_collection_infer_schema(
+    path: String,
+    name: String,
+) -> PyResult<PyLanceCollection> {
+    let collection = block_on_lance(CoreLanceCollection::open_inferred(path, name.clone()))?;
+    let schema = schema_from_core_schema(name, collection.schema()).map_err(io_to_py_err)?;
+    Ok(PyLanceCollection {
+        inner: Some(collection),
+        schema,
     })
 }
 
@@ -3616,9 +4086,20 @@ fn python_module(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> 
     module.add_class::<PyWeightedReRanker>()?;
     module.add_class::<PyCollectionStats>()?;
     module.add_class::<PyCollection>()?;
+    #[cfg(feature = "lance-storage")]
+    module.add_class::<PyLanceCollection>()?;
     module.add_function(wrap_pyfunction!(py_init, module)?)?;
     module.add_function(wrap_pyfunction!(py_create_and_open, module)?)?;
     module.add_function(wrap_pyfunction!(py_open, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(py_create_lance_collection, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(py_open_lance_collection, module)?)?;
+    #[cfg(feature = "lance-storage")]
+    module.add_function(wrap_pyfunction!(
+        py_open_lance_collection_infer_schema,
+        module
+    )?)?;
     Ok(())
 }
 

@@ -264,6 +264,14 @@ cargo build --release
 # With Hanns ANN backend
 cargo build --release --features hanns-backend
 
+# Experimental Lance-compatible storage
+cargo test -p hannsdb-core --features lance-storage,hanns-backend --test lance_compat -- --nocapture
+
+# Experimental Python facade for Lance-compatible storage
+cd crates/hannsdb-py
+maturin develop --features python-binding,hanns-backend,lance-storage
+python -m pytest tests/test_lance_storage_surface.py tests/test_lance_ecosystem_compat.py -q
+
 # Run tests
 cargo test --workspace
 

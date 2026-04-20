@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "lance-storage")]
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "lance-storage")]
+use tokio::sync::Mutex as AsyncMutex;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -18,6 +22,8 @@ use hannsdb_core::query::{
     QueryContext, QueryGroupBy, QueryReranker, QueryVector, VectorQuery, VectorQueryParam,
 };
 use hannsdb_core::HannsDb;
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::{storage::lance_store::LanceCollection, CollectionSchema};
 
 use crate::api::{
     AddColumnRequest, AddColumnResponse, AddVectorFieldRequest, AddVectorFieldResponse,
@@ -34,13 +40,26 @@ use super::routes_search;
 
 #[derive(Clone)]
 pub(crate) struct DaemonState {
+    #[cfg_attr(not(feature = "lance-storage"), allow(dead_code))]
+    pub(crate) root: PathBuf,
     pub(crate) db: Arc<Mutex<HannsDb>>,
+    #[cfg(feature = "lance-storage")]
+    pub(crate) lance_insert_lock: Arc<AsyncMutex<()>>,
+}
+
+#[cfg(feature = "lance-storage")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LanceDaemonCollectionMetadata {
+    metric: String,
 }
 
 pub fn build_router(root: &Path) -> io::Result<Router> {
     let db = HannsDb::open(root)?;
     let state = DaemonState {
+        root: root.to_path_buf(),
         db: Arc::new(Mutex::new(db)),
+        #[cfg(feature = "lance-storage")]
+        lance_insert_lock: Arc::new(AsyncMutex::new(())),
     };
 
     Ok(Router::new()
@@ -137,11 +156,55 @@ async fn create_collection(
     State(state): State<DaemonState>,
     Json(request): Json<CreateCollectionRequest>,
 ) -> Response {
+    match request
+        .storage
+        .as_deref()
+        .map(normalize_storage_backend)
+        .transpose()
+    {
+        Ok(Some("lance")) => return create_lance_collection(state, request).await,
+        Ok(Some("hannsdb")) | Ok(None) => {}
+        Ok(Some(_)) => unreachable!("normalize_storage_backend returns known values"),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })).into_response()
+        }
+    }
+
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &request.name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("collection already exists: {}", request.name),
+            }),
+        )
+            .into_response();
+    }
+
+    let Some(dimension) = request.dimension else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "dimension is required for native collection create".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let Some(metric) = request.metric.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "metric is required for native collection create".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
-        .create_collection(&request.name, request.dimension, &request.metric);
+        .create_collection(&request.name, dimension, metric);
 
     match result {
         Ok(()) => (
@@ -166,17 +229,97 @@ async fn create_collection(
     }
 }
 
-async fn list_collections(State(state): State<DaemonState>) -> Response {
-    let result = state
+fn normalize_storage_backend(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hannsdb" | "default" | "" => Ok("hannsdb"),
+        "lance" => Ok("lance"),
+        other => Err(format!("unsupported storage backend: {other}")),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+async fn create_lance_collection(state: DaemonState, request: CreateCollectionRequest) -> Response {
+    let native_exists = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
-        .list_collections();
+        .list_collections()
+        .map(|collections| collections.iter().any(|name| name == &request.name))
+        .unwrap_or(false);
+    if native_exists {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("collection already exists: {}", request.name),
+            }),
+        )
+            .into_response();
+    }
 
-    match result {
-        Ok(collections) => (
-            StatusCode::OK,
-            Json(ListCollectionsResponse { collections }),
+    let metric = request
+        .schema
+        .as_ref()
+        .map(|schema| schema.metric().to_string());
+    let metric = match (metric, request.metric.as_deref()) {
+        (Some(metric), _) => metric,
+        (None, Some(metric)) => metric.to_string(),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "metric is required for Lance create without schema".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let schema = match request.schema {
+        Some(schema) => schema,
+        None => {
+            let Some(dimension) = request.dimension else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "dimension is required for Lance create without schema".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
+            CollectionSchema::new(
+                "vector",
+                dimension,
+                metric.clone(),
+                Vec::<ScalarFieldSchema>::new(),
+            )
+        }
+    };
+    match LanceCollection::create(&state.root, request.name.clone(), schema, &[]).await {
+        Ok(_) => match write_lance_daemon_metadata(&state, &request.name, &metric) {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(CreateCollectionResponse { name: request.name }),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
         )
             .into_response(),
         Err(error) => (
@@ -189,10 +332,191 @@ async fn list_collections(State(state): State<DaemonState>) -> Response {
     }
 }
 
+#[cfg(not(feature = "lance-storage"))]
+async fn create_lance_collection(
+    _state: DaemonState,
+    _request: CreateCollectionRequest,
+) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: "Lance storage requires the lance-storage feature".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "lance-storage")]
+pub(crate) fn lance_collection_exists(state: &DaemonState, collection: &str) -> bool {
+    state
+        .root
+        .join("collections")
+        .join(format!("{collection}.lance"))
+        .exists()
+}
+
+#[cfg(feature = "lance-storage")]
+pub(crate) async fn open_lance_collection(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<LanceCollection> {
+    LanceCollection::open_inferred(&state.root, collection).await
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_daemon_metadata_path(state: &DaemonState, collection: &str) -> PathBuf {
+    state
+        .root
+        .join("collections")
+        .join(format!("{collection}.lance"))
+        .join("_hannsdb")
+        .join("collection.json")
+}
+
+#[cfg(feature = "lance-storage")]
+fn write_lance_daemon_metadata(
+    state: &DaemonState,
+    collection: &str,
+    metric: &str,
+) -> io::Result<()> {
+    let path = lance_daemon_metadata_path(state, collection);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let metadata = LanceDaemonCollectionMetadata {
+        metric: metric.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    std::fs::write(path, bytes)
+}
+
+#[cfg(feature = "lance-storage")]
+fn read_lance_daemon_metadata(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<Option<LanceDaemonCollectionMetadata>> {
+    let path = lance_daemon_metadata_path(state, collection);
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+pub(crate) fn lance_collection_metric(
+    state: &DaemonState,
+    collection: &str,
+    fallback: &str,
+) -> io::Result<String> {
+    Ok(read_lance_daemon_metadata(state, collection)?
+        .map(|metadata| metadata.metric)
+        .unwrap_or_else(|| fallback.to_string()))
+}
+
+async fn list_collections(State(state): State<DaemonState>) -> Response {
+    let result = state
+        .db
+        .lock()
+        .expect("daemon state mutex poisoned")
+        .list_collections();
+
+    match result {
+        Ok(mut collections) => {
+            #[cfg(feature = "lance-storage")]
+            match list_lance_collections(&state) {
+                Ok(lance_collections) => collections.extend(lance_collections),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: error.to_string(),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+            collections.sort();
+            collections.dedup();
+            (
+                StatusCode::OK,
+                Json(ListCollectionsResponse { collections }),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+fn list_lance_collections(state: &DaemonState) -> io::Result<Vec<String>> {
+    let collections_dir = state.root.join("collections");
+    let entries = match std::fs::read_dir(&collections_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if let Some(name) = file_name.strip_suffix(".lance") {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 async fn drop_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let path = state
+            .root
+            .join("collections")
+            .join(format!("{collection}.lance"));
+        return match std::fs::remove_dir_all(path) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(DropCollectionResponse {
+                    dropped: collection,
+                }),
+            )
+                .into_response(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response(),
+        };
+    }
+
     let result = state
         .db
         .lock()
@@ -228,6 +552,12 @@ async fn get_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_info(&state, &collection).await;
+        return collection_info_response(result);
+    }
+
     let result = state
         .db
         .lock()
@@ -237,10 +567,54 @@ async fn get_collection(
     collection_info_response(result)
 }
 
+#[cfg(feature = "lance-storage")]
+async fn lance_collection_info(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<hannsdb_core::CollectionInfo> {
+    let lance = open_lance_collection(state, collection).await?;
+    let live_count = lance.count_rows().await?;
+    let metric = lance_collection_metric(state, collection, lance.schema().metric())?;
+    let index_completeness = lance_index_completeness(&lance, live_count);
+    Ok(hannsdb_core::CollectionInfo {
+        name: collection.to_string(),
+        dimension: lance.schema().dimension(),
+        metric,
+        record_count: live_count,
+        deleted_count: 0,
+        live_count,
+        index_completeness,
+    })
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+fn lance_index_completeness(lance: &LanceCollection, live_count: usize) -> BTreeMap<String, f64> {
+    let mut index_completeness = BTreeMap::new();
+    let field_name = lance.schema().primary_vector_name().to_string();
+    let completeness = if live_count == 0 || lance.hanns_index_path(&field_name).exists() {
+        1.0
+    } else {
+        0.0
+    };
+    index_completeness.insert(field_name, completeness);
+    index_completeness
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+fn lance_index_completeness(_lance: &LanceCollection, _live_count: usize) -> BTreeMap<String, f64> {
+    BTreeMap::new()
+}
+
 async fn get_collection_stats(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_info(&state, &collection).await;
+        return collection_info_response(result);
+    }
+
     let result = state
         .db
         .lock()
@@ -321,6 +695,17 @@ async fn compact_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Lance compact is not supported by this daemon route yet".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     let mut db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.compact_collection(&collection);
 
@@ -358,9 +743,40 @@ async fn optimize_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+    if lance_collection_exists(&state, &collection) {
+        let result = match open_lance_collection(&state, &collection).await {
+            Ok(lance) => {
+                let field_name = lance.schema().primary_vector_name().to_string();
+                let metric = lance_collection_metric(&state, &collection, lance.schema().metric());
+                match metric {
+                    Ok(metric) => lance.optimize_hanns(&field_name, &metric).await,
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        return optimize_collection_response(result, collection);
+    }
+
+    #[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+    if lance_collection_exists(&state, &collection) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Lance optimize requires the hanns-backend feature".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     let db = state.db.lock().expect("daemon state mutex poisoned");
     let result = db.optimize_collection(&collection);
 
+    optimize_collection_response(result, collection)
+}
+
+fn optimize_collection_response(result: io::Result<()>, collection: String) -> Response {
     match result {
         Ok(()) => (
             StatusCode::OK,
@@ -390,28 +806,62 @@ async fn get_collection_segments(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        let result = lance_collection_segments(&state, &collection).await;
+        return collection_segments_response(result);
+    }
+
     let result = state
         .db
         .lock()
         .expect("daemon state mutex poisoned")
         .list_collection_segments(&collection);
 
+    collection_segments_response(result.map(|segments| {
+        segments
+            .into_iter()
+            .map(|segment| crate::api::SegmentInfoResponse {
+                id: segment.id,
+                live: segment.live_count,
+                dead: segment.dead_count,
+                ann_ready: segment.ann_ready,
+            })
+            .collect()
+    }))
+}
+
+#[cfg(feature = "lance-storage")]
+async fn lance_collection_segments(
+    state: &DaemonState,
+    collection: &str,
+) -> io::Result<Vec<crate::api::SegmentInfoResponse>> {
+    let lance = open_lance_collection(state, collection).await?;
+    let live = lance.count_rows().await?;
+    Ok(vec![crate::api::SegmentInfoResponse {
+        id: "lance".to_string(),
+        live,
+        dead: 0,
+        ann_ready: lance_primary_ann_ready(&lance),
+    }])
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+fn lance_primary_ann_ready(lance: &LanceCollection) -> bool {
+    let field_name = lance.schema().primary_vector_name();
+    lance.hanns_index_path(field_name).exists()
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+fn lance_primary_ann_ready(_lance: &LanceCollection) -> bool {
+    false
+}
+
+fn collection_segments_response(
+    result: io::Result<Vec<crate::api::SegmentInfoResponse>>,
+) -> Response {
     match result {
-        Ok(segments) => (
-            StatusCode::OK,
-            Json(SegmentsResponse {
-                segments: segments
-                    .into_iter()
-                    .map(|segment| crate::api::SegmentInfoResponse {
-                        id: segment.id,
-                        live: segment.live_count,
-                        dead: segment.dead_count,
-                        ann_ready: segment.ann_ready,
-                    })
-                    .collect(),
-            }),
-        )
-            .into_response(),
+        Ok(segments) => (StatusCode::OK, Json(SegmentsResponse { segments })).into_response(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -429,11 +879,50 @@ async fn get_collection_segments(
     }
 }
 
+#[cfg(feature = "lance-storage")]
+fn daemon_storage_error_response(error: io::Error) -> Response {
+    match error.kind() {
+        io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        io::ErrorKind::AlreadyExists => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn create_vector_index(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<VectorIndexRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return create_lance_vector_index(state, collection, request).await;
+    }
+
     let VectorIndexRequest {
         field_name,
         kind,
@@ -498,6 +987,11 @@ async fn list_vector_indexes(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return list_lance_vector_indexes(state, collection).await;
+    }
+
     let result = state
         .db
         .lock()
@@ -536,6 +1030,11 @@ async fn drop_vector_index(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return drop_lance_vector_index(state, collection, field_name).await;
+    }
+
     let result = state
         .db
         .lock()
@@ -572,6 +1071,11 @@ async fn create_scalar_index(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<ScalarIndexRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return create_lance_scalar_index(state, collection, request).await;
+    }
+
     let ScalarIndexRequest {
         field_name,
         kind,
@@ -634,6 +1138,11 @@ async fn list_scalar_indexes(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return list_lance_scalar_indexes(state, collection).await;
+    }
+
     let result = state
         .db
         .lock()
@@ -672,6 +1181,11 @@ async fn drop_scalar_index(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return drop_lance_scalar_index(state, collection, field_name).await;
+    }
+
     let result = state
         .db
         .lock()
@@ -703,6 +1217,201 @@ async fn drop_scalar_index(
     }
 }
 
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+async fn create_lance_vector_index(
+    state: DaemonState,
+    collection: String,
+    request: VectorIndexRequest,
+) -> Response {
+    if request.kind.trim().to_ascii_lowercase() != "hnsw" {
+        return daemon_storage_error_response(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Lance Hanns sidecar vector index supports only hnsw kind, got: {}",
+                request.kind
+            ),
+        ));
+    }
+    if request
+        .params
+        .as_object()
+        .is_some_and(|params| !params.is_empty())
+    {
+        return daemon_storage_error_response(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Lance Hanns sidecar vector index supports only default params",
+        ));
+    }
+    let lance = match open_lance_collection(&state, &collection).await {
+        Ok(lance) => lance,
+        Err(error) => return daemon_storage_error_response(error),
+    };
+    let metric = match request.metric {
+        Some(metric) => metric,
+        None => match lance_collection_metric(&state, &collection, lance.schema().metric()) {
+            Ok(metric) => metric,
+            Err(error) => return daemon_storage_error_response(error),
+        },
+    };
+    match lance.optimize_hanns(&request.field_name, &metric).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(CreateIndexResponse {
+                field_name: request.field_name,
+            }),
+        )
+            .into_response(),
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+async fn create_lance_vector_index(
+    _state: DaemonState,
+    _collection: String,
+    _request: VectorIndexRequest,
+) -> Response {
+    daemon_storage_error_response(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Lance vector index DDL requires the hanns-backend feature",
+    ))
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+async fn list_lance_vector_indexes(state: DaemonState, collection: String) -> Response {
+    match open_lance_collection(&state, &collection).await {
+        Ok(lance) => match lance.list_hanns_indexes() {
+            Ok(indexes) => (
+                StatusCode::OK,
+                Json(VectorIndexesResponse {
+                    vector_indexes: indexes
+                        .into_iter()
+                        .map(|descriptor| {
+                            serde_json::to_value(descriptor).expect("descriptor json")
+                        })
+                        .collect(),
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        },
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+async fn list_lance_vector_indexes(_state: DaemonState, _collection: String) -> Response {
+    (
+        StatusCode::OK,
+        Json(VectorIndexesResponse {
+            vector_indexes: Vec::new(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
+async fn drop_lance_vector_index(
+    state: DaemonState,
+    collection: String,
+    field_name: String,
+) -> Response {
+    match open_lance_collection(&state, &collection).await {
+        Ok(lance) => match lance.drop_hanns_index(&field_name) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(DropIndexResponse {
+                    dropped: field_name,
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        },
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
+#[cfg(all(feature = "lance-storage", not(feature = "hanns-backend")))]
+async fn drop_lance_vector_index(
+    _state: DaemonState,
+    _collection: String,
+    field_name: String,
+) -> Response {
+    let _ = field_name;
+    daemon_storage_error_response(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Lance vector index DDL requires the hanns-backend feature",
+    ))
+}
+
+#[cfg(feature = "lance-storage")]
+async fn create_lance_scalar_index(
+    state: DaemonState,
+    collection: String,
+    request: ScalarIndexRequest,
+) -> Response {
+    match open_lance_collection(&state, &collection).await {
+        Ok(lance) => match lance.create_scalar_index_descriptor(
+            &request.field_name,
+            &request.kind,
+            request.params,
+        ) {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(CreateIndexResponse {
+                    field_name: request.field_name,
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        },
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+async fn list_lance_scalar_indexes(state: DaemonState, collection: String) -> Response {
+    match open_lance_collection(&state, &collection).await {
+        Ok(lance) => match lance.list_scalar_index_descriptors() {
+            Ok(indexes) => (
+                StatusCode::OK,
+                Json(ScalarIndexesResponse {
+                    scalar_indexes: indexes
+                        .into_iter()
+                        .map(|descriptor| {
+                            serde_json::to_value(descriptor).expect("descriptor json")
+                        })
+                        .collect(),
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        },
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+async fn drop_lance_scalar_index(
+    state: DaemonState,
+    collection: String,
+    field_name: String,
+) -> Response {
+    match open_lance_collection(&state, &collection).await {
+        Ok(lance) => match lance.drop_scalar_index_descriptor(&field_name) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(DropIndexResponse {
+                    dropped: field_name,
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        },
+        Err(error) => daemon_storage_error_response(error),
+    }
+}
+
 async fn add_column_to_collection(
     State(state): State<DaemonState>,
     AxumPath(collection): AxumPath<String>,
@@ -716,6 +1425,23 @@ async fn add_column_to_collection(
     };
     let field = ScalarFieldSchema::new(request.name.clone(), data_type)
         .with_flags(request.nullable, request.array);
+
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return match open_lance_collection(&state, &collection).await {
+            Ok(lance) => match lance.add_scalar_column(field).await {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(AddColumnResponse {
+                        added: request.name,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => daemon_storage_error_response(error),
+            },
+            Err(error) => daemon_storage_error_response(error),
+        };
+    }
 
     let result = state
         .db
@@ -759,6 +1485,23 @@ async fn drop_column_from_collection(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return match open_lance_collection(&state, &collection).await {
+            Ok(lance) => match lance.drop_scalar_column(&field_name).await {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(DropColumnResponse {
+                        dropped: field_name,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => daemon_storage_error_response(error),
+            },
+            Err(error) => daemon_storage_error_response(error),
+        };
+    }
+
     let result = state
         .db
         .lock()
@@ -795,6 +1538,27 @@ async fn alter_column_in_collection(
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
     Json(request): Json<AlterColumnRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return match open_lance_collection(&state, &collection).await {
+            Ok(lance) => match lance
+                .rename_scalar_column(&field_name, &request.new_name)
+                .await
+            {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(AlterColumnResponse {
+                        old_name: field_name,
+                        new_name: request.new_name,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => daemon_storage_error_response(error),
+            },
+            Err(error) => daemon_storage_error_response(error),
+        };
+    }
+
     let result = state
         .db
         .lock()
@@ -839,6 +1603,11 @@ async fn add_vector_field_to_collection(
     AxumPath(collection): AxumPath<String>,
     Json(request): Json<AddVectorFieldRequest>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return lance_vector_add_unsupported_response();
+    }
+
     let data_type = match parse_daemon_vector_field_type(&request.data_type) {
         Ok(dt) => dt,
         Err(error) => {
@@ -908,6 +1677,23 @@ async fn drop_vector_field_from_collection(
     State(state): State<DaemonState>,
     AxumPath((collection, field_name)): AxumPath<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "lance-storage")]
+    if lance_collection_exists(&state, &collection) {
+        return match open_lance_collection(&state, &collection).await {
+            Ok(lance) => match lance.drop_vector_field(&field_name).await {
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(DropVectorFieldResponse {
+                        dropped: field_name,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => daemon_storage_error_response(error),
+            },
+            Err(error) => daemon_storage_error_response(error),
+        };
+    }
+
     let result = state
         .db
         .lock()
@@ -944,6 +1730,14 @@ async fn drop_vector_field_from_collection(
         )
             .into_response(),
     }
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_vector_add_unsupported_response() -> Response {
+    daemon_storage_error_response(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Lance add vector field is not supported by this daemon route yet",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +2026,7 @@ pub(crate) fn build_query_context(
 
 pub(crate) fn field_value_to_json(value: FieldValue) -> serde_json::Value {
     match value {
+        FieldValue::Null => serde_json::Value::Null,
         FieldValue::String(value) => serde_json::Value::String(value),
         FieldValue::Int64(value) => serde_json::Value::Number(value.into()),
         FieldValue::Int32(value) => serde_json::Value::Number(value.into()),

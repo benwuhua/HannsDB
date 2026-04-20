@@ -3,11 +3,19 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use hannsdb_core::CollectionSchema;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateCollectionRequest {
     pub name: String,
-    pub dimension: usize,
-    pub metric: String,
+    #[serde(default)]
+    pub dimension: Option<usize>,
+    #[serde(default)]
+    pub metric: Option<String>,
+    #[serde(default)]
+    pub storage: Option<String>,
+    #[serde(default)]
+    pub schema: Option<CollectionSchema>,
 }
 
 #[derive(Debug, Serialize)]

@@ -97,7 +97,7 @@ pub fn build_scalar_indexes_from_segments(
         .iter()
         .map(|map| {
             map.iter()
-                .map(|(k, v)| (k.clone(), field_value_to_scalar(v)))
+                .filter_map(|(k, v)| field_value_to_scalar(v).map(|value| (k.clone(), value)))
                 .collect()
         })
         .collect();

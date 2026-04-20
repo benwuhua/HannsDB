@@ -31,13 +31,21 @@ from .model import (
     VectorQuery,
     VectorSchema,
 )
-from .model.collection import MutationResult, create_and_open, open
+from .model.collection import (
+    LanceCollection,
+    MutationResult,
+    create_and_open,
+    create_lance_collection,
+    open,
+    open_lance_collection,
+)
 
 _native_exports = [name for name in dir(_native_module) if not name.startswith("_")]
 _facade_exports = [
     "AddColumnOption",
     "AlterColumnOption",
     "Collection",
+    "LanceCollection",
     "CollectionSchema",
     "CollectionOption",
     "DataType",
@@ -72,6 +80,8 @@ _facade_exports = [
     "QuantizeType",
     "VectorQuery",
     "VectorSchema",
+    "create_lance_collection",
+    "open_lance_collection",
 ]
 
 

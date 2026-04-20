@@ -383,6 +383,7 @@ enum GroupByValueKey {
 impl GroupByValueKey {
     fn from_field_value(value: &FieldValue) -> Self {
         match value {
+            FieldValue::Null => Self::Missing,
             FieldValue::String(value) => Self::String(value.clone()),
             FieldValue::Int64(value) => Self::Int64(*value),
             FieldValue::Int32(value) => Self::Int64(*value as i64),

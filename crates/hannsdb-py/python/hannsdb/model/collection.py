@@ -24,7 +24,14 @@ from ..model.schema.field_schema import (
     _coerce_vector_schema,
 )
 
-__all__ = ["Collection", "create_and_open", "open"]
+__all__ = [
+    "Collection",
+    "LanceCollection",
+    "create_and_open",
+    "open",
+    "create_lance_collection",
+    "open_lance_collection",
+]
 
 _INT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)$")
 _FLOAT_LITERAL_RE = re.compile(r"-?(0|[1-9][0-9]*)\.[0-9]+$")
@@ -339,6 +346,8 @@ def _coerce_doc_to_collection_schema(doc, schema: CollectionSchema | None):
             field_schema = schema.field(name)
         except KeyError:
             normalized_fields[name] = value
+            continue
+        if value is None and field_schema.nullable:
             continue
         normalized_fields[name] = _coerce_scalar_value_for_field_schema(value, field_schema)
     return doc._replace(fields=normalized_fields)
@@ -919,7 +928,30 @@ class Collection:
         return getattr(self._core, name)
 
 
-def create_and_open(path, schema, option: CollectionOption | None = None):
+def _normalize_storage(storage):
+    normalized = str(storage).strip().lower()
+    if normalized in {"hannsdb", "default", ""}:
+        return "hannsdb"
+    if normalized == "lance":
+        return "lance"
+    raise ValueError(f"unsupported storage backend: {storage}")
+
+
+def create_and_open(
+    path,
+    schema,
+    option: CollectionOption | None = None,
+    *,
+    storage="hannsdb",
+    name=None,
+):
+    storage = _normalize_storage(storage)
+    if storage == "lance":
+        if name is not None and str(name) != _coerce_collection_schema(schema).name:
+            raise ValueError("name must match schema.name when schema is provided")
+        return create_lance_collection(path, schema, [])
+    if name is not None:
+        raise ValueError("name is only supported when creating Lance storage")
     core_collection = _native_module.create_and_open(
         path,
         _schema_to_native(schema),
@@ -928,6 +960,132 @@ def create_and_open(path, schema, option: CollectionOption | None = None):
     return Collection._from_core(core_collection, schema=schema)
 
 
-def open(path, option: CollectionOption | None = None):
+def open(
+    path,
+    option: CollectionOption | None = None,
+    *,
+    storage="hannsdb",
+    schema=None,
+    name=None,
+):
+    storage = _normalize_storage(storage)
+    if storage == "lance":
+        return open_lance_collection(path, schema, name=name)
+    if name is not None:
+        raise ValueError("name is only supported when opening Lance storage")
     core_collection = _native_module.open(path, _native_value(option))
     return Collection._from_core(core_collection)
+
+
+class LanceCollection:
+    def __init__(self, core_collection, schema: CollectionSchema):
+        self._core = core_collection
+        self._schema = _coerce_collection_schema(schema)
+        self._core_lock = threading.RLock()
+
+    @property
+    def name(self) -> str:
+        return self._core.name
+
+    @property
+    def uri(self) -> str:
+        return self._core.uri
+
+    @property
+    def schema(self) -> CollectionSchema:
+        return self._schema
+
+    def insert(self, docs):
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
+        with self._core_lock:
+            return MutationResult(self._core.insert(_coerce_docs_to_native(coerced)))
+
+    def upsert(self, docs):
+        coerced = []
+        for doc in _coerce_docs_input(docs):
+            _validate_doc_nullable_fields(doc, self._schema, is_insert=True)
+            coerced.append(_coerce_doc_to_collection_schema(doc, self._schema))
+        with self._core_lock:
+            return MutationResult(self._core.upsert(_coerce_docs_to_native(coerced)))
+
+    def fetch(self, ids):
+        single_id, ids = _coerce_id_input(ids)
+        with self._core_lock:
+            result = _wrap_doc_result(self._core.fetch(ids))
+        if single_id:
+            return result[0] if result else None
+        return result
+
+    def delete(self, ids):
+        _, ids = _coerce_id_input(ids)
+        with self._core_lock:
+            return MutationResult(self._core.delete(ids))
+
+    def hanns_index_path(self, field_name):
+        return Path(self._core.hanns_index_path(field_name))
+
+    def optimize_hanns(self, field_name, metric="l2"):
+        with self._core_lock:
+            return self._core.optimize_hanns(field_name, metric)
+
+    def search(self, vector, topk=10, metric="l2"):
+        with self._core_lock:
+            return _wrap_doc_result(self._core.search(vector, topk, metric))
+
+    def destroy(self):
+        with self._core_lock:
+            return self._core.destroy()
+
+
+def create_lance_collection(path, schema, docs):
+    coerced_schema = _coerce_collection_schema(schema)
+    coerced_docs = []
+    for doc in _coerce_docs_input(docs):
+        _validate_doc_nullable_fields(doc, coerced_schema, is_insert=True)
+        coerced_docs.append(_coerce_doc_to_collection_schema(doc, coerced_schema))
+    core_collection = _native_module.create_lance_collection(
+        path,
+        _schema_to_native(coerced_schema),
+        _coerce_docs_to_native(coerced_docs),
+    )
+    return LanceCollection(core_collection, coerced_schema)
+
+
+def _infer_single_lance_collection_name(path) -> str:
+    collections_dir = Path(path) / "collections"
+    names = sorted(
+        child.name[: -len(".lance")]
+        for child in collections_dir.glob("*.lance")
+        if child.is_dir()
+    )
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        raise ValueError(
+            f"cannot infer Lance collection schema: no .lance datasets found under {collections_dir}"
+        )
+    raise ValueError(
+        "cannot infer Lance collection schema: multiple .lance datasets found; pass name explicitly"
+    )
+
+
+def open_lance_collection(path, schema=None, *, name=None):
+    if schema is None:
+        collection_name = (
+            str(name) if name is not None else _infer_single_lance_collection_name(path)
+        )
+        core_collection = _native_module.open_lance_collection_infer_schema(
+            path, collection_name
+        )
+        return LanceCollection(core_collection, core_collection.schema)
+    coerced_schema = _coerce_collection_schema(schema)
+    if name is not None and str(name) != coerced_schema.name:
+        raise ValueError("name must match schema.name when schema is provided")
+    core_collection = _native_module.open_lance_collection(
+        path,
+        _schema_to_native(coerced_schema),
+    )
+    return LanceCollection(core_collection, coerced_schema)

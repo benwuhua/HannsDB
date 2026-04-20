@@ -1,4 +1,4 @@
-from .collection import Collection
+from .collection import Collection, LanceCollection
 from .doc import Doc
 from .param import (
     AddColumnOption,
@@ -26,6 +26,7 @@ from .schema import CollectionSchema, CollectionStats, FieldSchema, VectorSchema
 
 __all__ = [
     "Collection",
+    "LanceCollection",
     "CollectionSchema",
     "CollectionStats",
     "AddColumnOption",

@@ -362,6 +362,20 @@ Current verified `knowhere-rs` findings already influenced HannsDB design:
 
 ## 10. Main risks
 
+## 10a. Lance-compatible storage direction
+
+The long-term storage direction is to make HannsDB a Lance-compatible local vector database facade. HannsDB should depend on upstream Lance crates for canonical persisted dataset format, while HannsDB owns the API/runtime facade and Hanns owns ANN acceleration.
+
+The current implementation is still experimental and feature-gated behind `lance-storage`, but it has moved beyond a storage-only prototype:
+
+- `LanceDatasetStore` writes and appends real Lance datasets through upstream `lance::Dataset` APIs.
+- `LanceCollection` provides a basic HannsDB-facing facade over Lance storage: create/open/insert/fetch/search/delete/upsert.
+- Python exposes `create_lance_collection`, `open_lance_collection`, and `LanceCollection`.
+- External Python `pylance` can open HannsDB-written datasets with `lance.dataset(collection.uri)`, count rows, and materialize Arrow tables.
+- With `hanns-backend`, `LanceCollection::optimize_hanns` builds a Hanns HNSW sidecar under `_hannsdb/ann/`; sidecars are invalidated after insert/delete/upsert.
+
+Still out of scope for the current experimental path: replacing the default `HannsDb` runtime, string primary keys, full schema coverage, Lance `IndexMetadata` integration for Hanns sidecars, daemon routing, legacy migration, and production-grade lifecycle/cleanup semantics.
+
 ### Risk 1: optimize cost dominates at target scale
 
 The current biggest technical risk is not correctness. It is the cost of building the ANN state for `50K / 1536 / cosine`.
@@ -387,6 +401,8 @@ The current project direction is:
 - benchmark through the Python embedded path first
 - keep daemon thin until core durability and benchmark path are stable
 - treat `knowhere-rs` verification as part of the product roadmap, not external maintenance
+- make new storage work Lance-compatible by using upstream Lance dataset writers/readers instead of extending HannsDB-only segment files
+- keep Hanns index artifacts optional and ignorable by Lance readers until a safe Lance `IndexMetadata` integration is proven
 
 ## 12. Companion docs
 

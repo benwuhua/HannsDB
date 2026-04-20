@@ -280,6 +280,7 @@ pub fn estimate_row_bytes(row: &ForwardRow) -> usize {
 
 fn estimate_field_value_bytes(value: &FieldValue) -> usize {
     match value {
+        FieldValue::Null => 0,
         FieldValue::String(value) => value.len(),
         FieldValue::Int64(_) => std::mem::size_of::<i64>(),
         FieldValue::Int32(_) => std::mem::size_of::<i32>(),
