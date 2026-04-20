@@ -2,7 +2,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 #[cfg(feature = "lance-storage")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 
 use axum::extract::{rejection::JsonRejection, Path as AxumPath, State};
@@ -220,22 +220,25 @@ async fn search_records_legacy(
         let lance = super::routes::open_lance_collection(state, collection).await?;
         let metric =
             super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
-        let hits = lance
-            .search_filtered(&request.vector, request.top_k, &metric, filter.as_ref())
+        let projection = lance_search_projection(lance.schema(), output_fields, None, None, None);
+        let result = lance
+            .search_vector_field_filtered_projected(
+                lance.schema().primary_vector_name(),
+                &request.vector,
+                request.top_k,
+                &metric,
+                filter.as_ref(),
+                projection,
+            )
             .await?;
-        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
-        let scores = hits
-            .iter()
-            .map(|hit| (hit.id, hit.distance))
-            .collect::<BTreeMap<_, _>>();
-        let docs = lance.fetch_documents(&ids).await?;
-        return Ok(docs
+        return Ok(result
+            .documents
             .into_iter()
             .map(|document| SearchHitResponse {
-                id: document.id.to_string(),
-                distance: scores.get(&document.id).copied().unwrap_or_default(),
+                id: document.document.id.to_string(),
+                distance: document.distance,
                 fields: if include_fields {
-                    select_output_fields(&document.fields, output_fields)
+                    select_output_fields(&document.document.fields, output_fields)
                 } else {
                     BTreeMap::new()
                 },
@@ -401,26 +404,39 @@ async fn search_records_typed_lance(
     } else {
         request.top_k
     };
-    let hits = lance
-        .search_vector_field_filtered(
+    let projection = lance_search_projection(
+        lance.schema(),
+        output_fields,
+        request
+            .group_by
+            .as_ref()
+            .map(|group_by| group_by.field_name.as_str()),
+        request
+            .order_by
+            .as_ref()
+            .map(|order_by| order_by.field_name.as_str()),
+        if request.include_vector {
+            Some(lance.schema().primary_vector_name())
+        } else {
+            None
+        },
+    );
+    let result = lance
+        .search_vector_field_filtered_projected(
             &query.field_name,
             &query.vector,
             raw_top_k,
             &metric,
             filter.as_ref(),
+            projection,
         )
         .await?;
-    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
-    let scores = hits
-        .iter()
-        .map(|hit| (hit.id, hit.distance))
-        .collect::<BTreeMap<_, _>>();
-    let docs = lance.fetch_documents(&ids).await?;
-    let mut scored_documents = docs
+    let mut scored_documents = result
+        .documents
         .into_iter()
         .map(|document| LanceScoredDocument {
-            distance: scores.get(&document.id).copied().unwrap_or_default(),
-            document,
+            distance: document.distance,
+            document: document.document,
             group_key: None,
         })
         .collect::<Vec<_>>();
@@ -462,6 +478,36 @@ async fn search_records_typed_lance(
             group_key: document.group_key.map(super::routes::field_value_to_json),
         })
         .collect())
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_search_projection(
+    schema: &hannsdb_core::document::CollectionSchema,
+    output_fields: Option<&[String]>,
+    group_by_field: Option<&str>,
+    order_by_field: Option<&str>,
+    include_vector_field: Option<&str>,
+) -> hannsdb_core::storage::lance_store::LanceSearchProjection {
+    let mut output = BTreeSet::new();
+    if let Some(fields) = output_fields {
+        output.extend(fields.iter().cloned());
+    }
+    let mut projection =
+        hannsdb_core::storage::lance_store::LanceSearchProjection::with_output_fields(output);
+    if let Some(field) = group_by_field {
+        if schema.fields.iter().any(|scalar| scalar.name == field) {
+            projection.required_fields.insert(field.to_string());
+        }
+    }
+    if let Some(field) = order_by_field {
+        if schema.fields.iter().any(|scalar| scalar.name == field) {
+            projection.required_fields.insert(field.to_string());
+        }
+    }
+    if let Some(field) = include_vector_field {
+        projection.required_vectors.insert(field.to_string());
+    }
+    projection
 }
 
 #[cfg(feature = "lance-storage")]
