@@ -1223,7 +1223,41 @@ async fn create_lance_vector_index(
     collection: String,
     request: VectorIndexRequest,
 ) -> Response {
-    if request.kind.trim().to_ascii_lowercase() != "hnsw" {
+    let kind = request.kind.trim().to_ascii_lowercase();
+    if matches!(kind.as_str(), "bm25" | "sparse_inverted" | "sparse_wand") {
+        if request
+            .params
+            .as_object()
+            .is_some_and(|params| !params.is_empty())
+        {
+            return daemon_storage_error_response(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Lance sparse sidecar index supports only default params",
+            ));
+        }
+        let lance = match open_lance_collection(&state, &collection).await {
+            Ok(lance) => lance,
+            Err(error) => return daemon_storage_error_response(error),
+        };
+        let metric = request.metric.unwrap_or_else(|| {
+            if kind == "bm25" {
+                "bm25".to_string()
+            } else {
+                "ip".to_string()
+            }
+        });
+        return match lance.optimize_sparse(&request.field_name, &metric).await {
+            Ok(()) => (
+                StatusCode::CREATED,
+                Json(CreateIndexResponse {
+                    field_name: request.field_name,
+                }),
+            )
+                .into_response(),
+            Err(error) => daemon_storage_error_response(error),
+        };
+    }
+    if kind != "hnsw" {
         return daemon_storage_error_response(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -1239,13 +1273,29 @@ async fn create_lance_vector_index(
     {
         return daemon_storage_error_response(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Lance Hanns sidecar vector index supports only default params",
+            "Lance sidecar vector indexes support only default params",
         ));
     }
+
     let lance = match open_lance_collection(&state, &collection).await {
         Ok(lance) => lance,
         Err(error) => return daemon_storage_error_response(error),
     };
+    let vector_schema = match lance
+        .schema()
+        .vectors
+        .iter()
+        .find(|vector| vector.name == request.field_name)
+    {
+        Some(vector) => vector,
+        None => {
+            return daemon_storage_error_response(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vector field not found: {}", request.field_name),
+            ))
+        }
+    };
+    let kind = request.kind.trim().to_ascii_lowercase();
     let metric = match request.metric {
         Some(metric) => metric,
         None => match lance_collection_metric(&state, &collection, lance.schema().metric()) {
@@ -1253,7 +1303,32 @@ async fn create_lance_vector_index(
             Err(error) => return daemon_storage_error_response(error),
         },
     };
-    match lance.optimize_hanns(&request.field_name, &metric).await {
+
+    let result = if matches!(vector_schema.data_type, FieldType::VectorSparse) {
+        if kind != "bm25" {
+            return daemon_storage_error_response(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Lance sparse sidecar vector index supports only bm25 kind, got: {}",
+                    request.kind
+                ),
+            ));
+        }
+        lance.optimize_sparse(&request.field_name, &metric).await
+    } else {
+        if kind != "hnsw" {
+            return daemon_storage_error_response(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Lance Hanns sidecar vector index supports only hnsw kind, got: {}",
+                    request.kind
+                ),
+            ));
+        }
+        lance.optimize_hanns(&request.field_name, &metric).await
+    };
+
+    match result {
         Ok(()) => (
             StatusCode::CREATED,
             Json(CreateIndexResponse {

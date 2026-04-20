@@ -384,8 +384,6 @@ async fn search_records_typed_lance(
     collection: &str,
     request: TypedSearchRequest,
 ) -> io::Result<Vec<SearchHitResponse>> {
-    validate_lance_rrf_reranker(request.reranker.as_ref())?;
-
     let filter = request
         .filter
         .as_deref()
@@ -396,43 +394,103 @@ async fn search_records_typed_lance(
     let output_fields = request.output_fields.as_deref();
     let include_fields = matches!(output_fields, Some(fields) if !fields.is_empty());
     let lance = super::routes::open_lance_collection(state, collection).await?;
-    let metric =
+    let default_metric =
         super::routes::lance_collection_metric(state, collection, lance.schema().metric())?;
-    let mut scored_documents = if request.query_by_id.is_some() {
-        let query = lance_typed_query_vector(&lance, &request).await?;
-        let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
-            lance.count_rows().await?
+    let recall_sources = lance_typed_recall_sources(&lance, &request, &default_metric).await?;
+    let reranker = lance_reranker_from_request(request.reranker.as_ref(), &recall_sources)?;
+
+    let needs_post_processing = request.group_by.is_some() || request.order_by.is_some();
+    let raw_top_k = if needs_post_processing {
+        lance.count_rows().await?
+    } else {
+        request.top_k
+    };
+    let projection = lance_search_projection(
+        lance.schema(),
+        output_fields,
+        request
+            .group_by
+            .as_ref()
+            .map(|group_by| group_by.field_name.as_str()),
+        request
+            .order_by
+            .as_ref()
+            .map(|order_by| order_by.field_name.as_str()),
+        if request.include_vector {
+            Some(lance.schema().primary_vector_name())
         } else {
-            request.top_k
+            None
+        },
+    );
+
+    let mut recall_results = Vec::with_capacity(recall_sources.len());
+    for source in &recall_sources {
+        let result = match &source.vector {
+            LanceRecallVector::Dense(vector) => {
+                lance
+                    .search_vector_field_filtered_projected(
+                        &source.field_name,
+                        vector,
+                        raw_top_k,
+                        &source.metric,
+                        filter.as_ref(),
+                        projection.clone(),
+                    )
+                    .await?
+            }
+            LanceRecallVector::Sparse(sparse) => {
+                if filter.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Lance sparse vector recall does not support filters yet",
+                    ));
+                }
+                #[cfg(feature = "hanns-backend")]
+                {
+                    lance
+                        .search_sparse_vector_field_projected(
+                            &source.field_name,
+                            sparse,
+                            raw_top_k,
+                            &source.metric,
+                            projection.clone(),
+                        )
+                        .await?
+                }
+                #[cfg(not(feature = "hanns-backend"))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Lance sparse vector recall requires hanns-backend",
+                    ));
+                }
+            }
         };
-        let projection = lance_search_projection(
-            lance.schema(),
-            output_fields,
-            request
-                .group_by
-                .as_ref()
-                .map(|group_by| group_by.field_name.as_str()),
-            request
-                .order_by
-                .as_ref()
-                .map(|order_by| order_by.field_name.as_str()),
-            if request.include_vector {
-                Some(lance.schema().primary_vector_name())
-            } else {
-                None
-            },
-        );
-        let result = lance
-            .search_vector_field_filtered_projected(
-                &query.field_name,
-                &query.vector,
-                raw_top_k,
-                &metric,
-                filter.as_ref(),
-                projection,
-            )
-            .await?;
-        let mut scored_documents = result
+        recall_results.push(LanceRecallResult {
+            field_name: source.field_name.clone(),
+            metric: source.metric.clone(),
+            documents: result.documents,
+        });
+    }
+
+    let should_fuse = reranker.is_some();
+    let fusion_limit = if needs_post_processing {
+        usize::MAX
+    } else {
+        request.top_k
+    };
+    let mut scored_documents = if should_fuse {
+        fuse_lance_recall_results(
+            recall_results,
+            reranker.expect("reranker checked above"),
+            fusion_limit,
+        )
+    } else {
+        let mut recall_results = recall_results;
+        let result = recall_results
+            .pop()
+            .expect("at least one recall source is required");
+        result
             .documents
             .into_iter()
             .map(|document| LanceScoredDocument {
@@ -440,126 +498,26 @@ async fn search_records_typed_lance(
                 document: document.document,
                 group_key: None,
             })
-            .collect::<Vec<_>>();
-        apply_lance_order_by(
-            &mut scored_documents,
-            lance.schema(),
-            request.order_by.as_ref(),
-        )?;
-        apply_lance_group_by(
-            scored_documents,
-            lance.schema(),
-            request.group_by.as_ref(),
-            request.top_k,
-        )?
-    } else {
-        let queries = lance_typed_query_vectors(&lance, &request)?;
-        if queries.len() > 1 {
-            if request.group_by.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Lance daemon typed multi-query search does not support group_by yet",
-                ));
-            }
-            if request.order_by.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Lance daemon typed multi-query search does not support order_by yet",
-                ));
-            }
-            let projection = lance_search_projection(
-                lance.schema(),
-                output_fields,
-                None,
-                None,
-                if request.include_vector {
-                    Some(lance.schema().primary_vector_name())
-                } else {
-                    None
-                },
-            );
-            let mut recall_lists = Vec::with_capacity(queries.len());
-            for query in &queries {
-                let result = lance
-                    .search_vector_field_filtered_projected(
-                        &query.field_name,
-                        &query.vector,
-                        request.top_k,
-                        &metric,
-                        filter.as_ref(),
-                        projection.clone(),
-                    )
-                    .await?;
-                recall_lists.push(result.documents);
-            }
-            fuse_lance_rrf(
-                recall_lists,
-                request
-                    .reranker
-                    .as_ref()
-                    .and_then(|reranker| reranker.rank_constant)
-                    .unwrap_or(DEFAULT_LANCE_RRF_RANK_CONSTANT),
-                request.top_k,
-            )
-        } else {
-            let [query] = queries.as_slice() else {
-                unreachable!("lance_typed_query_vectors returns at least one query")
-            };
-            let projection = lance_search_projection(
-                lance.schema(),
-                output_fields,
-                request
-                    .group_by
-                    .as_ref()
-                    .map(|group_by| group_by.field_name.as_str()),
-                request
-                    .order_by
-                    .as_ref()
-                    .map(|order_by| order_by.field_name.as_str()),
-                if request.include_vector {
-                    Some(lance.schema().primary_vector_name())
-                } else {
-                    None
-                },
-            );
-            let raw_top_k = if request.group_by.is_some() || request.order_by.is_some() {
-                lance.count_rows().await?
-            } else {
-                request.top_k
-            };
-            let result = lance
-                .search_vector_field_filtered_projected(
-                    &query.field_name,
-                    &query.vector,
-                    raw_top_k,
-                    &metric,
-                    filter.as_ref(),
-                    projection,
-                )
-                .await?;
-            let mut scored_documents = result
-                .documents
-                .into_iter()
-                .map(|document| LanceScoredDocument {
-                    distance: document.distance,
-                    document: document.document,
-                    group_key: None,
-                })
-                .collect::<Vec<_>>();
-            apply_lance_order_by(
-                &mut scored_documents,
-                lance.schema(),
-                request.order_by.as_ref(),
-            )?;
-            apply_lance_group_by(
-                scored_documents,
-                lance.schema(),
-                request.group_by.as_ref(),
-                request.top_k,
-            )?
-        }
+            .collect()
     };
-    if request.group_by.is_none() && scored_documents.len() > request.top_k {
+
+    let group_limit = if request.order_by.is_some() {
+        usize::MAX
+    } else {
+        request.top_k
+    };
+    scored_documents = apply_lance_group_by(
+        scored_documents,
+        lance.schema(),
+        request.group_by.as_ref(),
+        group_limit,
+    )?;
+    apply_lance_order_by(
+        &mut scored_documents,
+        lance.schema(),
+        request.order_by.as_ref(),
+    )?;
+    if scored_documents.len() > request.top_k {
         scored_documents.truncate(request.top_k);
     }
 
@@ -619,36 +577,52 @@ fn lance_search_projection(
 }
 
 #[cfg(feature = "lance-storage")]
-fn fuse_lance_rrf(
-    recall_lists: Vec<Vec<hannsdb_core::storage::lance_store::LanceSearchDocument>>,
-    rank_constant: u64,
+fn fuse_lance_recall_results(
+    recall_results: Vec<LanceRecallResult>,
+    reranker: LanceReranker,
     top_k: usize,
 ) -> Vec<LanceScoredDocument> {
-    let rank_constant = rank_constant as f32;
     let mut by_id =
-        std::collections::BTreeMap::<i64, (f32, hannsdb_core::document::Document)>::new();
-    for recall_list in recall_lists {
-        for (rank, document) in recall_list.into_iter().enumerate() {
-            let contribution = 1.0 / (rank_constant + rank as f32 + 1.0);
+        std::collections::BTreeMap::<i64, (f64, hannsdb_core::document::Document)>::new();
+
+    for result in recall_results {
+        let weight = match &reranker {
+            LanceReranker::Rrf { .. } => 1.0,
+            LanceReranker::Weighted { weights, .. } => {
+                weights.get(&result.field_name).copied().unwrap_or(1.0)
+            }
+        };
+        let metric = match &reranker {
+            LanceReranker::Rrf { .. } => result.metric.as_str(),
+            LanceReranker::Weighted {
+                metric_override, ..
+            } => metric_override.as_deref().unwrap_or(result.metric.as_str()),
+        };
+        for (rank, document) in result.documents.into_iter().enumerate() {
+            let contribution = match &reranker {
+                LanceReranker::Rrf { rank_constant } => {
+                    1.0 / (*rank_constant as f64 + rank as f64 + 1.0)
+                }
+                LanceReranker::Weighted { .. } => {
+                    weight * normalize_lance_distance(document.distance, metric)
+                }
+            };
             let entry = by_id
                 .entry(document.document.id)
                 .or_insert_with(|| (0.0, document.document.clone()));
             entry.0 += contribution;
         }
     }
+
     let mut fused = by_id
         .into_iter()
         .map(|(_id, (score, document))| LanceScoredDocument {
             document,
-            distance: -score,
+            distance: -(score as f32),
             group_key: None,
         })
         .collect::<Vec<_>>();
-    fused.sort_by(|left, right| {
-        left.distance
-            .total_cmp(&right.distance)
-            .then_with(|| left.document.id.cmp(&right.document.id))
-    });
+    fused.sort_by(compare_lance_scored_documents);
     if fused.len() > top_k {
         fused.truncate(top_k);
     }
@@ -656,22 +630,83 @@ fn fuse_lance_rrf(
 }
 
 #[cfg(feature = "lance-storage")]
+fn normalize_lance_distance(distance: f32, metric: &str) -> f64 {
+    let distance = distance as f64;
+    match metric {
+        "l2" => 1.0 - 2.0 * distance.atan() / std::f64::consts::PI,
+        "ip" => 0.5 + distance.atan() / std::f64::consts::PI,
+        "cosine" => 1.0 - distance / 2.0,
+        _ => 1.0 - distance,
+    }
+}
+
+#[cfg(feature = "lance-storage")]
 const DEFAULT_LANCE_RRF_RANK_CONSTANT: u64 = 60;
 
 #[cfg(feature = "lance-storage")]
-fn validate_lance_rrf_reranker(
+enum LanceReranker {
+    Rrf {
+        rank_constant: u64,
+    },
+    Weighted {
+        weights: BTreeMap<String, f64>,
+        metric_override: Option<String>,
+    },
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_reranker_from_request(
     reranker: Option<&crate::api::TypedQueryRerankerRequest>,
-) -> io::Result<()> {
+    recall_sources: &[LanceRecallSource],
+) -> io::Result<Option<LanceReranker>> {
     let Some(reranker) = reranker else {
-        return Ok(());
+        return Ok((recall_sources.len() > 1).then_some(LanceReranker::Rrf {
+            rank_constant: DEFAULT_LANCE_RRF_RANK_CONSTANT,
+        }));
     };
-    if !reranker.weights.is_empty() || reranker.metric.is_some() {
+
+    if !reranker.weights.is_empty() {
+        if recall_sources.iter().any(LanceRecallSource::is_sparse) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "weighted reranker does not support sparse/BM25 Lance recall",
+            ));
+        }
+        let metric_override = reranker
+            .metric
+            .as_deref()
+            .map(validate_lance_metric_override)
+            .transpose()?;
+        return Ok(Some(LanceReranker::Weighted {
+            weights: reranker.weights.clone(),
+            metric_override,
+        }));
+    }
+
+    if reranker.metric.is_some() {
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only RRF reranker",
+            io::ErrorKind::InvalidInput,
+            "reranker metric override requires weighted reranker weights",
         ));
     }
-    Ok(())
+
+    Ok(Some(LanceReranker::Rrf {
+        rank_constant: reranker
+            .rank_constant
+            .unwrap_or(DEFAULT_LANCE_RRF_RANK_CONSTANT),
+    }))
+}
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_metric_override(metric: &str) -> io::Result<String> {
+    let metric = metric.trim().to_ascii_lowercase();
+    match metric.as_str() {
+        "l2" | "ip" | "cosine" => Ok(metric),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported reranker metric override: {metric}"),
+        )),
+    }
 }
 
 #[cfg(feature = "lance-storage")]
@@ -916,166 +951,313 @@ impl LanceFloatGroupKey {
 }
 
 #[cfg(feature = "lance-storage")]
-struct LanceTypedQueryVector {
+struct LanceRecallSource {
     field_name: String,
-    vector: Vec<f32>,
+    vector: LanceRecallVector,
+    metric: String,
 }
 
 #[cfg(feature = "lance-storage")]
-fn lance_typed_query_vectors(
+enum LanceRecallVector {
+    Dense(Vec<f32>),
+    Sparse(hannsdb_core::document::SparseVector),
+}
+
+#[cfg(feature = "lance-storage")]
+impl LanceRecallSource {
+    fn is_sparse(&self) -> bool {
+        matches!(self.vector, LanceRecallVector::Sparse(_))
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+struct LanceRecallResult {
+    field_name: String,
+    metric: String,
+    documents: Vec<hannsdb_core::storage::lance_store::LanceSearchDocument>,
+}
+
+#[cfg(feature = "lance-storage")]
+async fn lance_typed_recall_sources(
     lance: &hannsdb_core::storage::lance_store::LanceCollection,
     request: &TypedSearchRequest,
-) -> io::Result<Vec<LanceTypedQueryVector>> {
-    if request.query_by_id_field_name.is_some() {
+    default_metric: &str,
+) -> io::Result<Vec<LanceRecallSource>> {
+    let mut sources = Vec::new();
+    for query in &request.queries {
+        sources.push(lance_typed_query_from_request(
+            lance,
+            query,
+            default_metric,
+        )?);
+    }
+
+    if let Some(ids) = request.query_by_id.as_ref() {
+        sources.extend(lance_typed_query_by_id_sources(lance, request, ids, default_metric).await?);
+    } else if request.query_by_id_field_name.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "query_by_id_field_name requires query_by_id",
         ));
     }
-    if request.queries.is_empty() {
+
+    if sources.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Lance daemon typed search requires at least one query",
+            "Lance daemon typed search requires at least one query or query_by_id",
         ));
     }
-    request
-        .queries
-        .iter()
-        .map(|query| lance_typed_query_from_request(lance, query))
-        .collect()
+    Ok(sources)
 }
 
 #[cfg(feature = "lance-storage")]
 fn lance_typed_query_from_request(
     lance: &hannsdb_core::storage::lance_store::LanceCollection,
     query: &crate::api::TypedVectorQueryRequest,
-) -> io::Result<LanceTypedQueryVector> {
-    if query.sparse_vector.is_some() || query.param.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search supports only dense vectors without query params",
-        ));
-    }
-    let vector = query.vector.clone().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Lance daemon typed search requires a dense vector",
-        )
-    })?;
-    let vector_schema = lance
-        .schema()
-        .vectors
-        .iter()
-        .find(|vector| vector.name == query.field_name)
-        .ok_or_else(|| {
-            io::Error::new(
+    default_metric: &str,
+) -> io::Result<LanceRecallSource> {
+    match (&query.vector, &query.sparse_vector) {
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("query vector field '{}' is not defined", query.field_name),
-            )
-        })?;
-    if vector.len() != vector_schema.dimension {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "query vector dimension mismatch for field '{}': expected {}, got {}",
-                query.field_name,
-                vector_schema.dimension,
-                vector.len()
-            ),
-        ));
+                "typed query must provide either vector or sparse_vector, not both",
+            ));
+        }
+        (Some(vector), None) => {
+            validate_lance_query_param(query.param.as_ref())?;
+            return lance_typed_dense_source(
+                lance,
+                query.field_name.trim(),
+                vector.clone(),
+                default_metric,
+                "query vector",
+            );
+        }
+        (None, Some(sparse)) => {
+            if query.param.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Lance sparse/BM25 recall does not accept dense query params",
+                ));
+            }
+            return lance_typed_sparse_source(
+                lance,
+                query.field_name.trim(),
+                sparse,
+                "query sparse vector",
+            );
+        }
+        (None, None) => {}
     }
-    Ok(LanceTypedQueryVector {
-        field_name: query.field_name.clone(),
-        vector,
-    })
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Lance daemon typed search requires a vector or sparse_vector",
+    ))
 }
 
 #[cfg(feature = "lance-storage")]
-async fn lance_typed_query_vector(
+async fn lance_typed_query_by_id_sources(
     lance: &hannsdb_core::storage::lance_store::LanceCollection,
     request: &TypedSearchRequest,
-) -> io::Result<LanceTypedQueryVector> {
-    if let Some(ids) = request.query_by_id.as_ref() {
-        if !request.queries.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Lance daemon typed search cannot mix queries with query_by_id",
-            ));
-        }
-        let [id] = ids.as_slice() else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Lance daemon typed search supports exactly one query_by_id",
-            ));
-        };
-        let id = id.parse::<i64>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid id, expected i64 string: {id}"),
-            )
-        })?;
-        let field_name = match request.query_by_id_field_name.as_deref() {
-            Some(field_name) => {
-                let field_name = field_name.trim();
-                if field_name.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "query_by_id_field_name must not be empty",
-                    ));
-                }
-                field_name.to_string()
+    ids: &[String],
+    default_metric: &str,
+) -> io::Result<Vec<LanceRecallSource>> {
+    if ids.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query_by_id requires at least one id",
+        ));
+    }
+    let field_name = match request.query_by_id_field_name.as_deref() {
+        Some(field_name) => {
+            let field_name = field_name.trim();
+            if field_name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "query_by_id_field_name must not be empty",
+                ));
             }
-            None => lance.schema().primary_vector_name().to_string(),
-        };
-        let vector_schema = lance
-            .schema()
-            .vectors
-            .iter()
-            .find(|vector| vector.name == field_name)
-            .ok_or_else(|| {
+            field_name.to_string()
+        }
+        None => lance.schema().primary_vector_name().to_string(),
+    };
+    let parsed_ids = ids
+        .iter()
+        .map(|id| {
+            id.parse::<i64>().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("query_by_id field '{field_name}' is not defined"),
+                    format!("invalid id, expected i64 string: {id}"),
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let documents = lance.fetch_documents(&parsed_ids).await?;
+    let mut sources = Vec::with_capacity(parsed_ids.len());
+    for id in &parsed_ids {
+        let document = documents
+            .iter()
+            .find(|document| document.id == *id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("document not found for query_by_id: {id}"),
                 )
             })?;
-        let docs = lance.fetch_documents(&[id]).await?;
-        let document = docs.first().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("document not found for query_by_id: {id}"),
-            )
-        })?;
         let vector = document.vectors.get(&field_name).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("query_by_id document is missing vector field '{field_name}'"),
             )
         })?;
-        if vector.len() != vector_schema.dimension {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "query_by_id vector dimension mismatch for field '{field_name}': expected {}, got {}",
-                    vector_schema.dimension,
-                    vector.len()
-                ),
-            ));
-        }
-        return Ok(LanceTypedQueryVector { field_name, vector });
+        sources.push(lance_typed_dense_source(
+            lance,
+            &field_name,
+            vector,
+            default_metric,
+            "query_by_id vector",
+        )?);
     }
+    Ok(sources)
+}
 
-    if request.query_by_id_field_name.is_some() {
+#[cfg(feature = "lance-storage")]
+fn lance_typed_dense_source(
+    lance: &hannsdb_core::storage::lance_store::LanceCollection,
+    field_name: &str,
+    vector: Vec<f32>,
+    default_metric: &str,
+    label: &str,
+) -> io::Result<LanceRecallSource> {
+    if field_name.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "query_by_id_field_name requires query_by_id",
+            "query vector field name must not be empty",
         ));
     }
-
-    let [query] = request.queries.as_slice() else {
+    let vector_schema = lance
+        .schema()
+        .vectors
+        .iter()
+        .find(|vector| vector.name == field_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("query vector field '{field_name}' is not defined"),
+            )
+        })?;
+    if vector.len() != vector_schema.dimension {
         return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Lance daemon typed search requires exactly one query",
+            if label == "query_by_id vector" {
+                io::ErrorKind::InvalidData
+            } else {
+                io::ErrorKind::InvalidInput
+            },
+            format!(
+                "{label} dimension mismatch for field '{field_name}': expected {}, got {}",
+                vector_schema.dimension,
+                vector.len()
+            ),
         ));
+    }
+    if !matches!(
+        vector_schema.data_type,
+        hannsdb_core::document::FieldType::VectorFp32
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("dense query vector provided for non-dense field '{field_name}'"),
+        ));
+    }
+    Ok(LanceRecallSource {
+        field_name: field_name.to_string(),
+        vector: LanceRecallVector::Dense(vector),
+        metric: vector_schema
+            .metric()
+            .unwrap_or(default_metric)
+            .to_ascii_lowercase(),
+    })
+}
+
+#[cfg(feature = "lance-storage")]
+fn lance_typed_sparse_source(
+    lance: &hannsdb_core::storage::lance_store::LanceCollection,
+    field_name: &str,
+    sparse: &crate::api::SparseVectorRequest,
+    label: &str,
+) -> io::Result<LanceRecallSource> {
+    if field_name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query sparse vector field name must not be empty",
+        ));
+    }
+    let vector_schema = lance
+        .schema()
+        .vectors
+        .iter()
+        .find(|vector| vector.name == field_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("query sparse vector field '{field_name}' is not defined"),
+            )
+        })?;
+    if !matches!(
+        vector_schema.data_type,
+        hannsdb_core::document::FieldType::VectorSparse
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} provided for non-sparse field '{field_name}'"),
+        ));
+    }
+    if sparse.indices.len() != sparse.values.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{label} for field '{field_name}' has mismatched indices/values lengths: {} != {}",
+                sparse.indices.len(),
+                sparse.values.len()
+            ),
+        ));
+    }
+    let sparse =
+        hannsdb_core::document::SparseVector::new(sparse.indices.clone(), sparse.values.clone());
+    if !sparse.is_sorted() && !sparse.indices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} indices for field '{field_name}' must be strictly sorted"),
+        ));
+    }
+    Ok(LanceRecallSource {
+        field_name: field_name.to_string(),
+        vector: LanceRecallVector::Sparse(sparse),
+        metric: "ip".to_string(),
+    })
+}
+
+#[cfg(feature = "lance-storage")]
+fn validate_lance_query_param(
+    param: Option<&crate::api::TypedVectorQueryParamRequest>,
+) -> io::Result<()> {
+    let Some(param) = param else {
+        return Ok(());
     };
-    lance_typed_query_from_request(lance, query)
+    if matches!(param.ef_search, Some(0)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query param ef_search must be positive",
+        ));
+    }
+    if matches!(param.nprobe, Some(0)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "query param nprobe must be positive",
+        ));
+    }
+    // Dense Lance projected scans do not consume ef_search/nprobe today.  Accept
+    // positive values as explicit no-ops so typed API callers can use one query
+    // shape across Lance and non-Lance collections without losing validation.
+    Ok(())
 }

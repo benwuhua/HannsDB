@@ -6,6 +6,8 @@ use arrow_schema::{DataType, Field, Schema};
 use crate::document::{CollectionSchema, FieldType, ScalarFieldSchema, VectorFieldSchema};
 
 pub(crate) const LANCE_ID_COLUMN: &str = "id";
+pub(crate) const LANCE_SPARSE_INDICES_FIELD: &str = "indices";
+pub(crate) const LANCE_SPARSE_VALUES_FIELD: &str = "values";
 
 pub(crate) fn arrow_schema_for_lance(schema: &CollectionSchema) -> io::Result<Arc<Schema>> {
     let mut fields = Vec::with_capacity(1 + schema.fields.len() + schema.vectors.len());
@@ -48,13 +50,16 @@ pub(crate) fn arrow_schema_for_lance(schema: &CollectionSchema) -> io::Result<Ar
                 ));
             }
             FieldType::VectorSparse => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "sparse vectors are not supported by Lance storage P0: {}",
-                        vector.name
-                    ),
-                ));
+                if vector.dimension != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "sparse vector dimension must be zero for Lance storage: {}",
+                            vector.name
+                        ),
+                    ));
+                }
+                sparse_vector_data_type_for_lance()
             }
             _ => {
                 return Err(io::Error::new(
@@ -87,6 +92,16 @@ pub(crate) fn collection_schema_from_lance_arrow(arrow: &Schema) -> io::Result<C
     let mut vectors = Vec::new();
     for field in arrow.fields() {
         if field.name() == LANCE_ID_COLUMN {
+            continue;
+        }
+        if sparse_vector_shape(field.data_type())? {
+            vectors.push(VectorFieldSchema {
+                name: field.name().clone(),
+                data_type: FieldType::VectorSparse,
+                dimension: 0,
+                index_param: None,
+                bm25_params: None,
+            });
             continue;
         }
         if let Some(dimension) = vector_dimension(field.data_type())? {
@@ -152,6 +167,24 @@ pub(crate) fn scalar_data_type_for_lance(
     }
 }
 
+pub(crate) fn sparse_vector_data_type_for_lance() -> DataType {
+    DataType::Struct(
+        vec![
+            Field::new(
+                LANCE_SPARSE_INDICES_FIELD,
+                DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+                true,
+            ),
+            Field::new(
+                LANCE_SPARSE_VALUES_FIELD,
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+        ]
+        .into(),
+    )
+}
+
 fn scalar_field_type(data_type: &DataType) -> io::Result<FieldType> {
     match data_type {
         DataType::Utf8 => Ok(FieldType::String),
@@ -197,6 +230,43 @@ fn vector_dimension(data_type: &DataType) -> io::Result<Option<usize>> {
             "negative Lance vector dimension",
         )
     })
+}
+
+fn sparse_vector_shape(data_type: &DataType) -> io::Result<bool> {
+    let DataType::Struct(fields) = data_type else {
+        return Ok(false);
+    };
+    if fields.len() != 2 {
+        return Ok(false);
+    }
+    let indices = fields
+        .iter()
+        .find(|field| field.name() == LANCE_SPARSE_INDICES_FIELD);
+    let values = fields
+        .iter()
+        .find(|field| field.name() == LANCE_SPARSE_VALUES_FIELD);
+    let (Some(indices), Some(values)) = (indices, values) else {
+        return Ok(false);
+    };
+    if !matches!(
+        indices.data_type(),
+        DataType::List(item) if item.data_type() == &DataType::UInt32
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported Lance sparse vector indices shape",
+        ));
+    }
+    if !matches!(
+        values.data_type(),
+        DataType::List(item) if item.data_type() == &DataType::Float32
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported Lance sparse vector values shape",
+        ));
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -250,22 +320,38 @@ mod tests {
     }
 
     #[test]
-    fn lance_schema_rejects_sparse_vectors_in_p0() {
+    fn lance_schema_maps_sparse_vectors_to_arrow_struct_lists() {
         let schema = CollectionSchema {
             primary_vector: "dense".to_string(),
             fields: Vec::new(),
-            vectors: vec![VectorFieldSchema {
-                name: "dense".to_string(),
-                data_type: FieldType::VectorSparse,
-                dimension: 0,
-                index_param: None,
-                bm25_params: None,
-            }],
+            vectors: vec![
+                VectorFieldSchema::new("dense", 3),
+                VectorFieldSchema {
+                    name: "sparse_title".to_string(),
+                    data_type: FieldType::VectorSparse,
+                    dimension: 0,
+                    index_param: None,
+                    bm25_params: None,
+                },
+            ],
         };
 
-        let err = arrow_schema_for_lance(&schema).expect_err("sparse vector rejected");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("sparse vectors are not supported"));
+        let arrow = arrow_schema_for_lance(&schema).expect("sparse vector schema");
+        let sparse = arrow.field_with_name("sparse_title").unwrap();
+        let DataType::Struct(fields) = sparse.data_type() else {
+            panic!("expected sparse vector to be encoded as struct/list");
+        };
+
+        assert_eq!(fields[0].name(), "indices");
+        assert_eq!(
+            fields[0].data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::UInt32, true)))
+        );
+        assert_eq!(fields[1].name(), "values");
+        assert_eq!(
+            fields[1].data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
     }
 
     #[test]
@@ -295,5 +381,49 @@ mod tests {
         assert_eq!(schema.vectors.len(), 1);
         assert_eq!(schema.vectors[0].name, "dense");
         assert_eq!(schema.vectors[0].dimension, 2);
+    }
+
+    #[test]
+    fn lance_schema_infers_sparse_vector_fields_from_arrow_struct_lists() {
+        let arrow = Schema::new(vec![
+            Field::new(LANCE_ID_COLUMN, DataType::Int64, false),
+            Field::new(
+                "dense",
+                DataType::FixedSizeList(
+                    std::sync::Arc::new(Field::new("item", DataType::Float32, false)),
+                    2,
+                ),
+                false,
+            ),
+            Field::new(
+                "sparse_title",
+                DataType::Struct(
+                    vec![
+                        Field::new(
+                            "indices",
+                            DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+                            true,
+                        ),
+                        Field::new(
+                            "values",
+                            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]);
+
+        let schema = collection_schema_from_lance_arrow(&arrow).expect("infer schema");
+
+        assert_eq!(schema.primary_vector, "dense");
+        assert_eq!(schema.vectors.len(), 2);
+        assert_eq!(schema.vectors[0].name, "dense");
+        assert_eq!(schema.vectors[0].data_type, FieldType::VectorFp32);
+        assert_eq!(schema.vectors[1].name, "sparse_title");
+        assert_eq!(schema.vectors[1].data_type, FieldType::VectorSparse);
+        assert_eq!(schema.vectors[1].dimension, 0);
     }
 }

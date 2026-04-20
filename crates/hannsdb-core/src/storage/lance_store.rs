@@ -8,15 +8,20 @@ use arrow_array::{
         BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder,
         StringBuilder, UInt32Builder, UInt64Builder,
     },
+    types::{Float32Type, UInt32Type},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array,
     Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    UInt32Array, UInt64Array,
+    StructArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 #[cfg(feature = "hanns-backend")]
-use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
+use hannsdb_index::descriptor::{
+    SparseIndexDescriptor, SparseIndexKind, VectorIndexDescriptor, VectorIndexKind,
+};
 #[cfg(feature = "hanns-backend")]
 use hannsdb_index::factory::DefaultIndexFactory;
+#[cfg(feature = "hanns-backend")]
+use hannsdb_index::sparse::{SparseIndexBackend, SparseVectorData};
 use lance::dataset::{
     ColumnAlteration, MergeInsertBuilder, NewColumnTransform, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
@@ -24,10 +29,11 @@ use lance::dataset::{
 use lance::Dataset;
 use serde::{Deserialize, Serialize};
 
-use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
+use crate::document::{CollectionSchema, Document, FieldType, FieldValue, SparseVector};
 use crate::query::{distance_by_metric, ComparisonOp, FilterExpr, SearchHit};
 use crate::storage::lance_schema::{
     arrow_schema_for_lance, collection_schema_from_lance_arrow, scalar_data_type_for_lance,
+    sparse_vector_data_type_for_lance, LANCE_SPARSE_INDICES_FIELD, LANCE_SPARSE_VALUES_FIELD,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,12 +41,27 @@ pub struct LanceScanObservation {
     pub predicate: Option<String>,
     pub projected_columns: Vec<String>,
     pub fallback_reason: Option<String>,
+    pub sparse_index: Option<LanceSparseIndexObservation>,
 }
 
 impl LanceScanObservation {
     pub fn predicate_pushdown_used(&self) -> bool {
         self.predicate.is_some()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanceSparseIndexObservation {
+    pub field_name: String,
+    pub metric: String,
+    pub path: LanceSparseIndexPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanceSparseIndexPath {
+    Loaded,
+    RebuiltMissing,
+    RebuiltCorrupt,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,6 +170,16 @@ impl LanceCollection {
         self.store.optimize_hanns(field_name, metric).await
     }
 
+    #[cfg(feature = "hanns-backend")]
+    pub fn sparse_index_path(&self, field_name: &str) -> PathBuf {
+        self.store.sparse_index_path(field_name)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn optimize_sparse(&self, field_name: &str, metric: &str) -> io::Result<()> {
+        self.store.optimize_sparse(field_name, metric).await
+    }
+
     pub async fn insert_documents(&self, documents: &[Document]) -> io::Result<()> {
         self.store.append(documents).await
     }
@@ -221,6 +252,40 @@ impl LanceCollection {
                 field_name, projection, query, top_k, metric, filter,
             )
             .await
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn search_sparse_vector_field_projected(
+        &self,
+        field_name: &str,
+        query: &SparseVector,
+        top_k: usize,
+        metric: &str,
+        projection: LanceSearchProjection,
+    ) -> io::Result<LanceSearchResult> {
+        self.store
+            .search_sparse_vector_field_projected(field_name, query, top_k, metric, projection)
+            .await
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn search_sparse_vector_field(
+        &self,
+        field_name: &str,
+        query: &SparseVector,
+        top_k: usize,
+        metric: &str,
+    ) -> io::Result<Vec<SearchHit>> {
+        self.store
+            .search_sparse_vector_field_projected(
+                field_name,
+                query,
+                top_k,
+                metric,
+                LanceSearchProjection::default(),
+            )
+            .await
+            .map(|result| result.hits)
     }
 
     pub async fn search_filtered(
@@ -328,6 +393,11 @@ impl LanceDatasetStore {
     }
 
     #[cfg(feature = "hanns-backend")]
+    pub fn sparse_index_path(&self, field_name: &str) -> PathBuf {
+        self.sparse_index_dir().join(format!("{field_name}.sparse"))
+    }
+
+    #[cfg(feature = "hanns-backend")]
     pub async fn optimize_hanns(&self, field_name: &str, metric: &str) -> io::Result<()> {
         let vector_schema = self
             .schema
@@ -415,6 +485,14 @@ impl LanceDatasetStore {
         Ok(())
     }
 
+    #[cfg(feature = "hanns-backend")]
+    pub async fn optimize_sparse(&self, field_name: &str, metric: &str) -> io::Result<()> {
+        let _ = self
+            .build_sparse_sidecar(field_name, &metric.trim().to_ascii_lowercase())
+            .await?;
+        Ok(())
+    }
+
     pub async fn create(&self, documents: &[Document]) -> io::Result<()> {
         self.write(documents, WriteMode::Create).await
     }
@@ -433,7 +511,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         usize::try_from(result.num_deleted_rows).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -474,7 +552,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         usize::try_from(stats.num_inserted_rows + stats.num_updated_rows)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "upsert count exceeds usize"))
     }
@@ -521,7 +599,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         Ok(())
     }
 
@@ -543,7 +621,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         Ok(())
     }
 
@@ -590,7 +668,7 @@ impl LanceDatasetStore {
             .map_err(lance_to_io)?;
         self.rename_scalar_index_descriptor_if_exists(field_name, new_name)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         Ok(())
     }
 
@@ -617,7 +695,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         Ok(())
     }
 
@@ -951,6 +1029,7 @@ impl LanceDatasetStore {
                         predicate: None,
                         projected_columns,
                         fallback_reason: None,
+                        sparse_index: None,
                     },
                 });
             }
@@ -1014,6 +1093,73 @@ impl LanceDatasetStore {
                 predicate,
                 projected_columns,
                 fallback_reason,
+                sparse_index: None,
+            },
+        })
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub async fn search_sparse_vector_field_projected(
+        &self,
+        field_name: &str,
+        query: &SparseVector,
+        top_k: usize,
+        metric: &str,
+        projection: LanceSearchProjection,
+    ) -> io::Result<LanceSearchResult> {
+        let metric = metric.trim().to_ascii_lowercase();
+        self.sparse_vector_schema(field_name)?;
+
+        let mut projected_columns = BTreeSet::new();
+        projected_columns.insert(crate::storage::lance_schema::LANCE_ID_COLUMN.to_string());
+        projected_columns.insert(field_name.to_string());
+        projected_columns.extend(projection.output_fields.iter().cloned());
+        projected_columns.extend(projection.required_fields.iter().cloned());
+        projected_columns.extend(projection.required_vectors.iter().cloned());
+        let mut projected_columns = projected_columns.into_iter().collect::<Vec<_>>();
+        projected_columns.sort();
+
+        let (index, path) = self
+            .load_or_rebuild_sparse_sidecar(field_name, &metric)
+            .await?;
+        let query_data = SparseVectorData::new(query.indices.clone(), query.values.clone());
+        let hits = index
+            .search(&query_data, top_k, None)
+            .map_err(adapter_error_to_io)?;
+        let hits = hits
+            .into_iter()
+            .map(|hit| SearchHit {
+                id: hit.id,
+                distance: -hit.score,
+            })
+            .collect::<Vec<_>>();
+        let scores = hits
+            .iter()
+            .map(|hit| (hit.id, hit.distance))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let documents = self
+            .fetch(&ids)
+            .await?
+            .into_iter()
+            .map(|document| LanceSearchDocument {
+                distance: scores.get(&document.id).copied().unwrap_or_default(),
+                document,
+            })
+            .collect();
+
+        Ok(LanceSearchResult {
+            hits,
+            documents,
+            observation: LanceScanObservation {
+                predicate: None,
+                projected_columns,
+                fallback_reason: None,
+                sparse_index: Some(LanceSparseIndexObservation {
+                    field_name: field_name.to_string(),
+                    metric,
+                    path,
+                }),
             },
         })
     }
@@ -1056,6 +1202,131 @@ impl LanceDatasetStore {
         ))
     }
 
+    #[cfg(feature = "hanns-backend")]
+    async fn load_or_rebuild_sparse_sidecar(
+        &self,
+        field_name: &str,
+        metric: &str,
+    ) -> io::Result<(Box<dyn SparseIndexBackend>, LanceSparseIndexPath)> {
+        match self.load_sparse_sidecar(field_name, metric) {
+            Ok(Some(index)) => Ok((index, LanceSparseIndexPath::Loaded)),
+            Ok(None) => self
+                .build_sparse_sidecar(field_name, metric)
+                .await
+                .map(|index| (index, LanceSparseIndexPath::RebuiltMissing)),
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                self.remove_sparse_sidecar(field_name)?;
+                self.build_sparse_sidecar(field_name, metric)
+                    .await
+                    .map(|index| (index, LanceSparseIndexPath::RebuiltCorrupt))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn load_sparse_sidecar(
+        &self,
+        field_name: &str,
+        metric: &str,
+    ) -> io::Result<Option<Box<dyn SparseIndexBackend>>> {
+        let index_path = self.sparse_index_path(field_name);
+        let metadata_path = self.sparse_index_metadata_path(field_name);
+        if !index_path.exists() || !metadata_path.exists() {
+            return Ok(None);
+        }
+        let metadata: SparseSidecarMetadata =
+            serde_json::from_slice(&std::fs::read(metadata_path)?)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if metadata.field_name != field_name || metadata.metric != metric {
+            return Ok(None);
+        }
+        let descriptor = sparse_index_descriptor(field_name, metric);
+        let bytes = std::fs::read(index_path)?;
+        DefaultIndexFactory::default()
+            .create_sparse_index(&descriptor, Some(&bytes))
+            .map(Some)
+            .map_err(adapter_error_to_io)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    async fn build_sparse_sidecar(
+        &self,
+        field_name: &str,
+        metric: &str,
+    ) -> io::Result<Box<dyn SparseIndexBackend>> {
+        let vector_schema = self.sparse_vector_schema(field_name)?.clone();
+        let documents = self.read_all_documents().await?;
+        let sparse_rows = documents
+            .iter()
+            .filter_map(|document| {
+                document.sparse_vectors.get(field_name).map(|sparse| {
+                    (
+                        document.id,
+                        SparseVectorData::new(sparse.indices.clone(), sparse.values.clone()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let descriptor = sparse_index_descriptor(field_name, metric);
+        let mut index = DefaultIndexFactory::default()
+            .create_sparse_index(&descriptor, None)
+            .map_err(adapter_error_to_io)?;
+        if !sparse_rows.is_empty() {
+            index.add(&sparse_rows).map_err(adapter_error_to_io)?;
+        }
+        if let Some(bm25) = &vector_schema.bm25_params {
+            index.set_bm25_params(bm25.k1, bm25.b, bm25.avgdl);
+        }
+
+        let bytes = index.serialize_to_bytes().map_err(adapter_error_to_io)?;
+        let bytes = bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "selected sparse backend cannot serialize sidecar index",
+            )
+        })?;
+        std::fs::create_dir_all(self.sparse_index_dir())?;
+        std::fs::write(self.sparse_index_path(field_name), bytes)?;
+        let metadata = SparseSidecarMetadata {
+            field_name: field_name.to_string(),
+            metric: metric.to_string(),
+            row_count: sparse_rows.len(),
+        };
+        std::fs::write(
+            self.sparse_index_metadata_path(field_name),
+            serde_json::to_vec_pretty(&metadata)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
+        )?;
+        Ok(index)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn sparse_vector_schema(
+        &self,
+        field_name: &str,
+    ) -> io::Result<&crate::document::VectorFieldSchema> {
+        let vector_schema = self
+            .schema
+            .vectors
+            .iter()
+            .find(|vector| vector.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("vector field not found: {field_name}"),
+                )
+            })?;
+        if !matches!(vector_schema.data_type, FieldType::VectorSparse) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("sparse sidecar supports only sparse vector fields: {field_name}"),
+            ));
+        }
+        Ok(vector_schema)
+    }
+
     async fn write(&self, documents: &[Document], mode: WriteMode) -> io::Result<()> {
         let batch = documents_to_lance_batch(&self.schema, documents)?;
         let schema = batch.schema();
@@ -1068,7 +1339,7 @@ impl LanceDatasetStore {
             .await
             .map_err(lance_to_io)?;
         #[cfg(feature = "hanns-backend")]
-        self.invalidate_hanns_sidecars()?;
+        self.invalidate_hannsdb_vector_sidecars()?;
         Ok(())
     }
 
@@ -1085,8 +1356,40 @@ impl LanceDatasetStore {
     }
 
     #[cfg(feature = "hanns-backend")]
-    fn invalidate_hanns_sidecars(&self) -> io::Result<()> {
-        let dir = self.hanns_index_dir();
+    fn sparse_index_dir(&self) -> PathBuf {
+        PathBuf::from(self.uri.as_str())
+            .join("_hannsdb")
+            .join("sparse")
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn sparse_index_metadata_path(&self, field_name: &str) -> PathBuf {
+        self.sparse_index_dir().join(format!("{field_name}.json"))
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn remove_sparse_sidecar(&self, field_name: &str) -> io::Result<()> {
+        for path in [
+            self.sparse_index_path(field_name),
+            self.sparse_index_metadata_path(field_name),
+        ] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn invalidate_hannsdb_vector_sidecars(&self) -> io::Result<()> {
+        self.remove_sidecar_dir(self.hanns_index_dir())?;
+        self.remove_sidecar_dir(self.sparse_index_dir())
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    fn remove_sidecar_dir(&self, dir: PathBuf) -> io::Result<()> {
         match std::fs::remove_dir_all(dir) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1123,6 +1426,14 @@ struct HannsSidecarMetadata {
 }
 
 #[cfg(feature = "hanns-backend")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparseSidecarMetadata {
+    field_name: String,
+    metric: String,
+    row_count: usize,
+}
+
+#[cfg(feature = "hanns-backend")]
 fn hanns_hnsw_descriptor(field_name: &str, metric: &str) -> VectorIndexDescriptor {
     VectorIndexDescriptor {
         field_name: field_name.to_string(),
@@ -1132,6 +1443,16 @@ fn hanns_hnsw_descriptor(field_name: &str, metric: &str) -> VectorIndexDescripto
             "m": 16,
             "ef_construction": 128,
         }),
+    }
+}
+
+#[cfg(feature = "hanns-backend")]
+fn sparse_index_descriptor(field_name: &str, metric: &str) -> SparseIndexDescriptor {
+    SparseIndexDescriptor {
+        field_name: field_name.to_string(),
+        kind: SparseIndexKind::SparseInverted,
+        metric: Some(metric.to_ascii_lowercase()),
+        params: serde_json::Value::Object(serde_json::Map::new()),
     }
 }
 
@@ -1304,7 +1625,8 @@ pub fn documents_from_lance_batch(
             }
         }
 
-        let mut vectors = Vec::with_capacity(schema.vectors.len());
+        let mut vectors = Vec::new();
+        let mut sparse_vectors = std::collections::BTreeMap::new();
         for vector_schema in &schema.vectors {
             let column = batch.column_by_name(&vector_schema.name).ok_or_else(|| {
                 io::Error::new(
@@ -1312,17 +1634,44 @@ pub fn documents_from_lance_batch(
                     format!("Lance batch missing vector column {}", vector_schema.name),
                 )
             })?;
-            vectors.push((
-                vector_schema.name.clone(),
-                vector_from_column(column, row_idx, vector_schema.dimension)?,
-            ));
+            match vector_schema.data_type {
+                FieldType::VectorFp32 => {
+                    vectors.push((
+                        vector_schema.name.clone(),
+                        vector_from_column(column, row_idx, vector_schema.dimension)?,
+                    ));
+                }
+                FieldType::VectorSparse => {
+                    if let Some(sparse) = sparse_vector_from_column(column, row_idx)? {
+                        sparse_vectors.insert(vector_schema.name.clone(), sparse);
+                    }
+                }
+                FieldType::VectorFp16 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "fp16 vector field {} is not supported by Lance storage",
+                            vector_schema.name
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "non-vector field registered as vector: {}",
+                            vector_schema.name
+                        ),
+                    ));
+                }
+            }
         }
 
         documents.push(Document {
             id: ids.value(row_idx),
             fields: fields.into_iter().collect(),
             vectors: vectors.into_iter().collect(),
-            sparse_vectors: Default::default(),
+            sparse_vectors,
         });
     }
     Ok(documents)
@@ -1357,21 +1706,49 @@ fn documents_from_projected_lance_batch(
         }
 
         let mut vectors = Vec::new();
+        let mut sparse_vectors = std::collections::BTreeMap::new();
         for vector_schema in &schema.vectors {
             let Some(column) = batch.column_by_name(&vector_schema.name) else {
                 continue;
             };
-            vectors.push((
-                vector_schema.name.clone(),
-                vector_from_column(column, row_idx, vector_schema.dimension)?,
-            ));
+            match vector_schema.data_type {
+                FieldType::VectorFp32 => {
+                    vectors.push((
+                        vector_schema.name.clone(),
+                        vector_from_column(column, row_idx, vector_schema.dimension)?,
+                    ));
+                }
+                FieldType::VectorSparse => {
+                    if let Some(sparse) = sparse_vector_from_column(column, row_idx)? {
+                        sparse_vectors.insert(vector_schema.name.clone(), sparse);
+                    }
+                }
+                FieldType::VectorFp16 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "fp16 vector field {} is not supported by Lance storage",
+                            vector_schema.name
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "non-vector field registered as vector: {}",
+                            vector_schema.name
+                        ),
+                    ));
+                }
+            }
         }
 
         documents.push(Document {
             id: ids.value(row_idx),
             fields: fields.into_iter().collect(),
             vectors: vectors.into_iter().collect(),
-            sparse_vectors: Default::default(),
+            sparse_vectors,
         });
     }
     Ok(documents)
@@ -1402,11 +1779,32 @@ pub fn documents_to_lance_batch(
     }
 
     for vector in &schema.vectors {
-        arrays.push(vector_array_for_documents(
-            vector.name.as_str(),
-            vector.dimension,
-            documents,
-        )?);
+        match vector.data_type {
+            FieldType::VectorFp32 => arrays.push(vector_array_for_documents(
+                vector.name.as_str(),
+                vector.dimension,
+                documents,
+            )?),
+            FieldType::VectorSparse => arrays.push(sparse_vector_array_for_documents(
+                vector.name.as_str(),
+                documents,
+            )?),
+            FieldType::VectorFp16 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "fp16 vectors are not supported by Lance storage: {}",
+                        vector.name
+                    ),
+                ));
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("non-vector field registered as vector: {}", vector.name),
+                ));
+            }
+        }
     }
 
     RecordBatch::try_new(arrow_schema, arrays).map_err(arrow_to_io)
@@ -1725,6 +2123,82 @@ fn vector_array_for_documents(
     .map_err(arrow_to_io)
 }
 
+fn sparse_vector_array_for_documents(
+    vector_name: &str,
+    documents: &[Document],
+) -> io::Result<ArrayRef> {
+    let sparse_rows = documents
+        .iter()
+        .map(|document| {
+            document
+                .sparse_vectors
+                .get(vector_name)
+                .map(|sparse| validate_sparse_vector(document.id, vector_name, sparse))
+                .transpose()
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let indices_rows = sparse_rows.iter().map(|sparse| {
+        sparse.as_ref().map(|sparse| {
+            sparse
+                .indices
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<Option<u32>>>()
+        })
+    });
+    let values_rows = sparse_rows.iter().map(|sparse| {
+        sparse.as_ref().map(|sparse| {
+            sparse
+                .values
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<Option<f32>>>()
+        })
+    });
+
+    let indices_array: ArrayRef = Arc::new(ListArray::from_iter_primitive::<UInt32Type, _, _>(
+        indices_rows,
+    ));
+    let values_array: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(
+        values_rows,
+    ));
+    let DataType::Struct(fields) = sparse_vector_data_type_for_lance() else {
+        unreachable!("sparse vector data type must be a struct");
+    };
+    StructArray::try_new(fields, vec![indices_array, values_array], None)
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(arrow_to_io)
+}
+
+fn validate_sparse_vector(
+    document_id: i64,
+    vector_name: &str,
+    sparse: &SparseVector,
+) -> io::Result<SparseVector> {
+    if sparse.indices.len() != sparse.values.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "document {document_id} sparse vector {vector_name} has mismatched indices/values lengths: {} != {}",
+                sparse.indices.len(),
+                sparse.values.len()
+            ),
+        ));
+    }
+    if !sparse.is_sorted() && !sparse.indices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "document {document_id} sparse vector {vector_name} indices must be strictly sorted"
+            ),
+        ));
+    }
+    Ok(sparse.clone())
+}
+
 fn optional_field<'a>(
     document: &'a Document,
     field_name: &str,
@@ -1863,6 +2337,68 @@ fn vector_from_column(column: &ArrayRef, row_idx: usize, dimension: usize) -> io
         ));
     }
     Ok(vector)
+}
+
+fn sparse_vector_from_column(
+    column: &ArrayRef,
+    row_idx: usize,
+) -> io::Result<Option<SparseVector>> {
+    let sparse = column
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| column_type_error("Struct<indices: List<UInt32>, values: List<Float32>>"))?;
+    let indices_column = sparse
+        .column_by_name(LANCE_SPARSE_INDICES_FIELD)
+        .ok_or_else(|| column_type_error("sparse vector indices field"))?;
+    let values_column = sparse
+        .column_by_name(LANCE_SPARSE_VALUES_FIELD)
+        .ok_or_else(|| column_type_error("sparse vector values field"))?;
+    let indices_list = indices_column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| column_type_error("List<UInt32> sparse indices"))?;
+    let values_list = values_column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| column_type_error("List<Float32> sparse values"))?;
+
+    match (indices_list.is_null(row_idx), values_list.is_null(row_idx)) {
+        (true, true) => return Ok(None),
+        (true, false) | (false, true) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Lance sparse vector row has only one null child list",
+            ));
+        }
+        (false, false) => {}
+    }
+
+    let indices_values = indices_list.value(row_idx);
+    let indices = indices_values
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| column_type_error("UInt32 sparse indices values"))?
+        .values()
+        .to_vec();
+    let values_values = values_list.value(row_idx);
+    let values = values_values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| column_type_error("Float32 sparse values"))?
+        .values()
+        .to_vec();
+
+    if indices.len() != values.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Lance sparse vector row has mismatched indices/values lengths: {} != {}",
+                indices.len(),
+                values.len()
+            ),
+        ));
+    }
+    Ok(Some(SparseVector::new(indices, values)))
 }
 
 fn column_type_error(expected: &str) -> io::Error {
