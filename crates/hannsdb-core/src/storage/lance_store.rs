@@ -11,19 +11,23 @@ use arrow_array::{
     Int64Array, ListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
     UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 #[cfg(feature = "hanns-backend")]
 use hannsdb_index::descriptor::{VectorIndexDescriptor, VectorIndexKind};
 #[cfg(feature = "hanns-backend")]
 use hannsdb_index::factory::DefaultIndexFactory;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance::dataset::{
+    ColumnAlteration, MergeInsertBuilder, NewColumnTransform, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
+};
 use lance::Dataset;
-#[cfg(feature = "hanns-backend")]
 use serde::{Deserialize, Serialize};
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
 use crate::query::{distance_by_metric, FilterExpr, SearchHit};
-use crate::storage::lance_schema::{arrow_schema_for_lance, collection_schema_from_lance_arrow};
+use crate::storage::lance_schema::{
+    arrow_schema_for_lance, collection_schema_from_lance_arrow, scalar_data_type_for_lance,
+};
 
 pub struct LanceCollection {
     name: String,
@@ -159,6 +163,53 @@ impl LanceCollection {
         self.store
             .search_filtered(query, top_k, metric, filter)
             .await
+    }
+
+    pub async fn add_scalar_column(
+        &self,
+        field: crate::document::ScalarFieldSchema,
+    ) -> io::Result<()> {
+        self.store.add_scalar_column(field).await
+    }
+
+    pub async fn drop_scalar_column(&self, field_name: &str) -> io::Result<()> {
+        self.store.drop_scalar_column(field_name).await
+    }
+
+    pub async fn rename_scalar_column(&self, field_name: &str, new_name: &str) -> io::Result<()> {
+        self.store.rename_scalar_column(field_name, new_name).await
+    }
+
+    pub async fn drop_vector_field(&self, field_name: &str) -> io::Result<()> {
+        self.store.drop_vector_field(field_name).await
+    }
+
+    pub fn create_scalar_index_descriptor(
+        &self,
+        field_name: &str,
+        kind: &str,
+        params: serde_json::Value,
+    ) -> io::Result<()> {
+        self.store
+            .create_scalar_index_descriptor(field_name, kind, params)
+    }
+
+    pub fn list_scalar_index_descriptors(&self) -> io::Result<Vec<LanceScalarIndexDescriptor>> {
+        self.store.list_scalar_index_descriptors()
+    }
+
+    pub fn drop_scalar_index_descriptor(&self, field_name: &str) -> io::Result<()> {
+        self.store.drop_scalar_index_descriptor(field_name)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn list_hanns_indexes(&self) -> io::Result<Vec<LanceHannsIndexDescriptor>> {
+        self.store.list_hanns_indexes()
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn drop_hanns_index(&self, field_name: &str) -> io::Result<()> {
+        self.store.drop_hanns_index(field_name)
     }
 }
 
@@ -356,6 +407,315 @@ impl LanceDatasetStore {
         self.invalidate_hanns_sidecars()?;
         usize::try_from(stats.num_inserted_rows + stats.num_updated_rows)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "upsert count exceeds usize"))
+    }
+
+    pub async fn add_scalar_column(
+        &self,
+        field: crate::document::ScalarFieldSchema,
+    ) -> io::Result<()> {
+        if self
+            .schema
+            .fields
+            .iter()
+            .any(|existing| existing.name == field.name)
+            || self
+                .schema
+                .vectors
+                .iter()
+                .any(|existing| existing.name == field.name)
+            || field.name == crate::storage::lance_schema::LANCE_ID_COLUMN
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("field already exists: {}", field.name),
+            ));
+        }
+        if !field.nullable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Lance add column supports only nullable scalar columns for existing datasets",
+            ));
+        }
+        let data_type = scalar_data_type_for_lance(&field.data_type, field.array)?;
+        let mut dataset = self.open_lance().await?;
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                    field.name.clone(),
+                    data_type,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
+        Ok(())
+    }
+
+    pub async fn drop_scalar_column(&self, field_name: &str) -> io::Result<()> {
+        self.schema
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("scalar field not found: {field_name}"),
+                )
+            })?;
+        self.remove_scalar_index_descriptor_if_exists(field_name)?;
+        let mut dataset = self.open_lance().await?;
+        dataset
+            .drop_columns(&[field_name])
+            .await
+            .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
+        Ok(())
+    }
+
+    pub async fn rename_scalar_column(&self, field_name: &str, new_name: &str) -> io::Result<()> {
+        if new_name.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "new column name must not be empty",
+            ));
+        }
+        self.schema
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("scalar field not found: {field_name}"),
+                )
+            })?;
+        if self
+            .schema
+            .fields
+            .iter()
+            .any(|field| field.name == new_name)
+            || self
+                .schema
+                .vectors
+                .iter()
+                .any(|field| field.name == new_name)
+            || new_name == crate::storage::lance_schema::LANCE_ID_COLUMN
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("field already exists: {new_name}"),
+            ));
+        }
+        let mut dataset = self.open_lance().await?;
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new(field_name.to_string()).rename(new_name.to_string())
+            ])
+            .await
+            .map_err(lance_to_io)?;
+        self.rename_scalar_index_descriptor_if_exists(field_name, new_name)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
+        Ok(())
+    }
+
+    pub async fn drop_vector_field(&self, field_name: &str) -> io::Result<()> {
+        self.schema
+            .vectors
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("vector field not found: {field_name}"),
+                )
+            })?;
+        if field_name == self.schema.primary_vector_name() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Lance storage cannot drop the primary vector field",
+            ));
+        }
+        let mut dataset = self.open_lance().await?;
+        dataset
+            .drop_columns(&[field_name])
+            .await
+            .map_err(lance_to_io)?;
+        #[cfg(feature = "hanns-backend")]
+        self.invalidate_hanns_sidecars()?;
+        Ok(())
+    }
+
+    pub fn create_scalar_index_descriptor(
+        &self,
+        field_name: &str,
+        kind: &str,
+        params: serde_json::Value,
+    ) -> io::Result<()> {
+        self.schema
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("scalar field not found: {field_name}"),
+                )
+            })?;
+        let kind = kind.trim().to_ascii_lowercase();
+        if kind != "inverted" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Lance scalar index DDL supports only inverted kind, got: {kind}"),
+            ));
+        }
+        let mut descriptors = self.list_scalar_index_descriptors()?;
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.field_name == field_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("scalar index already exists: {field_name}"),
+            ));
+        }
+        descriptors.push(LanceScalarIndexDescriptor {
+            field_name: field_name.to_string(),
+            kind,
+            params,
+        });
+        self.write_scalar_index_descriptors(&descriptors)
+    }
+
+    pub fn list_scalar_index_descriptors(&self) -> io::Result<Vec<LanceScalarIndexDescriptor>> {
+        let path = self.scalar_index_descriptors_path();
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn drop_scalar_index_descriptor(&self, field_name: &str) -> io::Result<()> {
+        let mut descriptors = self.list_scalar_index_descriptors()?;
+        let before = descriptors.len();
+        descriptors.retain(|descriptor| descriptor.field_name != field_name);
+        if descriptors.len() == before {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("scalar index not found: {field_name}"),
+            ));
+        }
+        self.write_scalar_index_descriptors(&descriptors)
+    }
+
+    fn remove_scalar_index_descriptor_if_exists(&self, field_name: &str) -> io::Result<()> {
+        let mut descriptors = self.list_scalar_index_descriptors()?;
+        let before = descriptors.len();
+        descriptors.retain(|descriptor| descriptor.field_name != field_name);
+        if descriptors.len() != before {
+            self.write_scalar_index_descriptors(&descriptors)?;
+        }
+        Ok(())
+    }
+
+    fn rename_scalar_index_descriptor_if_exists(
+        &self,
+        field_name: &str,
+        new_name: &str,
+    ) -> io::Result<()> {
+        let mut descriptors = self.list_scalar_index_descriptors()?;
+        let mut changed = false;
+        for descriptor in &mut descriptors {
+            if descriptor.field_name == field_name {
+                descriptor.field_name = new_name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_scalar_index_descriptors(&descriptors)?;
+        }
+        Ok(())
+    }
+
+    fn write_scalar_index_descriptors(
+        &self,
+        descriptors: &[LanceScalarIndexDescriptor],
+    ) -> io::Result<()> {
+        let path = self.scalar_index_descriptors_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(descriptors)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
+        )
+    }
+
+    fn scalar_index_descriptors_path(&self) -> PathBuf {
+        PathBuf::from(self.uri.as_str())
+            .join("_hannsdb")
+            .join("scalar_indexes.json")
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn list_hanns_indexes(&self) -> io::Result<Vec<LanceHannsIndexDescriptor>> {
+        let mut descriptors = Vec::new();
+        let dir = self.hanns_index_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(descriptors),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let metadata: HannsSidecarMetadata = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            descriptors.push(LanceHannsIndexDescriptor {
+                field_name: metadata.field_name,
+                kind: "hnsw".to_string(),
+                metric: metadata.metric,
+                params: serde_json::json!({"m": 16, "ef_construction": 128}),
+            });
+        }
+        descriptors.sort_by(|left, right| left.field_name.cmp(&right.field_name));
+        Ok(descriptors)
+    }
+
+    #[cfg(feature = "hanns-backend")]
+    pub fn drop_hanns_index(&self, field_name: &str) -> io::Result<()> {
+        let index_path = self.hanns_index_path(field_name);
+        let metadata_path = self.hanns_index_metadata_path(field_name);
+        let existed = index_path.exists() || metadata_path.exists();
+        match std::fs::remove_file(index_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        match std::fs::remove_file(metadata_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        if existed {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("vector index not found: {field_name}"),
+            ))
+        }
     }
 
     pub async fn open_lance(&self) -> io::Result<Dataset> {
@@ -571,6 +931,24 @@ impl LanceDatasetStore {
             Err(err) => Err(err),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LanceScalarIndexDescriptor {
+    pub field_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[cfg(feature = "hanns-backend")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LanceHannsIndexDescriptor {
+    pub field_name: String,
+    pub kind: String,
+    pub metric: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 #[cfg(feature = "hanns-backend")]

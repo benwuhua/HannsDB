@@ -744,9 +744,9 @@ async fn lance_storage_admin_compact_returns_unsupported() {
         .contains("Lance compact"));
 }
 
-#[cfg(feature = "lance-storage")]
+#[cfg(all(feature = "lance-storage", feature = "hanns-backend"))]
 #[tokio::test]
-async fn lance_storage_index_ddl_returns_unsupported() {
+async fn lance_storage_index_ddl_routes_to_hanns_sidecar_and_scalar_catalog() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
 
@@ -758,7 +758,17 @@ async fn lance_storage_index_ddl_returns_unsupported() {
                 .uri("/collections")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                    r#"{
+                        "name":"docs",
+                        "dimension":2,
+                        "metric":"l2",
+                        "storage":"lance",
+                        "schema":{
+                            "primary_vector":"vector",
+                            "fields":[{"name":"title","data_type":"String"}],
+                            "vectors":[{"name":"vector","data_type":"VectorFp32","dimension":2}]
+                        }
+                    }"#,
                 ))
                 .expect("build request"),
         )
@@ -766,64 +776,134 @@ async fn lance_storage_index_ddl_returns_unsupported() {
         .expect("send create request");
     assert_eq!(create.status(), StatusCode::CREATED);
 
-    for request in [
-        Request::builder()
-            .method("POST")
-            .uri("/collections/docs/indexes/vector")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"field_name":"vector","kind":"hnsw","metric":"l2","params":{}}"#,
-            ))
-            .expect("build request"),
-        Request::builder()
-            .method("GET")
-            .uri("/collections/docs/indexes/vector")
-            .body(Body::empty())
-            .expect("build request"),
-        Request::builder()
-            .method("DELETE")
-            .uri("/collections/docs/indexes/vector/vector")
-            .body(Body::empty())
-            .expect("build request"),
-        Request::builder()
-            .method("POST")
-            .uri("/collections/docs/indexes/scalar")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"field_name":"title","kind":"inverted","params":{}}"#,
-            ))
-            .expect("build request"),
-        Request::builder()
-            .method("GET")
-            .uri("/collections/docs/indexes/scalar")
-            .body(Body::empty())
-            .expect("build request"),
-        Request::builder()
-            .method("DELETE")
-            .uri("/collections/docs/indexes/scalar/title")
-            .body(Body::empty())
-            .expect("build request"),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("send index ddl request");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read index ddl body");
-        let json: Value = serde_json::from_slice(&body).expect("parse index ddl json");
-        assert!(json["error"]
-            .as_str()
-            .expect("error")
-            .contains("Lance index DDL"));
-    }
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]],"fields":[{"title":"alpha"},{"title":"beta"}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let create_vector_index = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/vector")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"vector","kind":"hnsw","metric":"l2","params":{}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create vector index");
+    assert_eq!(create_vector_index.status(), StatusCode::CREATED);
+    assert!(tempdir
+        .path()
+        .join("collections")
+        .join("docs.lance")
+        .join("_hannsdb")
+        .join("ann")
+        .join("vector.hanns")
+        .exists());
+
+    let list_vector = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/indexes/vector")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send list vector indexes");
+    assert_eq!(list_vector.status(), StatusCode::OK);
+    let body = to_bytes(list_vector.into_body(), usize::MAX)
+        .await
+        .expect("read vector index body");
+    let json: Value = serde_json::from_slice(&body).expect("parse vector indexes json");
+    assert_eq!(json["vector_indexes"][0]["field_name"], "vector");
+    assert_eq!(json["vector_indexes"][0]["kind"], "hnsw");
+    assert_eq!(json["vector_indexes"][0]["metric"], "l2");
+
+    let create_scalar_index = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/scalar")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"title","kind":"inverted","params":{"enable_range_optimization":true}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create scalar index");
+    assert_eq!(create_scalar_index.status(), StatusCode::CREATED);
+
+    let list_scalar = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/collections/docs/indexes/scalar")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send list scalar indexes");
+    assert_eq!(list_scalar.status(), StatusCode::OK);
+    let body = to_bytes(list_scalar.into_body(), usize::MAX)
+        .await
+        .expect("read scalar index body");
+    let json: Value = serde_json::from_slice(&body).expect("parse scalar indexes json");
+    assert_eq!(json["scalar_indexes"][0]["field_name"], "title");
+    assert_eq!(json["scalar_indexes"][0]["kind"], "inverted");
+    assert_eq!(
+        json["scalar_indexes"][0]["params"]["enable_range_optimization"],
+        true
+    );
+
+    let drop_vector = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/indexes/vector/vector")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send drop vector index");
+    assert_eq!(drop_vector.status(), StatusCode::OK);
+
+    let drop_scalar = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/indexes/scalar/title")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send drop scalar index");
+    assert_eq!(drop_scalar.status(), StatusCode::OK);
 }
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
-async fn lance_storage_schema_mutation_returns_unsupported() {
+async fn lance_storage_schema_mutation_updates_lance_dataset() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let app = build_router(tempdir.path()).expect("build router");
 
@@ -835,7 +915,20 @@ async fn lance_storage_schema_mutation_returns_unsupported() {
                 .uri("/collections")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                    r#"{
+                        "name":"docs",
+                        "dimension":2,
+                        "metric":"l2",
+                        "storage":"lance",
+                        "schema":{
+                            "primary_vector":"vector",
+                            "fields":[{"name":"title","data_type":"String"}],
+                            "vectors":[
+                                {"name":"vector","data_type":"VectorFp32","dimension":2},
+                                {"name":"aux","data_type":"VectorFp32","dimension":2}
+                            ]
+                        }
+                    }"#,
                 ))
                 .expect("build request"),
         )
@@ -843,53 +936,150 @@ async fn lance_storage_schema_mutation_returns_unsupported() {
         .expect("send create request");
     assert_eq!(create.status(), StatusCode::CREATED);
 
-    for request in [
-        Request::builder()
-            .method("POST")
-            .uri("/collections/docs/schema/columns")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"title","data_type":"string"}"#))
-            .expect("build request"),
-        Request::builder()
-            .method("PATCH")
-            .uri("/collections/docs/schema/columns/title")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"new_name":"headline"}"#))
-            .expect("build request"),
-        Request::builder()
-            .method("DELETE")
-            .uri("/collections/docs/schema/columns/title")
-            .body(Body::empty())
-            .expect("build request"),
-        Request::builder()
-            .method("POST")
-            .uri("/collections/docs/schema/vectors")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"name":"title_vec","data_type":"vector_fp32","dimension":2}"#,
-            ))
-            .expect("build request"),
-        Request::builder()
-            .method("DELETE")
-            .uri("/collections/docs/schema/vectors/title_vec")
-            .body(Body::empty())
-            .expect("build request"),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("send schema mutation request");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read schema mutation body");
-        let json: Value = serde_json::from_slice(&body).expect("parse schema mutation json");
-        assert!(json["error"]
-            .as_str()
-            .expect("error")
-            .contains("Lance schema mutation"));
-    }
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["42"],
+                        "vectors":[[0.0,0.0]],
+                        "named_vectors":[{"aux":[1.0,1.0]}],
+                        "fields":[{"title":"alpha"}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/schema/columns")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"tag","data_type":"string","nullable":true}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send add column request");
+    assert_eq!(add.status(), StatusCode::OK);
+
+    let insert_with_tag = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "ids":["43"],
+                        "vectors":[[0.1,0.0]],
+                        "named_vectors":[{"aux":[1.1,1.1]}],
+                        "fields":[{"title":"beta","tag":"fresh"}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert with tag");
+    assert_eq!(insert_with_tag.status(), StatusCode::OK);
+
+    let rename = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/collections/docs/schema/columns/title")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"new_name":"headline"}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send rename column request");
+    assert_eq!(rename.status(), StatusCode::OK);
+
+    let fetch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records/fetch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","43"],"output_fields":["headline","tag"]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send fetch request");
+    assert_eq!(fetch.status(), StatusCode::OK);
+    let body = to_bytes(fetch.into_body(), usize::MAX)
+        .await
+        .expect("read fetch body");
+    let json: Value = serde_json::from_slice(&body).expect("parse fetch json");
+    assert_eq!(json["documents"][0]["fields"]["headline"], "alpha");
+    assert!(json["documents"][0]["fields"].get("tag").is_none());
+    assert_eq!(json["documents"][1]["fields"]["headline"], "beta");
+    assert_eq!(json["documents"][1]["fields"]["tag"], "fresh");
+
+    let drop_tag = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/schema/columns/tag")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send drop scalar request");
+    assert_eq!(drop_tag.status(), StatusCode::OK);
+
+    let drop_aux = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/collections/docs/schema/vectors/aux")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("send drop vector request");
+    assert_eq!(drop_aux.status(), StatusCode::OK);
+
+    let add_vector = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/schema/vectors")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"new_vec","data_type":"vector_fp32","dimension":2}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send add vector request");
+    assert_eq!(add_vector.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(add_vector.into_body(), usize::MAX)
+        .await
+        .expect("read add vector body");
+    let json: Value = serde_json::from_slice(&body).expect("parse add vector json");
+    assert!(json["error"]
+        .as_str()
+        .expect("error")
+        .contains("Lance add vector field"));
 }
 
 #[cfg(feature = "lance-storage")]

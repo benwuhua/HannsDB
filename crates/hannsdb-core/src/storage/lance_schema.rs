@@ -138,7 +138,10 @@ fn scalar_data_type(data_type: &FieldType) -> io::Result<DataType> {
     }
 }
 
-fn scalar_data_type_for_lance(data_type: &FieldType, is_array: bool) -> io::Result<DataType> {
+pub(crate) fn scalar_data_type_for_lance(
+    data_type: &FieldType,
+    is_array: bool,
+) -> io::Result<DataType> {
     let item_type = scalar_data_type(data_type)?;
     if is_array {
         Ok(DataType::List(Arc::new(Field::new(
