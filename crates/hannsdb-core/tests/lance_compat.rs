@@ -4,7 +4,7 @@ use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema,
 };
 use hannsdb_core::storage::lance_store::{
-    documents_to_lance_batch, LanceCollection, LanceDatasetStore,
+    documents_to_lance_batch, LanceCollection, LanceDatasetStore, LanceSearchProjection,
 };
 use hannsdb_core::storage::selector::{StorageBackend, StorageCollection};
 
@@ -38,6 +38,66 @@ fn sample_documents() -> Vec<Document> {
             ],
             "dense",
             vec![4.0, 5.0, 6.0],
+        ),
+    ]
+}
+
+fn pushdown_schema() -> CollectionSchema {
+    CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: vec![
+            ScalarFieldSchema::new("title", FieldType::String),
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("score", FieldType::Float64),
+            ScalarFieldSchema::new("extra", FieldType::String),
+        ],
+        vectors: vec![hannsdb_core::document::VectorFieldSchema::new("dense", 2)],
+    }
+}
+
+fn pushdown_documents() -> Vec<Document> {
+    vec![
+        Document::with_primary_vector_name(
+            1,
+            vec![
+                ("title".to_string(), FieldValue::String("alpha".to_string())),
+                ("group".to_string(), FieldValue::Int64(1)),
+                ("score".to_string(), FieldValue::Float64(10.0)),
+                (
+                    "extra".to_string(),
+                    FieldValue::String("hidden-a".to_string()),
+                ),
+            ],
+            "dense",
+            vec![0.0, 0.0],
+        ),
+        Document::with_primary_vector_name(
+            2,
+            vec![
+                ("title".to_string(), FieldValue::String("beta".to_string())),
+                ("group".to_string(), FieldValue::Int64(1)),
+                ("score".to_string(), FieldValue::Float64(20.0)),
+                (
+                    "extra".to_string(),
+                    FieldValue::String("hidden-b".to_string()),
+                ),
+            ],
+            "dense",
+            vec![1.0, 1.0],
+        ),
+        Document::with_primary_vector_name(
+            3,
+            vec![
+                ("title".to_string(), FieldValue::String("gamma".to_string())),
+                ("group".to_string(), FieldValue::Int64(2)),
+                ("score".to_string(), FieldValue::Float64(30.0)),
+                (
+                    "extra".to_string(),
+                    FieldValue::String("hidden-c".to_string()),
+                ),
+            ],
+            "dense",
+            vec![2.0, 2.0],
         ),
     ]
 }
@@ -450,4 +510,186 @@ async fn lance_collection_mutations_invalidate_hanns_sidecar() {
         !collection.hanns_index_path("dense").exists(),
         "upsert should invalidate stale Hanns sidecar"
     );
+}
+
+#[tokio::test]
+async fn lance_dataset_store_pushes_equality_filter_to_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), pushdown_schema());
+    store
+        .create(&pushdown_documents())
+        .await
+        .expect("create lance dataset");
+    let filter = hannsdb_core::query::parse_filter("group == 1").expect("parse filter");
+
+    let result = store
+        .search_vector_field_filtered_projected(
+            "dense",
+            LanceSearchProjection::with_output_fields(["title".to_string()]),
+            &[0.0, 0.0],
+            10,
+            "l2",
+            Some(&filter),
+        )
+        .await
+        .expect("search with pushdown");
+
+    assert_eq!(
+        result.hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(result.observation.predicate.as_deref(), Some("group = 1"));
+    assert!(result.observation.fallback_reason.is_none());
+}
+
+#[tokio::test]
+async fn lance_dataset_store_pushes_range_and_filter_to_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), pushdown_schema());
+    store
+        .create(&pushdown_documents())
+        .await
+        .expect("create lance dataset");
+    let filter =
+        hannsdb_core::query::parse_filter("group == 1 and score >= 15.0").expect("parse filter");
+
+    let result = store
+        .search_vector_field_filtered_projected(
+            "dense",
+            LanceSearchProjection::with_output_fields(["title".to_string()]),
+            &[0.0, 0.0],
+            10,
+            "l2",
+            Some(&filter),
+        )
+        .await
+        .expect("search with and pushdown");
+
+    assert_eq!(
+        result.hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(
+        result.observation.predicate.as_deref(),
+        Some("(group = 1) AND (score >= 15)")
+    );
+    assert!(result.observation.fallback_reason.is_none());
+}
+
+#[tokio::test]
+async fn lance_dataset_store_projects_requested_columns() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), pushdown_schema());
+    store
+        .create(&pushdown_documents())
+        .await
+        .expect("create lance dataset");
+
+    let result = store
+        .search_vector_field_filtered_projected(
+            "dense",
+            LanceSearchProjection::with_output_fields(["title".to_string()]),
+            &[0.0, 0.0],
+            1,
+            "l2",
+            None,
+        )
+        .await
+        .expect("search with projection");
+
+    assert!(result
+        .observation
+        .projected_columns
+        .contains(&"id".to_string()));
+    assert!(result
+        .observation
+        .projected_columns
+        .contains(&"dense".to_string()));
+    assert!(result
+        .observation
+        .projected_columns
+        .contains(&"title".to_string()));
+    assert!(!result
+        .observation
+        .projected_columns
+        .contains(&"extra".to_string()));
+    assert_eq!(
+        result.documents[0].document.fields.get("title"),
+        Some(&FieldValue::String("alpha".to_string()))
+    );
+    assert!(!result.documents[0].document.fields.contains_key("extra"));
+}
+
+#[tokio::test]
+async fn lance_dataset_store_falls_back_for_unsupported_filter() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), pushdown_schema());
+    store
+        .create(&pushdown_documents())
+        .await
+        .expect("create lance dataset");
+    let filter = hannsdb_core::query::parse_filter("title like \"%a\"").expect("parse filter");
+
+    let result = store
+        .search_vector_field_filtered_projected(
+            "dense",
+            LanceSearchProjection::with_output_fields(["title".to_string()]),
+            &[0.0, 0.0],
+            10,
+            "l2",
+            Some(&filter),
+        )
+        .await
+        .expect("search with fallback");
+
+    assert_eq!(
+        result.hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(result.observation.predicate.is_none());
+    assert!(result
+        .observation
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("like")));
+}
+
+#[tokio::test]
+async fn lance_dataset_store_does_not_partially_push_mixed_filter() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let uri = temp.path().join("docs.lance");
+    let store = LanceDatasetStore::new(uri.to_string_lossy(), pushdown_schema());
+    store
+        .create(&pushdown_documents())
+        .await
+        .expect("create lance dataset");
+    let filter = hannsdb_core::query::parse_filter("group == 1 and title like \"%a\"")
+        .expect("parse filter");
+
+    let result = store
+        .search_vector_field_filtered_projected(
+            "dense",
+            LanceSearchProjection::with_output_fields(["title".to_string()]),
+            &[0.0, 0.0],
+            10,
+            "l2",
+            Some(&filter),
+        )
+        .await
+        .expect("search with mixed fallback");
+
+    assert_eq!(
+        result.hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(result.observation.predicate.is_none());
+    assert!(result
+        .observation
+        .fallback_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("like")));
 }

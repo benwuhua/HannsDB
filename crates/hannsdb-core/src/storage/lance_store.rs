@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,10 +25,63 @@ use lance::Dataset;
 use serde::{Deserialize, Serialize};
 
 use crate::document::{CollectionSchema, Document, FieldType, FieldValue};
-use crate::query::{distance_by_metric, FilterExpr, SearchHit};
+use crate::query::{distance_by_metric, ComparisonOp, FilterExpr, SearchHit};
 use crate::storage::lance_schema::{
     arrow_schema_for_lance, collection_schema_from_lance_arrow, scalar_data_type_for_lance,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LanceScanObservation {
+    pub predicate: Option<String>,
+    pub projected_columns: Vec<String>,
+    pub fallback_reason: Option<String>,
+}
+
+impl LanceScanObservation {
+    pub fn predicate_pushdown_used(&self) -> bool {
+        self.predicate.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LanceSearchProjection {
+    pub output_fields: BTreeSet<String>,
+    pub required_fields: BTreeSet<String>,
+    pub required_vectors: BTreeSet<String>,
+}
+
+impl LanceSearchProjection {
+    pub fn with_output_fields(fields: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            output_fields: fields.into_iter().collect(),
+            required_fields: BTreeSet::new(),
+            required_vectors: BTreeSet::new(),
+        }
+    }
+
+    pub fn required_field(mut self, field: impl Into<String>) -> Self {
+        self.required_fields.insert(field.into());
+        self
+    }
+
+    pub fn required_vector(mut self, field: impl Into<String>) -> Self {
+        self.required_vectors.insert(field.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanceSearchDocument {
+    pub document: Document,
+    pub distance: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanceSearchResult {
+    pub hits: Vec<SearchHit>,
+    pub documents: Vec<LanceSearchDocument>,
+    pub observation: LanceScanObservation,
+}
 
 pub struct LanceCollection {
     name: String,
@@ -150,6 +204,22 @@ impl LanceCollection {
     ) -> io::Result<Vec<SearchHit>> {
         self.store
             .search_vector_field_filtered(field_name, query, top_k, metric, filter)
+            .await
+    }
+
+    pub async fn search_vector_field_filtered_projected(
+        &self,
+        field_name: &str,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
+        projection: LanceSearchProjection,
+    ) -> io::Result<LanceSearchResult> {
+        self.store
+            .search_vector_field_filtered_projected(
+                field_name, projection, query, top_k, metric, filter,
+            )
             .await
     }
 
@@ -797,6 +867,27 @@ impl LanceDatasetStore {
         metric: &str,
         filter: Option<&FilterExpr>,
     ) -> io::Result<Vec<SearchHit>> {
+        self.search_vector_field_filtered_projected(
+            field_name,
+            LanceSearchProjection::default(),
+            query,
+            top_k,
+            metric,
+            filter,
+        )
+        .await
+        .map(|result| result.hits)
+    }
+
+    pub async fn search_vector_field_filtered_projected(
+        &self,
+        field_name: &str,
+        projection: LanceSearchProjection,
+        query: &[f32],
+        top_k: usize,
+        metric: &str,
+        filter: Option<&FilterExpr>,
+    ) -> io::Result<LanceSearchResult> {
         let vector_schema = self
             .schema
             .vectors
@@ -819,18 +910,74 @@ impl LanceDatasetStore {
             ));
         }
 
-        #[cfg(feature = "hanns-backend")]
-        if field_name == self.schema.primary_vector_name() && filter.is_none() {
-            if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
-                return Ok(hits);
+        let translated_filter =
+            filter.map(|filter| lance_predicate_for_filter(&self.schema, filter));
+        let mut projected_columns = BTreeSet::new();
+        projected_columns.insert(crate::storage::lance_schema::LANCE_ID_COLUMN.to_string());
+        projected_columns.insert(field_name.to_string());
+        projected_columns.extend(projection.output_fields.iter().cloned());
+        projected_columns.extend(projection.required_fields.iter().cloned());
+        projected_columns.extend(projection.required_vectors.iter().cloned());
+        if translated_filter.as_ref().is_some_and(Result::is_err) {
+            if let Some(filter) = filter {
+                projected_columns.extend(filter.referenced_fields());
             }
         }
 
-        let mut hits = Vec::new();
-        for document in self.read_all_documents().await? {
-            if filter.is_some_and(|filter| !filter.matches(&document.fields)) {
-                continue;
+        let mut projected_columns = projected_columns.into_iter().collect::<Vec<_>>();
+        projected_columns.sort();
+
+        #[cfg(feature = "hanns-backend")]
+        if field_name == self.schema.primary_vector_name() && filter.is_none() {
+            if let Some(hits) = self.search_hanns_sidecar(query, top_k, metric).await? {
+                let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+                let scores = hits
+                    .iter()
+                    .map(|hit| (hit.id, hit.distance))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                let documents = self
+                    .fetch(&ids)
+                    .await?
+                    .into_iter()
+                    .map(|document| LanceSearchDocument {
+                        distance: scores.get(&document.id).copied().unwrap_or_default(),
+                        document,
+                    })
+                    .collect();
+                return Ok(LanceSearchResult {
+                    hits,
+                    documents,
+                    observation: LanceScanObservation {
+                        predicate: None,
+                        projected_columns,
+                        fallback_reason: None,
+                    },
+                });
             }
+        }
+
+        let dataset = self.open_lance().await?;
+        let mut scanner = dataset.scan();
+        scanner.project(&projected_columns).map_err(lance_to_io)?;
+        let (predicate, fallback_reason) = match translated_filter {
+            Some(Ok(predicate)) => {
+                scanner.filter(predicate.as_str()).map_err(lance_to_io)?;
+                (Some(predicate), None)
+            }
+            Some(Err(reason)) => (None, Some(reason)),
+            None => (None, None),
+        };
+        let batch = scanner.try_into_batch().await.map_err(lance_to_io)?;
+        let mut documents = documents_from_projected_lance_batch(&self.schema, &batch)?;
+
+        if predicate.is_none() {
+            if let Some(filter) = filter {
+                documents.retain(|document| filter.matches(&document.fields));
+            }
+        }
+
+        let mut scored = Vec::new();
+        for document in documents {
             let vector = document.vectors.get(field_name).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -840,20 +987,35 @@ impl LanceDatasetStore {
                     ),
                 )
             })?;
-            hits.push(SearchHit {
-                id: document.id,
+            scored.push(LanceSearchDocument {
                 distance: distance_by_metric(query, vector, metric)?,
+                document,
             });
         }
-        hits.sort_by(|left, right| {
+        scored.sort_by(|left, right| {
             left.distance
                 .total_cmp(&right.distance)
-                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| left.document.id.cmp(&right.document.id))
         });
-        if hits.len() > top_k {
-            hits.truncate(top_k);
+        if scored.len() > top_k {
+            scored.truncate(top_k);
         }
-        Ok(hits)
+        let hits = scored
+            .iter()
+            .map(|document| SearchHit {
+                id: document.document.id,
+                distance: document.distance,
+            })
+            .collect();
+        Ok(LanceSearchResult {
+            hits,
+            documents: scored,
+            observation: LanceScanObservation {
+                predicate,
+                projected_columns,
+                fallback_reason,
+            },
+        })
     }
 
     #[cfg(feature = "hanns-backend")]
@@ -986,6 +1148,118 @@ fn public_distance(metric: &str, backend_distance: f32) -> f32 {
     }
 }
 
+fn lance_predicate_for_filter(
+    schema: &CollectionSchema,
+    filter: &FilterExpr,
+) -> Result<String, String> {
+    match filter {
+        FilterExpr::And(exprs) => {
+            if exprs.is_empty() {
+                return Err("empty and expression cannot be pushed down".to_string());
+            }
+            let parts = exprs
+                .iter()
+                .map(|expr| {
+                    lance_predicate_for_filter(schema, expr).map(|part| format!("({part})"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(parts.join(" AND "))
+        }
+        FilterExpr::Clause { field, op, value } => {
+            if matches!(op, ComparisonOp::Ne) {
+                return Err("!= is not in the initial Lance pushdown subset".to_string());
+            }
+            let scalar = schema
+                .fields
+                .iter()
+                .find(|scalar| scalar.name == *field)
+                .ok_or_else(|| format!("field '{field}' is not a Lance scalar field"))?;
+            if scalar.array {
+                return Err(format!("array field '{field}' is not pushdown-safe"));
+            }
+            if !is_safe_lance_identifier(field) {
+                return Err(format!(
+                    "field '{field}' is not a safe Lance predicate identifier"
+                ));
+            }
+            let literal = lance_literal_for_field_value(&scalar.data_type, value)?;
+            let op = match op {
+                ComparisonOp::Eq => "=",
+                ComparisonOp::Gt => ">",
+                ComparisonOp::Gte => ">=",
+                ComparisonOp::Lt => "<",
+                ComparisonOp::Lte => "<=",
+                ComparisonOp::Ne => unreachable!("handled above"),
+            };
+            Ok(format!("{field} {op} {literal}"))
+        }
+        FilterExpr::Or(_) => Err("or expressions require fallback in this slice".to_string()),
+        FilterExpr::Not(_) => Err("not expressions require fallback in this slice".to_string()),
+        FilterExpr::InList { .. } => {
+            Err("in-list filters require fallback in this slice".to_string())
+        }
+        FilterExpr::NullCheck { .. } => {
+            Err("null checks require fallback in this slice".to_string())
+        }
+        FilterExpr::Like { .. } => Err("like filters require fallback in this slice".to_string()),
+        FilterExpr::HasPrefix { .. } => {
+            Err("has_prefix filters require fallback in this slice".to_string())
+        }
+        FilterExpr::HasSuffix { .. } => {
+            Err("has_suffix filters require fallback in this slice".to_string())
+        }
+        FilterExpr::ArrayContains { .. }
+        | FilterExpr::ArrayContainsAny { .. }
+        | FilterExpr::ArrayContainsAll { .. } => {
+            Err("array filters require fallback in this slice".to_string())
+        }
+    }
+}
+
+fn is_safe_lance_identifier(field: &str) -> bool {
+    let mut chars = field.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn lance_literal_for_field_value(
+    data_type: &FieldType,
+    value: &FieldValue,
+) -> Result<String, String> {
+    match (data_type, value) {
+        (FieldType::String, FieldValue::String(value)) => {
+            Ok(format!("'{}'", value.replace('\'', "''")))
+        }
+        (FieldType::Bool, FieldValue::Bool(value)) => Ok(value.to_string()),
+        (FieldType::Int64, FieldValue::Int64(value)) => Ok(value.to_string()),
+        (FieldType::Int64, FieldValue::Int32(value)) => Ok(value.to_string()),
+        (FieldType::Int32, FieldValue::Int32(value)) => Ok(value.to_string()),
+        (FieldType::UInt32, FieldValue::UInt32(value)) => Ok(value.to_string()),
+        (FieldType::UInt64, FieldValue::UInt64(value)) => Ok(value.to_string()),
+        (FieldType::UInt64, FieldValue::UInt32(value)) => Ok(value.to_string()),
+        (FieldType::Float, FieldValue::Float(value)) => Ok(value.to_string()),
+        (FieldType::Float, FieldValue::Float64(value)) if value.is_finite() => {
+            Ok(value.to_string())
+        }
+        (FieldType::Float, FieldValue::Int32(value)) => Ok(value.to_string()),
+        (FieldType::Float, FieldValue::Int64(value)) => Ok(value.to_string()),
+        (FieldType::Float64, FieldValue::Float64(value)) if value.is_finite() => {
+            Ok(value.to_string())
+        }
+        (FieldType::Float64, FieldValue::Float(value)) if value.is_finite() => {
+            Ok(value.to_string())
+        }
+        (FieldType::Float64, FieldValue::Int32(value)) => Ok(value.to_string()),
+        (FieldType::Float64, FieldValue::Int64(value)) => Ok(value.to_string()),
+        _ => Err(format!(
+            "literal {value:?} is not compatible with Lance field type {data_type:?}"
+        )),
+    }
+}
+
 fn id_predicate(ids: &[i64]) -> String {
     if ids.len() == 1 {
         format!("id = {}", ids[0])
@@ -1038,6 +1312,55 @@ pub fn documents_from_lance_batch(
                     format!("Lance batch missing vector column {}", vector_schema.name),
                 )
             })?;
+            vectors.push((
+                vector_schema.name.clone(),
+                vector_from_column(column, row_idx, vector_schema.dimension)?,
+            ));
+        }
+
+        documents.push(Document {
+            id: ids.value(row_idx),
+            fields: fields.into_iter().collect(),
+            vectors: vectors.into_iter().collect(),
+            sparse_vectors: Default::default(),
+        });
+    }
+    Ok(documents)
+}
+
+fn documents_from_projected_lance_batch(
+    schema: &CollectionSchema,
+    batch: &RecordBatch,
+) -> io::Result<Vec<Document>> {
+    let id_column = batch.column_by_name("id").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Lance batch missing id column")
+    })?;
+    let ids = id_column
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Lance id column is not Int64")
+        })?;
+
+    let mut documents = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        let mut fields = Vec::new();
+        for scalar in &schema.fields {
+            let Some(column) = batch.column_by_name(&scalar.name) else {
+                continue;
+            };
+            if let Some(value) =
+                field_value_from_column(column, row_idx, &scalar.data_type, scalar.array)?
+            {
+                fields.push((scalar.name.clone(), value));
+            }
+        }
+
+        let mut vectors = Vec::new();
+        for vector_schema in &schema.vectors {
+            let Some(column) = batch.column_by_name(&vector_schema.name) else {
+                continue;
+            };
             vectors.push((
                 vector_schema.name.clone(),
                 vector_from_column(column, row_idx, vector_schema.dimension)?,
