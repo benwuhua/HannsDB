@@ -20,7 +20,7 @@ log = "0.4"
 hannsdb-index = { path = "../hannsdb-index" }
 arrow-array = { version = "57", optional = true }
 arrow-schema = { version = "57", optional = true }
-lance = { path = "../../../lance/rust/lance", optional = true }
+lance = { path = "/Users/ryan/Code/vectorDB/lance/rust/lance", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

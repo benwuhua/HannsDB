@@ -1,5 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+#[cfg(feature = "lance-storage")]
+use hannsdb_core::document::SparseVector;
 use hannsdb_core::document::{
     CollectionSchema, Document, FieldType, FieldValue, ScalarFieldSchema, VectorFieldSchema,
 };
@@ -85,6 +87,17 @@ fn seed_delete_by_filter_collection(root: &std::path::Path) {
         ],
     )
     .expect("insert documents");
+}
+
+#[cfg(feature = "lance-storage")]
+fn sparse_vector_field_schema(name: &str) -> VectorFieldSchema {
+    VectorFieldSchema {
+        name: name.to_string(),
+        data_type: FieldType::VectorSparse,
+        dimension: 0,
+        index_param: None,
+        bm25_params: None,
+    }
 }
 
 // This rewrite only supports the scalar-only layout used by the latest-live
@@ -1829,7 +1842,7 @@ async fn lance_storage_typed_search_multi_query_uses_top_k_per_recall_source() {
 
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
-async fn lance_storage_typed_search_multi_query_rejects_unsupported_combinations() {
+async fn lance_storage_typed_search_multi_query_rejects_invalid_params_and_sparse() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let schema = CollectionSchema {
         primary_vector: "vector".to_string(),
@@ -1843,11 +1856,522 @@ async fn lance_storage_typed_search_multi_query_rejects_unsupported_combinations
         tempdir.path(),
         "docs",
         schema,
-        &[Document::with_vectors(
+        &[
+            // id=1 is second in both recall lists and wins the fused order.
+            Document::with_vectors(
+                1,
+                [("group".to_string(), FieldValue::Int64(1))],
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![0.1, 0.0])],
+            ),
+            // id=2 is a weaker group=2 candidate than id=4 after fusion.
+            Document::with_vectors(
+                2,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.4, 0.0],
+                [("title_vec".to_string(), vec![10.0, 10.0])],
+            ),
+            // id=3 is first for the title source and becomes the second group representative.
+            Document::with_vectors(
+                3,
+                [("group".to_string(), FieldValue::Int64(3))],
+                vec![10.0, 10.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+            // id=4 is strong in both recall lists, but still trails id=3 after full-list fusion.
+            Document::with_vectors(
+                4,
+                [("group".to_string(), FieldValue::Int64(2))],
+                vec![0.2, 0.0],
+                [("title_vec".to_string(), vec![0.2, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":2,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "group_by":{"field_name":"group","group_topk":1,"group_count":2}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multi-query group_by search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["1", "3"]);
+    assert_eq!(json["hits"][0]["group_key"], serde_json::json!(1));
+    assert_eq!(json["hits"][1]["group_key"], serde_json::json!(3));
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_order_by_applies_after_fusion() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![ScalarFieldSchema::new("rank", FieldType::Int64)],
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                1,
+                [("rank".to_string(), FieldValue::Int64(3))],
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![0.1, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [("rank".to_string(), FieldValue::Int64(2))],
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![10.0, 10.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [("rank".to_string(), FieldValue::Int64(1))],
+                vec![10.0, 10.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+            Document::with_vectors(
+                4,
+                [("rank".to_string(), FieldValue::Int64(4))],
+                vec![0.2, 0.0],
+                [("title_vec".to_string(), vec![0.2, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":2,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "order_by":{"field_name":"rank"}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multi-query order_by search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["3", "2"]);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_query_by_id_and_queries_fuse_deterministically() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                1,
+                Vec::new(),
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![0.2, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                Vec::new(),
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                Vec::new(),
+                vec![10.0, 10.0],
+                [("title_vec".to_string(), vec![10.0, 10.0])],
+            ),
+            Document::with_vectors(
+                4,
+                Vec::new(),
+                vec![0.2, 0.0],
+                [("title_vec".to_string(), vec![0.1, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":3,
+                        "query_by_id":["1"],
+                        "queries":[{"field_name":"title_vec","vector":[0.0,0.0]}]
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send query_by_id plus query search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["2", "1", "4"]);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multiple_query_by_id_values_fuse() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![VectorFieldSchema::new("vector", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::new(1, Vec::new(), vec![0.0, 0.0]),
+            Document::new(2, Vec::new(), vec![0.2, 0.0]),
+            Document::new(3, Vec::new(), vec![0.1, 0.0]),
+            Document::new(4, Vec::new(), vec![5.0, 5.0]),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"top_k":3,"query_by_id":["1","2"]}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("send multiple query_by_id search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["1", "2", "3"]);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_dense_query_params_have_explicit_boundaries() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![VectorFieldSchema::new("vector", 2)],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::new(1, Vec::new(), vec![0.0, 0.0]),
+            Document::new(2, Vec::new(), vec![1.0, 1.0]),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":32,"nprobe":4}}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send dense param search");
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = to_bytes(accepted.into_body(), usize::MAX)
+        .await
+        .expect("read accepted body");
+    let json: Value = serde_json::from_slice(&body).expect("parse accepted json");
+    assert_eq!(json["hits"][0]["id"], "1");
+
+    for body in [
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":0}}]}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"nprobe":0}}]}"#,
+    ] {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/docs/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("send invalid dense param search");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_weighted_dense_reranker_and_metric_override() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("dense", 2),
+            VectorFieldSchema::new("title", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_named_vectors(
+                1,
+                Vec::new(),
+                "dense",
+                vec![0.1, 0.0],
+                [("title".to_string(), vec![0.5, 0.0])],
+            ),
+            Document::with_named_vectors(
+                2,
+                Vec::new(),
+                "dense",
+                vec![0.5, 0.0],
+                [("title".to_string(), vec![0.1, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":2,
+                        "queries":[
+                            {"field_name":"dense","vector":[0.0,0.0]},
+                            {"field_name":"title","vector":[0.0,0.0]}
+                        ],
+                        "reranker":{"weights":{"dense":0.7,"title":0.3},"metric":"l2"}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send weighted reranker search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "1");
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_sparse_query_round_trips_and_uses_index_path() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("dense", 2),
+            sparse_vector_field_schema("sparse"),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_sparse_vectors(
+                1,
+                Vec::new(),
+                "dense",
+                vec![0.0, 0.0],
+                [(
+                    "sparse".to_string(),
+                    SparseVector::new(vec![1, 3], vec![2.0, 1.0]),
+                )],
+            ),
+            Document::with_sparse_vectors(
+                2,
+                Vec::new(),
+                "dense",
+                vec![1.0, 1.0],
+                [("sparse".to_string(), SparseVector::new(vec![2], vec![3.0]))],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection with sparse vectors");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let index = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/indexes/vector")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"field_name":"sparse","kind":"bm25","metric":"ip","params":{}}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send sparse index create");
+    assert_eq!(index.status(), StatusCode::CREATED);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"sparse","sparse_vector":{"indices":[1],"values":[1.0]}}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send sparse search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "1");
+    assert!(
+        tempdir
+            .path()
+            .join("collections")
+            .join("docs.lance")
+            .join("_hannsdb")
+            .join("sparse")
+            .exists(),
+        "sparse/BM25 sidecar path should prove the indexed path was built"
+    );
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_rejects_sparse_weighted_boundaries() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "dense".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("dense", 2),
+            sparse_vector_field_schema("sparse"),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[Document::with_sparse_vectors(
             1,
-            [("group".to_string(), FieldValue::Int64(1))],
+            Vec::new(),
+            "dense",
             vec![0.0, 0.0],
-            [("title_vec".to_string(), vec![0.0, 0.0])],
+            [("sparse".to_string(), SparseVector::new(vec![1], vec![1.0]))],
         )],
     )
     .await
@@ -1855,13 +2379,9 @@ async fn lance_storage_typed_search_multi_query_rejects_unsupported_combinations
     let app = build_router(tempdir.path()).expect("build router");
 
     for body in [
-        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"reranker":{"weights":{"vector":1.0}}}"#,
         r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"reranker":{"metric":"l2"}}"#,
-        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"group_by":{"field_name":"group"}}"#,
-        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0]},{"field_name":"title_vec","vector":[0.0,0.0]}],"order_by":{"field_name":"group"}}"#,
-        r#"{"top_k":1,"query_by_id":["1"],"queries":[{"field_name":"vector","vector":[0.0,0.0]}]}"#,
-        r#"{"top_k":1,"query_by_id":["1","2"]}"#,
-        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":10}},{"field_name":"title_vec","vector":[0.0,0.0]}]}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":0}}]}"#,
+        r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"nprobe":0}}]}"#,
         r#"{"top_k":1,"queries":[{"field_name":"vector","sparse_vector":{"indices":[1],"values":[1.0]}},{"field_name":"title_vec","vector":[0.0,0.0]}]}"#,
     ] {
         let response = app
@@ -1875,11 +2395,224 @@ async fn lance_storage_typed_search_multi_query_rejects_unsupported_combinations
                     .expect("build request"),
             )
             .await
-            .expect("send unsupported multi-query request");
+            .expect("send unsupported sparse query request");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body: {body}");
     }
 }
 
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_supports_weighted_reranker() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: Vec::new(),
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                1,
+                Vec::new(),
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![0.5, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                Vec::new(),
+                vec![0.5, 0.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":2,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "reranker":{"weights":{"vector":0.8,"title_vec":0.2},"metric":"l2"}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send weighted search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "1");
+    assert_eq!(json["hits"][1]["id"], "2");
+    assert!(json["hits"][0]["distance"].as_f64().expect("distance") < 0.0);
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_multi_query_supports_group_by_and_order_by() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let schema = CollectionSchema {
+        primary_vector: "vector".to_string(),
+        fields: vec![
+            ScalarFieldSchema::new("group", FieldType::Int64),
+            ScalarFieldSchema::new("rank", FieldType::Int64),
+        ],
+        vectors: vec![
+            VectorFieldSchema::new("vector", 2),
+            VectorFieldSchema::new("title_vec", 2),
+        ],
+    };
+    LanceCollection::create(
+        tempdir.path(),
+        "docs",
+        schema,
+        &[
+            Document::with_vectors(
+                1,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("rank".to_string(), FieldValue::Int64(30)),
+                ],
+                vec![0.0, 0.0],
+                [("title_vec".to_string(), vec![0.2, 0.0])],
+            ),
+            Document::with_vectors(
+                2,
+                [
+                    ("group".to_string(), FieldValue::Int64(1)),
+                    ("rank".to_string(), FieldValue::Int64(10)),
+                ],
+                vec![0.1, 0.0],
+                [("title_vec".to_string(), vec![0.1, 0.0])],
+            ),
+            Document::with_vectors(
+                3,
+                [
+                    ("group".to_string(), FieldValue::Int64(2)),
+                    ("rank".to_string(), FieldValue::Int64(20)),
+                ],
+                vec![0.2, 0.0],
+                [("title_vec".to_string(), vec![0.0, 0.0])],
+            ),
+        ],
+    )
+    .await
+    .expect("seed Lance collection");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "top_k":2,
+                        "queries":[
+                            {"field_name":"vector","vector":[0.0,0.0]},
+                            {"field_name":"title_vec","vector":[0.0,0.0]}
+                        ],
+                        "group_by":{"field_name":"group","group_topk":1,"group_count":2},
+                        "order_by":{"field_name":"rank"}
+                    }"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send grouped ordered search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    let ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["3", "1"]);
+    assert_eq!(json["hits"][0]["group_key"], serde_json::json!(2));
+    assert_eq!(json["hits"][1]["group_key"], serde_json::json!(1));
+}
+
+#[cfg(feature = "lance-storage")]
+#[tokio::test]
+async fn lance_storage_typed_search_accepts_dense_query_params_as_noops() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let app = build_router(tempdir.path()).expect("build router");
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"docs","dimension":2,"metric":"l2","storage":"lance"}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send create request");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let insert = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/records")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"ids":["42","84"],"vectors":[[0.0,0.0],[1.0,1.0]]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send insert request");
+    assert_eq!(insert.status(), StatusCode::OK);
+
+    let search = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":1,"queries":[{"field_name":"vector","vector":[0.0,0.0],"param":{"ef_search":32,"nprobe":4}}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send param search");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: Value = serde_json::from_slice(&body).expect("parse json");
+    assert_eq!(json["hits"][0]["id"], "42");
+}
 #[cfg(feature = "lance-storage")]
 #[tokio::test]
 async fn lance_storage_typed_search_accepts_single_recall_reranker() {
@@ -1952,7 +2685,7 @@ async fn lance_storage_typed_search_accepts_single_recall_reranker() {
         )
         .await
         .expect("send weighted reranker search request");
-    assert_eq!(weighted.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(weighted.status(), StatusCode::OK);
 }
 
 #[cfg(feature = "lance-storage")]
@@ -2213,17 +2946,44 @@ async fn lance_storage_typed_search_query_by_id_routes_to_lance() {
     assert_eq!(json["hits"][0]["vector"], serde_json::json!([0.0, 0.0]));
 
     let multi_id = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/collections/docs/search")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"top_k":1,"query_by_id":["42","84"]}"#))
+                .body(Body::from(r#"{"top_k":2,"query_by_id":["42","84"]}"#))
                 .expect("build request"),
         )
         .await
         .expect("send multi-id search request");
-    assert_eq!(multi_id.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(multi_id.status(), StatusCode::OK);
+    let body = to_bytes(multi_id.into_body(), usize::MAX)
+        .await
+        .expect("read multi-id body");
+    let json: Value = serde_json::from_slice(&body).expect("parse multi-id json");
+    let hit_ids = json["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().expect("hit id").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(hit_ids, vec!["42", "84"]);
+
+    let mixed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/collections/docs/search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"top_k":2,"query_by_id":["42"],"queries":[{"field_name":"vector","vector":[1.0,1.0]}]}"#,
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("send mixed query_by_id search request");
+    assert_eq!(mixed.status(), StatusCode::OK);
 }
 
 #[cfg(feature = "lance-storage")]
